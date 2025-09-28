@@ -1,0 +1,18 @@
+[project]
+name = "yplayer"
+version = "0.1.0"
+description = "CLI YouTube audio cache + player (audio-only via yt-dlp)."
+authors = [ { name = "You" } ]
+requires-python = ">=3.9"
+dependencies = [
+  "yt-dlp",
+]
+readme = "README.md"
+license = { text = "MIT" }
+
+[project.scripts]
+yplay = "yplayer.cli:main"
+
+[build-system]
+requires = ["setuptools>=67", "wheel"]
+build-backend = "setuptools.build_meta"

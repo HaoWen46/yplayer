@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+
+# Local cache (optional; comment out if you want to commit examples)
+# Music cache dir is outside repo by default (~/.Music/yt-audio), so nothing here.
