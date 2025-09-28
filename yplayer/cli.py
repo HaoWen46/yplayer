@@ -11,7 +11,7 @@ from .core import (
     search_results,
     list_cached_tracks,
 )
-from .browse import browse_and_play, browse_playlist
+from .enhanced_browse import enhanced_browse_and_play, enhanced_browse_playlist
 from .config import DEFAULT_CACHE_DIR, SUPPORTED_FORMATS
 from .utils import info, Colors
 from .playlist import is_playlist_url, extract_playlist_entries
@@ -109,7 +109,8 @@ def main(argv=None):
 
     if args.browse:
         tracks = list_cached_tracks(args.dir)
-        browse_and_play(tracks, prefer_player=args.player, volume=args.volume)
+        # browse_and_play(tracks, prefer_player=args.player, volume=args.volume)
+        enhanced_browse_and_play(tracks, prefer_player=args.player, volume=args.volume)
         return
 
     if not args.query:
@@ -125,7 +126,17 @@ def main(argv=None):
             if not entries:
                 info("playlist appears empty")
                 return
-            browse_playlist(
+
+            # browse_playlist(
+            #     entries,
+            #     opts,
+            #     prefetch_count=prefetch,
+            #     api_key=args.yt_api_key,
+            #     prefer_player=args.player,
+            #     volume=args.volume,
+            # )
+
+            enhanced_browse_playlist(
                 entries,
                 opts,
                 prefetch_count=prefetch,
