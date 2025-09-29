@@ -36,7 +36,7 @@ from .config import (
     YTDL_AUDIO_FORMAT,
 )
 from .utils import which, die, info, normalize_ext
-from .playback import Player
+from .enhanced_playback import EnhancedPlayer
 
 # ----------- URL / ID helpers -----------
 
@@ -659,5 +659,5 @@ def run_and_maybe_play(query_or_url: str, opts: Options, *, api_key: Optional[st
     path = resolve_and_maybe_download(query_or_url, opts, api_key=api_key)
     if opts.play_after and not opts.print_only:
         player = Player(prefer=opts.player)
-        player.play(path, volume=opts.volume)
+        Enhancedplayer.play(path, volume=opts.volume)
     return path
