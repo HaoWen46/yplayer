@@ -8,10 +8,14 @@ dependencies = [
   "yt-dlp",
 ]
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 
 [project.scripts]
-yplay = "yplayer.cli:main"
+yplay-py = "yplayer.cli:main"
+yplay-worker = "yplayer.worker:main"
+
+[tool.setuptools.packages.find]
+include = ["yplayer*"]
 
 [build-system]
 requires = ["setuptools>=67", "wheel"]

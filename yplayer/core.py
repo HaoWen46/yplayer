@@ -16,6 +16,7 @@ Features:
 import os
 import re
 import json
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -74,25 +75,107 @@ def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 def require_bins():
-    """Warn if ffmpeg missing (yt-dlp library will still work for native downloads)."""
+    """Warn if ffmpeg missing and ensure yt-dlp is up to date."""
     if not which("ffmpeg") and not which("avconv"):
         info(
             "ffmpeg not found — native downloads will work, "
             "but conversion/metadata embedding won't.\n"
             "Install with: brew install ffmpeg"
         )
+    # Check and update yt-dlp if needed
+    ensure_ytdlp_uptodate()
 
-def _auto_update_ytdlp():
-    """Try to self-update the yt-dlp CLI if present (used as fallback when DownloadError occurs)."""
-    ytdlp_bin = which("yt-dlp")
-    if not ytdlp_bin:
-        return
+def _normalize_version(v: str) -> str:
+    """Normalize version string for comparison (e.g., 2026.01.29 -> 2026.1.29)."""
+    parts = v.split(".")
+    normalized = []
+    for part in parts:
+        try:
+            normalized.append(str(int(part)))
+        except ValueError:
+            normalized.append(part)
+    return ".".join(normalized)
+
+
+def _get_ytdlp_versions() -> tuple[Optional[str], Optional[str]]:
+    """Get current and latest yt-dlp versions. Returns (current, latest) or (None, None) on error."""
     try:
-        info("attempting to update yt-dlp…")
-        subprocess.run([ytdlp_bin, "-U"], check=True)
-        info("yt-dlp updated successfully.")
+        import yt_dlp
+        current = getattr(yt_dlp, 'version', None)
+        if current is None:
+            current = getattr(yt_dlp, '__version__', None)
+        if hasattr(current, '__version__'):
+            current = current.__version__
+        # yt_dlp.version is a module; get the string
+        if hasattr(current, '__name__') and current.__name__ == 'yt_dlp.version':
+            current = getattr(current, '__version__', None)
+    except Exception:
+        current = None
+
+    # Fallback: get version from pip
+    if not current or not isinstance(current, str):
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "show", "yt-dlp"],
+                capture_output=True, text=True, timeout=10
+            )
+            for line in result.stdout.splitlines():
+                if line.startswith("Version:"):
+                    current = line.split(":", 1)[1].strip()
+                    break
+        except Exception:
+            pass
+
+    # Get latest version from PyPI
+    latest = None
+    try:
+        req = urllib.request.Request(
+            "https://pypi.org/pypi/yt-dlp/json",
+            headers={"Accept": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            latest = data.get("info", {}).get("version")
+    except Exception:
+        pass
+
+    return current, latest
+
+
+def _update_ytdlp_pip() -> bool:
+    """Update yt-dlp via pip. Returns True on success."""
+    try:
+        info("updating yt-dlp via pip…")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0:
+            info("yt-dlp updated successfully.")
+            return True
+        else:
+            info(f"yt-dlp update failed: {result.stderr}")
+            return False
     except Exception as e:
         info(f"yt-dlp update failed: {e}")
+        return False
+
+
+def ensure_ytdlp_uptodate():
+    """Check if yt-dlp is up to date and update if needed."""
+    current, latest = _get_ytdlp_versions()
+    if not current or not latest:
+        return  # Can't determine versions, skip check
+
+    # Normalize versions for comparison (e.g., 2026.01.29 == 2026.1.29)
+    if _normalize_version(current) != _normalize_version(latest):
+        info(f"yt-dlp is outdated ({current} -> {latest})")
+        _update_ytdlp_pip()
+
+
+def _auto_update_ytdlp():
+    """Try to update yt-dlp via pip (used as fallback when DownloadError occurs)."""
+    _update_ytdlp_pip()
 
 # ----------- YouTube Data API (no descriptions) ----------
 
@@ -658,6 +741,6 @@ def resolve_and_maybe_download(query_or_url: str, opts: Options, *, api_key: Opt
 def run_and_maybe_play(query_or_url: str, opts: Options, *, api_key: Optional[str] = None) -> str:
     path = resolve_and_maybe_download(query_or_url, opts, api_key=api_key)
     if opts.play_after and not opts.print_only:
-        player = Player(prefer=opts.player)
-        Enhancedplayer.play(path, volume=opts.volume)
+        player = EnhancedPlayer(prefer=opts.player)
+        player.play(filepath=path, volume=opts.volume)
     return path

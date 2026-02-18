@@ -10,6 +10,7 @@ from .core import (
     is_url,
     search_results,
     list_cached_tracks,
+    require_bins,
 )
 from .enhanced_browse import enhanced_browse_and_play, enhanced_browse_playlist
 from .config import DEFAULT_CACHE_DIR, SUPPORTED_FORMATS
@@ -75,6 +76,9 @@ def main(argv=None):
         argv = sys.argv[1:]
     parser = _mk_parser()
     args = parser.parse_args(argv)
+
+    # Check dependencies (ffmpeg) and ensure yt-dlp is up to date
+    require_bins()
 
     # Make --prefetch-count alias backward-compatible if used
     if args.prefetch_count is not None:

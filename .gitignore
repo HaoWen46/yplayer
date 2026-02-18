@@ -12,5 +12,11 @@ __pycache__/
 .idea/
 .vscode/
 
-# Local cache (optional; comment out if you want to commit examples)
-# Music cache dir is outside repo by default (~/.Music/yt-audio), so nothing here.
+# Rust build output
+target/
+
+# SQLite index (auto-generated from cache dir)
+*.db
+
+# Claude Code project settings
+.claude/
