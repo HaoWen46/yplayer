@@ -11,6 +11,9 @@ dependencies = [
 readme = "README.md"
 license = "MIT"
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [project.scripts]
 yplay-worker = "yplayer.worker:main"
 

@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      # Hard gate: the code must build and pass its tests.
+      - name: Test
+        run: cargo test --workspace --verbose
+      # Informational until the Phase 2 dead-code purge; tighten to -D warnings then.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+        continue-on-error: true
+      - name: Format check
+        run: cargo fmt --all --check
+        continue-on-error: true
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Install from pyproject.toml in a clean environment so an undeclared
+      # dependency (the python-dotenv gap that broke HEAD) fails loudly.
+      - name: Install
+        run: pip install .[dev]
+      - name: Smoke + protocol tests
+        run: pytest -q
