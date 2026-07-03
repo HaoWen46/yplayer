@@ -2,6 +2,7 @@ pub mod albums;
 pub mod help;
 pub mod input_overlay;
 pub mod library;
+pub mod lyrics;
 pub mod player_bar;
 pub mod playlist;
 pub mod search;
@@ -26,23 +27,34 @@ pub fn draw(f: &mut Frame, app: &App) {
     // Header
     draw_header(f, app, chunks[0]);
 
-    // Main content depends on view mode
-    match &app.mode {
-        crate::types::ViewMode::Library => library::draw(f, app, chunks[1]),
-        crate::types::ViewMode::Albums => albums::draw_list(f, app, chunks[1]),
-        crate::types::ViewMode::AlbumDetail { .. } => albums::draw_detail(f, app, chunks[1]),
-        crate::types::ViewMode::Playlist { .. } => playlist::draw(f, app, chunks[1]),
-        crate::types::ViewMode::Search => {
-            library::draw(f, app, chunks[1]);
-            search::draw_overlay(f, app);
-        }
-        crate::types::ViewMode::DownloadInput => {
-            library::draw(f, app, chunks[1]);
-            input_overlay::draw_download(f, app);
-        }
-        crate::types::ViewMode::RenameInput => {
-            library::draw(f, app, chunks[1]);
-            input_overlay::draw_rename(f, app);
+    // Main content depends on view mode. When the lyrics pane is toggled on and
+    // we're in a list view, it replaces the list.
+    let list_mode = matches!(
+        app.mode,
+        crate::types::ViewMode::Library
+            | crate::types::ViewMode::Albums
+            | crate::types::ViewMode::AlbumDetail { .. }
+    );
+    if app.show_lyrics && list_mode {
+        lyrics::draw(f, app, chunks[1]);
+    } else {
+        match &app.mode {
+            crate::types::ViewMode::Library => library::draw(f, app, chunks[1]),
+            crate::types::ViewMode::Albums => albums::draw_list(f, app, chunks[1]),
+            crate::types::ViewMode::AlbumDetail { .. } => albums::draw_detail(f, app, chunks[1]),
+            crate::types::ViewMode::Playlist { .. } => playlist::draw(f, app, chunks[1]),
+            crate::types::ViewMode::Search => {
+                library::draw(f, app, chunks[1]);
+                search::draw_overlay(f, app);
+            }
+            crate::types::ViewMode::DownloadInput => {
+                library::draw(f, app, chunks[1]);
+                input_overlay::draw_download(f, app);
+            }
+            crate::types::ViewMode::RenameInput => {
+                library::draw(f, app, chunks[1]);
+                input_overlay::draw_rename(f, app);
+            }
         }
     }
 

@@ -23,8 +23,52 @@ use crate::ui;
 /// Result of a background download task, delivered to the event loop.
 #[derive(Debug)]
 pub enum WorkerEvent {
-    DownloadDone { track: Track },
-    DownloadFailed { url: String, error: String },
+    DownloadDone {
+        track: Track,
+    },
+    DownloadFailed {
+        url: String,
+        error: String,
+    },
+    LyricsReady {
+        track_id: String,
+        // Some = a definitive answer (empty vec means "genuinely none"), which is
+        // cached. None = a transient fetch error, which is not cached so it retries.
+        result: Option<Vec<(f64, String)>>,
+    },
+}
+
+/// Parse LRC text into `(seconds, line)` pairs, sorted by time. Metadata tags
+/// like `[ar:...]` are skipped; a line may carry several timestamps.
+pub fn parse_lrc(lrc: &str) -> Vec<(f64, String)> {
+    let mut out: Vec<(f64, String)> = Vec::new();
+    for line in lrc.lines() {
+        let mut rest = line;
+        let mut times: Vec<f64> = Vec::new();
+        while let Some(stripped) = rest.strip_prefix('[') {
+            let Some(close) = stripped.find(']') else {
+                break;
+            };
+            if let Some(t) = parse_lrc_time(&stripped[..close]) {
+                times.push(t);
+            }
+            rest = &stripped[close + 1..];
+        }
+        let text = rest.trim();
+        for t in times {
+            out.push((t, text.to_string()));
+        }
+    }
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
+/// Parse an LRC timestamp tag like `mm:ss.xx`; returns None for metadata tags.
+fn parse_lrc_time(tag: &str) -> Option<f64> {
+    let (m, s) = tag.split_once(':')?;
+    let mins: f64 = m.trim().parse().ok()?;
+    let secs: f64 = s.trim().parse().ok()?;
+    Some(mins * 60.0 + secs)
 }
 
 /// Severity of a transient status message; controls its color in the footer.
@@ -67,6 +111,14 @@ pub struct App {
     status_msg_until: Option<std::time::Instant>,
     // Whether the help overlay is open.
     pub show_help: bool,
+    // Synced lyrics for the current track (None = fetching, Some(empty) = none found).
+    pub lyrics: Option<Vec<(f64, String)>>,
+    lyrics_track_id: Option<String>,
+    lyrics_cache: std::collections::HashMap<String, Vec<(f64, String)>>,
+    lyrics_inflight: std::collections::HashSet<String>,
+    pub show_lyrics: bool,
+    // Count of lyric lines whose timestamp has passed (0 = before the first).
+    pub current_lyric: usize,
     // Delete confirmation: Some(Instant) = waiting for 2nd press, expires after 3s
     pub confirm_delete_until: Option<std::time::Instant>,
     // Background download tasks report results here; run() owns the receiver.
@@ -74,6 +126,9 @@ pub struct App {
     worker_rx: Option<mpsc::UnboundedReceiver<WorkerEvent>>,
     // Persistent worker actor handle; set by run() (needs a Tokio runtime).
     worker: Option<WorkerHandle>,
+    // A separate worker for lyrics, so a small HTTP GET never queues behind a
+    // long download (and vice-versa) on the single serial worker.
+    lyrics_worker: Option<WorkerHandle>,
 }
 
 impl App {
@@ -107,10 +162,17 @@ impl App {
             status_severity: Severity::Info,
             status_msg_until: None,
             show_help: false,
+            lyrics: None,
+            lyrics_track_id: None,
+            lyrics_cache: std::collections::HashMap::new(),
+            lyrics_inflight: std::collections::HashSet::new(),
+            show_lyrics: false,
+            current_lyric: 0,
             confirm_delete_until: None,
             worker_tx,
             worker_rx: Some(worker_rx),
             worker: None,
+            lyrics_worker: None,
         }
     }
 
@@ -428,10 +490,14 @@ impl App {
                     self.play_track(prev).await;
                 }
             }
+            Action::ToggleLyrics => {
+                self.show_lyrics = !self.show_lyrics;
+            }
             Action::Tick => {
                 self.player.poll_status().await;
                 self.check_loop().await;
                 self.clear_expired_status();
+                self.update_current_lyric();
                 // Redraw only when something is actually animating or expiring,
                 // so a fully idle app doesn't repaint.
                 if self.player.is_playing()
@@ -520,6 +586,7 @@ impl App {
             match self.player.play(path, Some(self.volume / 100.0)).await {
                 Ok(()) => {
                     let _ = self.db.update_last_played(&track.id);
+                    self.load_lyrics_for(&track);
                     self.playing = Some(track);
                 }
                 Err(e) => {
@@ -529,6 +596,39 @@ impl App {
         } else {
             self.set_status("No audio file for this track".to_string());
         }
+    }
+
+    /// Set up lyrics for a newly-playing track: use the session cache if present,
+    /// otherwise clear and fetch in the background.
+    fn load_lyrics_for(&mut self, track: &Track) {
+        self.current_lyric = 0;
+        self.lyrics_track_id = Some(track.id.clone());
+        if let Some(cached) = self.lyrics_cache.get(&track.id) {
+            self.lyrics = Some(cached.clone());
+            return;
+        }
+        self.lyrics = None; // None = still fetching
+        // Don't spawn a second fetch for a track already being fetched.
+        if self.lyrics_inflight.contains(&track.id) {
+            return;
+        }
+        let Some(worker) = self.lyrics_worker.clone() else {
+            return;
+        };
+        self.lyrics_inflight.insert(track.id.clone());
+        let tx = self.worker_tx.clone();
+        let track_id = track.id.clone();
+        let name = track.title.clone();
+        let artist = track.uploader.clone();
+        let duration = track.duration;
+        tokio::spawn(async move {
+            let result = match worker.lyrics(name, artist, duration).await {
+                Ok(Some(lrc)) => Some(parse_lrc(&lrc)), // found
+                Ok(None) => Some(Vec::new()),           // definitively none
+                Err(_) => None,                         // transient error — don't cache
+            };
+            let _ = tx.send(WorkerEvent::LyricsReady { track_id, result });
+        });
     }
 
     async fn enter_album(&mut self) {
@@ -739,6 +839,46 @@ impl App {
                     Severity::Error,
                 );
             }
+            WorkerEvent::LyricsReady { track_id, result } => {
+                self.lyrics_inflight.remove(&track_id);
+                let is_current = self.lyrics_track_id.as_deref() == Some(track_id.as_str());
+                match result {
+                    // Definitive answer (found, or genuinely none): cache it.
+                    Some(lines) => {
+                        self.lyrics_cache.insert(track_id, lines.clone());
+                        if is_current {
+                            self.lyrics = Some(lines);
+                            self.current_lyric = 0;
+                        }
+                    }
+                    // Transient error: don't cache (so it retries next play); show
+                    // the empty state rather than a stuck "Fetching…".
+                    None => {
+                        if is_current {
+                            self.lyrics = Some(Vec::new());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Recompute which lyric line is active from the playback position; marks the
+    /// frame dirty only when it changes (a few times a minute), avoiding flicker.
+    fn update_current_lyric(&mut self) {
+        let Some(ref lines) = self.lyrics else {
+            return;
+        };
+        if lines.is_empty() {
+            return;
+        }
+        let pos = self.player.position;
+        let passed = lines.partition_point(|(t, _)| *t <= pos);
+        if passed != self.current_lyric {
+            self.current_lyric = passed;
+            if self.show_lyrics {
+                self.dirty = true;
+            }
         }
     }
 
@@ -813,8 +953,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         app.selection = pos;
     }
 
-    // Spawn the persistent worker actor (needs the Tokio runtime, so not in App::new).
+    // Spawn the persistent worker actors (need the Tokio runtime, so not in App::new).
+    // Downloads and lyrics get separate workers so neither blocks the other.
     app.worker = Some(WorkerHandle::spawn(app.config.clone()));
+    app.lyrics_worker = Some(WorkerHandle::spawn(app.config.clone()));
 
     // Restore the terminal before printing any panic message, so a crash never
     // leaves the shell in raw mode / the alternate screen.
@@ -929,6 +1071,21 @@ mod tests {
         // Nothing playing -> no index.
         app.playing = None;
         assert_eq!(app.playing_index(), None);
+    }
+
+    #[test]
+    fn parse_lrc_sorts_and_skips_metadata() {
+        let lrc = "[ar:Zutomayo]\n[00:12.50]first\n[00:15.00][01:00.00]repeat\n[00:03.00]early\nno timestamp\n";
+        let parsed = super::parse_lrc(lrc);
+        assert_eq!(
+            parsed,
+            vec![
+                (3.0, "early".to_string()),
+                (12.5, "first".to_string()),
+                (15.0, "repeat".to_string()),
+                (60.0, "repeat".to_string()),
+            ]
+        );
     }
 
     #[test]

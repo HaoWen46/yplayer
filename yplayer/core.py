@@ -211,6 +211,71 @@ def _auto_update_ytdlp():
     """Try to update yt-dlp via pip (used as fallback when DownloadError occurs)."""
     _update_ytdlp_pip()
 
+# ----------- Lyrics (LRCLIB) ----------
+
+def _clean_track_title(title: str) -> str:
+    """Reduce a decorated YouTube title to the song name for lyrics matching.
+
+    jpop uploads are typically 'Artist『Song』MV (romaji ...)'. Prefer the text
+    inside Japanese quote brackets; otherwise strip bracketed decorations and
+    common tags (MV, Official Video, feat. ...).
+    """
+    m = re.search(r"[『「【]([^』」】]+)[』」】]", title or "")
+    if m:
+        return m.group(1).strip()
+    t = re.sub(r"[\(\[（【][^\)\]）】]*[\)\]）】]", "", title or "")
+    t = re.sub(r"\b(?:MV|M/V|Music Video|Official.*|Lyric.*|feat\..*)\b", "", t, flags=re.I)
+    return t.strip()
+
+
+def _lrclib_search(track_name: str, artist_name: str, duration: int | None) -> dict:
+    """One LRCLIB /api/search call; return the closest-duration synced hit."""
+    q = urllib.parse.urlencode({"track_name": track_name, "artist_name": artist_name})
+    url = f"https://lrclib.net/api/search?{q}"
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "yplayer (https://github.com/HaoWen46/yplayer)"}
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            results = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(results, list):
+        return {}
+    best, best_score = None, None
+    for r in results:
+        if not r.get("syncedLyrics"):
+            continue
+        rd = r.get("duration") or 0
+        score = abs((duration or rd) - rd)
+        if best_score is None or score < best_score:
+            best, best_score = r, score
+    if best is None:
+        return {}
+    return {"synced": best.get("syncedLyrics"), "plain": best.get("plainLyrics")}
+
+
+def fetch_lyrics(track_name: str, artist_name: str | None = None,
+                 duration: int | None = None) -> dict:
+    """Fetch synced lyrics from LRCLIB (free, keyless).
+
+    Tries the cleaned song title with the artist, then the cleaned title alone
+    (YouTube uploader names rarely match LRCLIB's artist field). Returns a dict
+    with 'synced'/'plain', or {} if nothing was found.
+    """
+    cleaned = _clean_track_title(track_name)
+    for track, artist in [
+        (cleaned, artist_name or ""),
+        (cleaned, ""),
+        (track_name or "", artist_name or ""),
+    ]:
+        if not track:
+            continue
+        hit = _lrclib_search(track, artist, duration)
+        if hit.get("synced"):
+            return hit
+    return {}
+
 # ----------- YouTube Data API (no descriptions) ----------
 
 API_BASE = "https://www.googleapis.com/youtube/v3"

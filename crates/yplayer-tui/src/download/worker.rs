@@ -19,6 +19,12 @@ enum WorkerRequest {
         url: String,
         reply: oneshot::Sender<Result<Track, String>>,
     },
+    Lyrics {
+        track_name: String,
+        artist_name: Option<String>,
+        duration: Option<i64>,
+        reply: oneshot::Sender<Result<Option<String>, String>>,
+    },
 }
 
 /// Cloneable handle the app uses to talk to the worker actor.
@@ -45,10 +51,34 @@ impl WorkerHandle {
         rx.await
             .map_err(|_| "worker dropped the request".to_string())?
     }
+
+    /// Fetch synced lyrics for a track. Ok(None) means "none found".
+    pub async fn lyrics(
+        &self,
+        track_name: String,
+        artist_name: Option<String>,
+        duration: Option<i64>,
+    ) -> Result<Option<String>, String> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(WorkerRequest::Lyrics {
+                track_name,
+                artist_name,
+                duration,
+                reply,
+            })
+            .map_err(|_| "worker actor is gone".to_string())?;
+        rx.await
+            .map_err(|_| "worker dropped the request".to_string())?
+    }
 }
 
 /// Downloads can be slow, but not unbounded — a wedged worker must not hang forever.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+/// Lyrics fetch runs on its own worker. Must exceed the Python side's worst
+/// case (up to 3 LRCLIB calls at 6s each) so a slow LRCLIB doesn't trip the
+/// actor timeout and needlessly respawn the worker.
+const LYRICS_TIMEOUT: Duration = Duration::from_secs(25);
 
 async fn actor(cfg: Config, mut rx: mpsc::UnboundedReceiver<WorkerRequest>) {
     let mut bridge: Option<Bridge> = None;
@@ -87,6 +117,44 @@ async fn actor(cfg: Config, mut rx: mpsc::UnboundedReceiver<WorkerRequest>) {
                             "download timed out after {}s",
                             DOWNLOAD_TIMEOUT.as_secs()
                         )));
+                    }
+                }
+            }
+            WorkerRequest::Lyrics {
+                track_name,
+                artist_name,
+                duration,
+                reply,
+            } => {
+                if bridge.is_none() {
+                    match Bridge::new(&cfg).await {
+                        Ok(b) => bridge = Some(b),
+                        Err(e) => {
+                            let _ = reply.send(Err(format!("worker start failed: {e}")));
+                            continue;
+                        }
+                    }
+                }
+                let b = bridge.as_mut().unwrap();
+
+                let outcome = tokio::time::timeout(
+                    LYRICS_TIMEOUT,
+                    b.lyrics(&track_name, artist_name.as_deref(), duration),
+                )
+                .await;
+                match outcome {
+                    Ok(Ok(lrc)) => {
+                        let _ = reply.send(Ok(lrc));
+                    }
+                    Ok(Err(fail)) => {
+                        if fail.is_transport() {
+                            bridge = None;
+                        }
+                        let _ = reply.send(Err(fail.to_string()));
+                    }
+                    Err(_elapsed) => {
+                        bridge = None;
+                        let _ = reply.send(Err("lyrics request timed out".to_string()));
                     }
                 }
             }

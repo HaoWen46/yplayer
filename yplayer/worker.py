@@ -105,6 +105,19 @@ def _handle_list_formats(req: dict):
     _respond({"ok": True, "formats": formats})
 
 
+def _handle_lyrics(req: dict):
+    from .core import fetch_lyrics
+    result = fetch_lyrics(
+        req.get("track_name", ""),
+        req.get("artist_name"),
+        req.get("duration"),
+    )
+    if result.get("synced") or result.get("plain"):
+        _respond({"ok": True, "synced": result.get("synced"), "plain": result.get("plain")})
+    else:
+        _respond({"ok": False, "error": "no lyrics found"})
+
+
 def main():
     global _current_id
 
@@ -124,6 +137,7 @@ def main():
         "video_info": _handle_video_info,
         "playlist_entries": _handle_playlist_entries,
         "list_formats": _handle_list_formats,
+        "lyrics": _handle_lyrics,
     }
 
     # Announce readiness so the host can tell a live worker from one that failed

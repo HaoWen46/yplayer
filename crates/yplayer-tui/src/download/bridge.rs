@@ -8,7 +8,7 @@ use tokio::process::{Child, Command};
 use crate::config::Config;
 use crate::types::Track;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Default)]
 struct WorkerCommand {
     cmd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -27,6 +27,12 @@ struct WorkerCommand {
     native: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     embed_meta: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    track_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artist_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,6 +52,8 @@ pub struct WorkerResponse {
     pub entries: Option<Vec<Value>>,
     #[serde(default)]
     pub formats: Option<Vec<Value>>,
+    #[serde(default)]
+    pub synced: Option<String>,
 }
 
 #[derive(Debug)]
@@ -241,8 +249,7 @@ impl Bridge {
                 api_key: cfg.api_key.clone(),
                 native: Some(cfg.native),
                 embed_meta: Some(cfg.embed_meta),
-                query: None,
-                limit: None,
+                ..Default::default()
             })
             .await?;
 
@@ -288,11 +295,7 @@ impl Bridge {
                 query: Some(query.to_string()),
                 limit: Some(limit),
                 api_key: cfg.api_key.clone(),
-                url: None,
-                cache_dir: None,
-                format: None,
-                native: None,
-                embed_meta: None,
+                ..Default::default()
             })
             .await?;
 
@@ -310,13 +313,7 @@ impl Bridge {
             .send(WorkerCommand {
                 cmd: "playlist_entries".to_string(),
                 url: Some(url.to_string()),
-                query: None,
-                limit: None,
-                cache_dir: None,
-                format: None,
-                api_key: None,
-                native: None,
-                embed_meta: None,
+                ..Default::default()
             })
             .await?;
 
@@ -332,13 +329,7 @@ impl Bridge {
             .send(WorkerCommand {
                 cmd: "list_formats".to_string(),
                 url: Some(url.to_string()),
-                query: None,
-                limit: None,
-                cache_dir: None,
-                format: None,
-                api_key: None,
-                native: None,
-                embed_meta: None,
+                ..Default::default()
             })
             .await?;
 
@@ -349,6 +340,30 @@ impl Bridge {
             .map(|v| v.to_string())
             .collect();
         Ok(formats)
+    }
+
+    /// Fetch synced lyrics (LRC text) for a track. Returns Ok(None) when the
+    /// worker found none (an application-level "not found", not a failure).
+    pub async fn lyrics(
+        &mut self,
+        track_name: &str,
+        artist_name: Option<&str>,
+        duration: Option<i64>,
+    ) -> Result<Option<String>, WorkerFailure> {
+        match self
+            .send(WorkerCommand {
+                cmd: "lyrics".to_string(),
+                track_name: Some(track_name.to_string()),
+                artist_name: artist_name.map(str::to_string),
+                duration,
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(resp) => Ok(resp.synced),
+            Err(WorkerFailure::App(_)) => Ok(None), // "no lyrics found"
+            Err(e) => Err(e),
+        }
     }
 }
 

@@ -25,6 +25,7 @@ pub enum Action {
     NextTrack,
     PrevTrack,
     ToggleHelp,
+    ToggleLyrics,
     Tick,
 }
 
@@ -63,6 +64,7 @@ fn map_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('n') => Some(Action::NextTrack),
         KeyCode::Char('p') => Some(Action::PrevTrack),
         KeyCode::Char('?') => Some(Action::ToggleHelp),
+        KeyCode::Char('L') => Some(Action::ToggleLyrics),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Quit),
         _ => None,
     }

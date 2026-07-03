@@ -18,6 +18,7 @@ const SECTIONS: &[Section] = &[
             ("\u{2190} / \u{2192}", "seek -5s / +5s"),
             ("+ / -", "volume up / down"),
             ("l", "cycle loop: single / all / shuffle"),
+            ("L", "toggle synced lyrics"),
         ],
     ),
     (
