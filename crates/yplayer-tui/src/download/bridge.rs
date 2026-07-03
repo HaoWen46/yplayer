@@ -59,19 +59,36 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    pub async fn new(_cfg: &Config) -> Result<Self> {
+    pub async fn new(cfg: &Config) -> Result<Self> {
         // Find Python executable — prefer the venv Python next to the Rust binary
         let python = find_python()?;
+
+        // Send worker stderr (tracebacks, yt-dlp / pip output) to a log file rather
+        // than the terminal — inheriting it would corrupt the raw-mode alternate screen.
+        let log_path = cfg.cache_dir.join(".worker.log");
+        let stderr = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_path)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
 
         let mut child = Command::new(&python)
             .arg("-m")
             .arg("yplayer.worker")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(stderr)
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("Failed to spawn Python worker with: {}", python))?;
+            .with_context(|| {
+                format!(
+                    "Failed to spawn Python worker with: {} (stderr log: {})",
+                    python,
+                    log_path.display()
+                )
+            })?;
 
         let stdin = child.stdin.take().context("No stdin on worker")?;
         let stdout = child.stdout.take().context("No stdout on worker")?;

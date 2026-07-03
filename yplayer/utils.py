@@ -28,12 +28,23 @@ class Colors:
     BRIGHT_WHITE   = "\033[97m"
 
 
+class YplayerError(Exception):
+    """An expected, user-facing failure whose message is safe to show in the UI.
+
+    The worker returns ``str(YplayerError)`` in the JSON ``error`` field so the
+    Rust TUI can display the real reason instead of a generic string.
+    """
+
+
 def which(prog: str) -> Optional[str]:
     return shutil.which(prog)
 
 def die(msg: str, code: int = 1):
+    """Report an expected failure. Writes to stderr (captured to the worker log)
+    and raises YplayerError so callers/worker surface the message."""
+    _ = code  # retained for call-site compatibility; no process exit anymore
     sys.stderr.write(f"\x1b[31merror:\x1b[0m {msg}\n")
-    raise SystemExit(code)
+    raise YplayerError(msg)
 
 def info(msg: str):
     sys.stderr.write(f"\x1b[36minfo:\x1b[0m {msg}\n")

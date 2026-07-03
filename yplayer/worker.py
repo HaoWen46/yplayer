@@ -16,6 +16,7 @@ Commands:
 import json
 import sys
 import os
+import threading
 
 # Ensure yt-dlp is up to date on worker start
 from .core import (
@@ -101,11 +102,15 @@ def _handle_list_formats(req: dict):
 
 
 def main():
-    # Auto-update yt-dlp on worker start
-    try:
-        ensure_ytdlp_uptodate()
-    except Exception:
-        pass
+    # Check for a newer yt-dlp in the background so requests are served
+    # immediately; the check itself is throttled to once per day.
+    def _bg_update():
+        try:
+            ensure_ytdlp_uptodate(os.path.expanduser("~/Music/yt-audio"))
+        except Exception:
+            pass
+
+    threading.Thread(target=_bg_update, daemon=True).start()
 
     handlers = {
         "download": _handle_download,
@@ -133,10 +138,11 @@ def main():
 
         try:
             handler(req)
-        except SystemExit:
-            # core.die() calls sys.exit — catch and report as error
-            _respond({"ok": False, "error": "Operation failed (see stderr)"})
+        except SystemExit as e:
+            # A library may call sys.exit(); keep the worker alive and report it.
+            _respond({"ok": False, "error": f"worker aborted: {e}"})
         except Exception as e:
+            # Includes YplayerError from die(), which carries the real message.
             _respond({"ok": False, "error": str(e)})
 
 

@@ -1,3 +1,10 @@
 [workspace]
 members = ["crates/yplayer-tui"]
 resolver = "2"
+
+# Smaller, faster release binary. LTO + a single codegen unit shrink the
+# ratatui + bundled-SQLite binary substantially; strip drops debug symbols.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

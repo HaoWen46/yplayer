@@ -49,6 +49,13 @@ pub fn scan_and_index(cache_dir: &Path, db: &CacheIndex) -> Result<usize> {
             None => continue,
         };
 
+        // Incremental: skip tracks already in the DB (or a second folder sharing
+        // the same id). Without this, every launch re-parses the whole library
+        // and the returned "new tracks" count is wrong.
+        if seen_ids.contains(&id) {
+            continue;
+        }
+
         // Find audio file in the directory
         let audio_path = find_audio_in_dir(dir);
         let audio_path = match audio_path {

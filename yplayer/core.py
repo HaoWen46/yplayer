@@ -160,14 +160,52 @@ def _update_ytdlp_pip() -> bool:
         return False
 
 
-def ensure_ytdlp_uptodate():
-    """Check if yt-dlp is up to date and update if needed."""
-    current, latest = _get_ytdlp_versions()
-    if not current or not latest:
-        return  # Can't determine versions, skip check
+def _version_tuple(v: str) -> tuple:
+    """Parse a version like '2026.06.09' into a comparable tuple of ints.
+    Non-numeric parts contribute their leading digits, or 0."""
+    out = []
+    for part in v.split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out)
 
-    # Normalize versions for comparison (e.g., 2026.01.29 == 2026.1.29)
-    if _normalize_version(current) != _normalize_version(latest):
+
+def ensure_ytdlp_uptodate(cache_dir: Optional[str] = None, *, max_age_hours: float = 24.0):
+    """Update yt-dlp only when PyPI has a strictly newer release.
+
+    Throttled: if a check ran within ``max_age_hours`` (tracked by a timestamp
+    file under ``cache_dir``), this returns immediately. Comparing by version
+    ordering — not ``!=`` — avoids pointlessly "downgrading" a locally newer
+    dev build on every start.
+    """
+    stamp = os.path.join(cache_dir, ".ytdlp_update_check") if cache_dir else None
+    if stamp:
+        try:
+            if os.path.exists(stamp) and (time.time() - os.path.getmtime(stamp)) < max_age_hours * 3600:
+                return
+        except OSError:
+            pass
+
+    current, latest = _get_ytdlp_versions()
+
+    # Record the attempt regardless of outcome, so a failed PyPI fetch doesn't
+    # re-hit the network on every launch.
+    if stamp:
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(stamp, "w", encoding="utf-8") as f:
+                f.write(str(int(time.time())))
+        except OSError:
+            pass
+
+    if not current or not latest:
+        return  # Can't determine versions, skip
+
+    try:
+        outdated = _version_tuple(latest) > _version_tuple(current)
+    except Exception:
+        outdated = _normalize_version(current) != _normalize_version(latest)
+    if outdated:
         info(f"yt-dlp is outdated ({current} -> {latest})")
         _update_ytdlp_pip()
 

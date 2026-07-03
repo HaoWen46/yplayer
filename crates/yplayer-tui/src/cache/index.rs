@@ -13,11 +13,28 @@ impl CacheIndex {
         let conn = Connection::open(db_path)
             .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
 
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA foreign_keys=ON;
+             PRAGMA busy_timeout=5000;",
+        )?;
 
         let idx = Self { conn };
         idx.create_tables()?;
+        // The ON DELETE CASCADE was historically a no-op (foreign_keys defaulted
+        // off), so old databases can carry album_tracks rows for deleted tracks.
+        idx.cleanup_orphans()?;
         Ok(idx)
+    }
+
+    /// Remove album_tracks rows referencing tracks that no longer exist.
+    fn cleanup_orphans(&self) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM album_tracks WHERE track_id NOT IN (SELECT id FROM tracks)",
+            [],
+        )?;
+        Ok(())
     }
 
     fn create_tables(&self) -> Result<()> {
@@ -249,6 +266,24 @@ impl CacheIndex {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Return the id of the album named `name`, creating it if absent.
+    /// (albums.name is UNIQUE, so a plain INSERT fails on re-sync — this doesn't.)
+    pub fn get_or_create_album(&self, name: &str, description: &str) -> Result<i64> {
+        use rusqlite::OptionalExtension;
+        if let Some(id) = self
+            .conn
+            .query_row(
+                "SELECT id FROM albums WHERE name = ?1",
+                params![name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            return Ok(id);
+        }
+        self.create_album(name, description)
+    }
+
     pub fn get_album_tracks(&self, album_id: i64) -> Result<Vec<Track>> {
         let mut stmt = self.conn.prepare(
             "SELECT t.id, t.title, t.uploader, t.duration, t.webpage_url, t.audio_path, t.format, t.file_size, t.added_at, t.last_played
@@ -329,16 +364,88 @@ impl CacheIndex {
         Ok(())
     }
 
-    /// Bulk insert album data (for scanner migration).
+    /// Bulk insert album data (for scanner migration). Idempotent across launches:
+    /// gets-or-creates the album and ignores album_tracks rows that already exist
+    /// or reference missing tracks (skipped by OR IGNORE under foreign_keys=ON).
     pub fn bulk_insert_album(&self, name: &str, description: &str, track_ids: &[(String, i32)]) -> Result<()> {
-        let album_id = self.create_album(name, description)?;
-        let mut stmt = self.conn.prepare(
-            "INSERT OR IGNORE INTO album_tracks (album_id, track_id, position) VALUES (?1, ?2, ?3)",
-        )?;
-        for (track_id, position) in track_ids {
-            stmt.execute(params![album_id, track_id, position])?;
+        let album_id = self.get_or_create_album(name, description)?;
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO album_tracks (album_id, track_id, position) VALUES (?1, ?2, ?3)",
+            )?;
+            for (track_id, position) in track_ids {
+                stmt.execute(params![album_id, track_id, position])?;
+            }
         }
+        tx.commit()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(id: &str, title: &str) -> Track {
+        Track {
+            id: id.to_string(),
+            title: title.to_string(),
+            uploader: Some("Zutomayo".to_string()),
+            duration: Some(215),
+            webpage_url: Some(format!("https://youtu.be/{id}")),
+            audio_path: Some(format!("/tmp/{id}.mp3")),
+            format: Some("mp3".to_string()),
+            file_size: Some(1234),
+            added_at: None,
+            last_played: None,
+        }
+    }
+
+    fn open_temp() -> (CacheIndex, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = CacheIndex::open(&dir.path().join("test.db")).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn cjk_title_round_trips_byte_exact() {
+        let (db, _dir) = open_temp();
+        let t = track("abc12345", "ずっと真夜中でいいのに。— 秒針を噛む");
+        db.upsert_track(&t).unwrap();
+        let got = db.get_track("abc12345").unwrap().unwrap();
+        assert_eq!(got.title, "ずっと真夜中でいいのに。— 秒針を噛む");
+    }
+
+    #[test]
+    fn deleting_a_track_leaves_no_orphan_album_rows() {
+        let (db, _dir) = open_temp();
+        db.upsert_track(&track("t1", "One")).unwrap();
+        db.upsert_track(&track("t2", "Two")).unwrap();
+        let album = db.get_or_create_album("Best", "").unwrap();
+        db.add_track_to_album(album, "t1", 0).unwrap();
+        db.add_track_to_album(album, "t2", 1).unwrap();
+
+        // With foreign_keys=ON, deleting a track cascades to album_tracks, so the
+        // album's reported count stays in sync with its actual joined tracks.
+        db.delete_track("t1").unwrap();
+        assert_eq!(db.get_album_tracks(album).unwrap().len(), 1);
+        let albums = db.list_albums().unwrap();
+        assert_eq!(albums[0].track_count, 1);
+    }
+
+    #[test]
+    fn bulk_insert_album_is_idempotent_across_reruns() {
+        let (db, _dir) = open_temp();
+        db.upsert_track(&track("t1", "One")).unwrap();
+        let rows = [("t1".to_string(), 0)];
+        // Simulates the scanner running on every launch — the second call used to
+        // fail on the albums.name UNIQUE constraint and silently skip re-sync.
+        db.bulk_insert_album("Mix", "", &rows).unwrap();
+        db.bulk_insert_album("Mix", "", &rows).unwrap();
+        let albums = db.list_albums().unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].track_count, 1);
     }
 }
 
