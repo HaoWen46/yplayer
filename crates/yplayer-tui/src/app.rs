@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::cache::index::CacheIndex;
 use crate::cache::scanner;
 use crate::config::Config;
-use crate::download::bridge::Bridge;
+use crate::download::worker::WorkerHandle;
 use crate::events::{self, Action};
 use crate::player::mpv::MpvPlayer;
 use crate::types::{Album, LoopMode, SortMode, Track, ViewMode};
@@ -60,6 +60,8 @@ pub struct App {
     // Background download tasks report results here; run() owns the receiver.
     worker_tx: mpsc::UnboundedSender<WorkerEvent>,
     worker_rx: Option<mpsc::UnboundedReceiver<WorkerEvent>>,
+    // Persistent worker actor handle; set by run() (needs a Tokio runtime).
+    worker: Option<WorkerHandle>,
 }
 
 impl App {
@@ -90,6 +92,7 @@ impl App {
             confirm_delete_until: None,
             worker_tx,
             worker_rx: Some(worker_rx),
+            worker: None,
         }
     }
 
@@ -679,25 +682,17 @@ impl App {
 
         self.set_status(format!("Downloading {}…", truncate_chars(&url, 40)));
 
-        // Run the download off the event loop; the result comes back over the
-        // worker channel so the UI stays responsive for the whole download.
+        // Run the download through the persistent worker actor, off the event
+        // loop; the result comes back over the channel so the UI stays responsive.
+        let Some(worker) = self.worker.clone() else {
+            self.set_status("Worker not ready".to_string());
+            return;
+        };
         let tx = self.worker_tx.clone();
-        let cfg = self.config.clone();
         tokio::spawn(async move {
-            let ev = match Bridge::new(&cfg).await {
-                Ok(mut bridge) => match bridge.download(&url, &cfg).await {
-                    Ok(result) => WorkerEvent::DownloadDone {
-                        track: result.track,
-                    },
-                    Err(e) => WorkerEvent::DownloadFailed {
-                        url,
-                        error: e.to_string(),
-                    },
-                },
-                Err(e) => WorkerEvent::DownloadFailed {
-                    url,
-                    error: format!("worker: {e}"),
-                },
+            let ev = match worker.download(url.clone()).await {
+                Ok(track) => WorkerEvent::DownloadDone { track },
+                Err(error) => WorkerEvent::DownloadFailed { url, error },
             };
             let _ = tx.send(ev);
         });
@@ -778,6 +773,9 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     let mut app = App::new(cfg, db);
     app.load_library();
+
+    // Spawn the persistent worker actor (needs the Tokio runtime, so not in App::new).
+    app.worker = Some(WorkerHandle::spawn(app.config.clone()));
 
     // Restore the terminal before printing any panic message, so a crash never
     // leaves the shell in raw mode / the alternate screen.

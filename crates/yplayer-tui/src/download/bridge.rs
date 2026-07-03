@@ -31,6 +31,8 @@ struct WorkerCommand {
 
 #[derive(Debug, Deserialize)]
 pub struct WorkerResponse {
+    #[serde(default)]
+    pub id: Option<u64>,
     pub ok: bool,
     #[serde(default)]
     pub error: Option<String>,
@@ -52,16 +54,54 @@ pub struct DownloadResult {
     pub track: Track,
 }
 
+/// Why a worker request failed. `Transport` means the worker process is
+/// unhealthy and should be respawned; `App` is a worker-reported error (e.g.
+/// "video unavailable") that leaves the worker perfectly usable.
+#[derive(Debug)]
+pub enum WorkerFailure {
+    Transport(anyhow::Error),
+    App(String),
+}
+
+impl WorkerFailure {
+    pub fn is_transport(&self) -> bool {
+        matches!(self, WorkerFailure::Transport(_))
+    }
+}
+
+impl std::fmt::Display for WorkerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkerFailure::Transport(e) => write!(f, "{e}"),
+            WorkerFailure::App(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl From<anyhow::Error> for WorkerFailure {
+    fn from(e: anyhow::Error) -> Self {
+        WorkerFailure::Transport(e)
+    }
+}
+
+impl From<WorkerFailure> for anyhow::Error {
+    fn from(e: WorkerFailure) -> Self {
+        anyhow::anyhow!("{e}")
+    }
+}
+
 pub struct Bridge {
     child: Child,
     stdin: tokio::process::ChildStdin,
     reader: BufReader<tokio::process::ChildStdout>,
+    next_id: u64,
 }
 
 impl Bridge {
     pub async fn new(cfg: &Config) -> Result<Self> {
-        // Find Python executable — prefer the venv Python next to the Rust binary
-        let python = find_python()?;
+        // Tests can inject a fake worker via YPLAY_WORKER_CMD; otherwise prefer
+        // the venv Python next to the Rust binary.
+        let (program, args) = worker_command()?;
 
         // Send worker stderr (tracebacks, yt-dlp / pip output) to a log file rather
         // than the terminal — inheriting it would corrupt the raw-mode alternate screen.
@@ -74,9 +114,8 @@ impl Bridge {
             .map(Stdio::from)
             .unwrap_or_else(|_| Stdio::null());
 
-        let mut child = Command::new(&python)
-            .arg("-m")
-            .arg("yplayer.worker")
+        let mut child = Command::new(&program)
+            .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
@@ -84,8 +123,9 @@ impl Bridge {
             .spawn()
             .with_context(|| {
                 format!(
-                    "Failed to spawn Python worker with: {} (stderr log: {})",
-                    python,
+                    "Failed to spawn worker: {} {} (stderr log: {})",
+                    program,
+                    args.join(" "),
                     log_path.display()
                 )
             })?;
@@ -94,38 +134,99 @@ impl Bridge {
         let stdout = child.stdout.take().context("No stdout on worker")?;
         let reader = BufReader::new(stdout);
 
-        Ok(Self {
+        let mut bridge = Self {
             child,
             stdin,
             reader,
-        })
+            next_id: 1,
+        };
+        bridge.await_ready().await?;
+        Ok(bridge)
     }
 
-    async fn send(&mut self, cmd: WorkerCommand) -> Result<WorkerResponse> {
-        let mut line = serde_json::to_string(&cmd)?;
+    /// Read the worker's readiness handshake, so a worker that failed to start
+    /// is detected here rather than on the first real request.
+    async fn await_ready(&mut self) -> Result<()> {
+        let mut line = String::new();
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.reader.read_line(&mut line),
+        )
+        .await
+        .context("worker did not send its readiness handshake in time")?
+        .context("failed reading worker handshake")?;
+        if n == 0 {
+            anyhow::bail!("worker exited before handshake (see .worker.log)");
+        }
+        let v: Value = serde_json::from_str(line.trim())
+            .with_context(|| format!("worker handshake was not JSON: {:?}", line.trim()))?;
+        if v.get("event").and_then(|e| e.as_str()) != Some("ready") {
+            anyhow::bail!("unexpected worker handshake: {}", line.trim());
+        }
+        Ok(())
+    }
+
+    async fn send(&mut self, cmd: WorkerCommand) -> Result<WorkerResponse, WorkerFailure> {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        // Serialize, then inject the request id so callers never manage ids.
+        let mut value =
+            serde_json::to_value(&cmd).map_err(|e| WorkerFailure::Transport(e.into()))?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("id".to_string(), serde_json::json!(id));
+        }
+        let mut line =
+            serde_json::to_string(&value).map_err(|e| WorkerFailure::Transport(e.into()))?;
         line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await?;
-        self.stdin.flush().await?;
+        self.stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| WorkerFailure::Transport(e.into()))?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|e| WorkerFailure::Transport(e.into()))?;
 
         let mut response_line = String::new();
-        self.reader.read_line(&mut response_line).await?;
-
-        if response_line.is_empty() {
-            anyhow::bail!("Python worker closed unexpectedly");
+        let n = self
+            .reader
+            .read_line(&mut response_line)
+            .await
+            .map_err(|e| WorkerFailure::Transport(e.into()))?;
+        if n == 0 {
+            return Err(WorkerFailure::Transport(anyhow::anyhow!(
+                "worker closed unexpectedly"
+            )));
         }
 
-        let resp: WorkerResponse =
-            serde_json::from_str(&response_line).context("Invalid JSON from worker")?;
+        let resp: WorkerResponse = serde_json::from_str(&response_line).map_err(|e| {
+            WorkerFailure::Transport(anyhow::anyhow!("invalid JSON from worker: {e}"))
+        })?;
+
+        if let Some(rid) = resp.id {
+            if rid != id {
+                return Err(WorkerFailure::Transport(anyhow::anyhow!(
+                    "worker response id mismatch (got {rid}, want {id})"
+                )));
+            }
+        }
 
         if !resp.ok {
-            let err = resp.error.unwrap_or_else(|| "Unknown error".to_string());
-            anyhow::bail!("Worker error: {}", err);
+            return Err(WorkerFailure::App(
+                resp.error
+                    .unwrap_or_else(|| "unknown worker error".to_string()),
+            ));
         }
 
         Ok(resp)
     }
 
-    pub async fn download(&mut self, url: &str, cfg: &Config) -> Result<DownloadResult> {
+    pub async fn download(
+        &mut self,
+        url: &str,
+        cfg: &Config,
+    ) -> Result<DownloadResult, WorkerFailure> {
         let resp = self
             .send(WorkerCommand {
                 cmd: "download".to_string(),
@@ -140,7 +241,9 @@ impl Bridge {
             })
             .await?;
 
-        let path = resp.path.context("No path in download response")?;
+        let path = resp
+            .path
+            .ok_or_else(|| WorkerFailure::App("no path in download response".to_string()))?;
         let meta = resp.meta.unwrap_or(Value::Null);
 
         let track = Track {
@@ -282,6 +385,23 @@ fn parse_track_from_value(v: &Value) -> Option<Track> {
         added_at: None,
         last_played: None,
     })
+}
+
+/// The command used to launch the worker. Overridable via YPLAY_WORKER_CMD
+/// (whitespace-separated) so tests can substitute a fake worker.
+fn worker_command() -> Result<(String, Vec<String>)> {
+    if let Ok(custom) = std::env::var("YPLAY_WORKER_CMD") {
+        let mut parts: Vec<String> = custom.split_whitespace().map(String::from).collect();
+        if parts.is_empty() {
+            anyhow::bail!("YPLAY_WORKER_CMD is set but empty");
+        }
+        let program = parts.remove(0);
+        return Ok((program, parts));
+    }
+    Ok((
+        find_python()?,
+        vec!["-m".to_string(), "yplayer.worker".to_string()],
+    ))
 }
 
 fn find_python() -> Result<String> {

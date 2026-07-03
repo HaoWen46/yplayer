@@ -33,12 +33,17 @@ def test_worker_protocol_roundtrip():
         stderr=subprocess.PIPE,
         text=True,
     )
-    out, _err = proc.communicate('{"cmd": "__unknown__"}\n', timeout=60)
+    out, _err = proc.communicate('{"id": 7, "cmd": "__unknown__"}\n', timeout=60)
 
-    # Exactly one JSON line on stdout, and nothing else leaks there.
-    lines = [ln for ln in out.splitlines() if ln.strip()]
-    assert len(lines) == 1, f"expected one JSON line on stdout, got: {lines!r}"
+    # Only JSON lines on stdout, nothing else leaks there.
+    lines = [json.loads(ln) for ln in out.splitlines() if ln.strip()]
+    assert len(lines) == 2, f"expected ready + one response, got: {lines!r}"
 
-    resp = json.loads(lines[0])
+    # First line is the readiness handshake.
+    assert lines[0].get("event") == "ready"
+
+    # Second line is the response, with the request id echoed back.
+    resp = lines[1]
     assert resp["ok"] is False
+    assert resp["id"] == 7
     assert "__unknown__" in resp["error"]

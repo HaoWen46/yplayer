@@ -31,8 +31,15 @@ from .core import (
 from .playlist import extract_playlist_entries
 
 
+# The id of the request currently being handled, echoed back on every response
+# so the host can correlate replies and detect protocol desync.
+_current_id = None
+
+
 def _respond(obj: dict):
-    """Write a JSON line to stdout and flush."""
+    """Write a JSON line to stdout and flush, echoing the current request id."""
+    if _current_id is not None and "id" not in obj:
+        obj = {"id": _current_id, **obj}
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
@@ -102,6 +109,8 @@ def _handle_list_formats(req: dict):
 
 
 def main():
+    global _current_id
+
     # Check for a newer yt-dlp in the background so requests are served
     # immediately; the check itself is throttled to once per day.
     def _bg_update():
@@ -120,16 +129,22 @@ def main():
         "list_formats": _handle_list_formats,
     }
 
+    # Announce readiness so the host can tell a live worker from one that failed
+    # to import/start, and can begin sending requests.
+    _respond({"event": "ready", "ok": True})
+
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
+        _current_id = None
         try:
             req = json.loads(line)
         except json.JSONDecodeError as e:
             _respond({"ok": False, "error": f"Invalid JSON: {e}"})
             continue
 
+        _current_id = req.get("id") if isinstance(req, dict) else None
         cmd = req.get("cmd", "")
         handler = handlers.get(cmd)
         if handler is None:
