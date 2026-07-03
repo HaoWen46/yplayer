@@ -13,30 +13,27 @@ Features:
 - Sidecar JSON: legacy <cache>/<id>.json still written; folder meta.json added.
 - Cached library listing helpers for the browse UI (both layouts).
 """
+import json
 import os
 import re
-import json
+import subprocess
 import sys
 import time
 import urllib.parse
 import urllib.request
-import subprocess
-import shutil
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
 from .config import (
-    DEFAULT_CACHE_DIR,
     DEFAULT_AUDIO_FORMAT,
-    SUPPORTED_FORMATS,
+    DEFAULT_CACHE_DIR,
     EMBED_METADATA_DEFAULT,
     KNOWN_EXTS,
-    YTDL_AUDIO_FORMAT,
+    SUPPORTED_FORMATS,
 )
-from .utils import which, die, info, normalize_ext
+from .utils import die, info, normalize_ext, which
 
 # ----------- URL / ID helpers -----------
 
@@ -46,7 +43,7 @@ YOUTUBE_ID_RE = re.compile(r"(?:v=|\/)([0-9A-Za-z_-]{11})(?:[^0-9A-Za-z_-]|$)")
 def is_url(s: str) -> bool:
     return bool(YOUTUBE_URL_RE.search(s))
 
-def extract_video_id(url: str) -> Optional[str]:
+def extract_video_id(url: str) -> str | None:
     """Try to extract a YouTube video ID from common URL forms."""
     if not url:
         return None
@@ -61,11 +58,11 @@ class Options:
     fmt: str = DEFAULT_AUDIO_FORMAT
     native: bool = False
     embed_meta: bool = EMBED_METADATA_DEFAULT
-    audio_quality: Optional[str] = None  # "0" best for VBR when converting
+    audio_quality: str | None = None  # "0" best for VBR when converting
     list_formats: bool = False
-    player: Optional[str] = None
+    player: str | None = None
     play_after: bool = True
-    volume: Optional[float] = None
+    volume: float | None = None
     print_only: bool = False
 
 # ----------- FS / deps -----------
@@ -96,7 +93,7 @@ def _normalize_version(v: str) -> str:
     return ".".join(normalized)
 
 
-def _get_ytdlp_versions() -> tuple[Optional[str], Optional[str]]:
+def _get_ytdlp_versions() -> tuple[str | None, str | None]:
     """Get current and latest yt-dlp versions. Returns (current, latest) or (None, None) on error."""
     try:
         import yt_dlp
@@ -170,7 +167,7 @@ def _version_tuple(v: str) -> tuple:
     return tuple(out)
 
 
-def ensure_ytdlp_uptodate(cache_dir: Optional[str] = None, *, max_age_hours: float = 24.0):
+def ensure_ytdlp_uptodate(cache_dir: str | None = None, *, max_age_hours: float = 24.0):
     """Update yt-dlp only when PyPI has a strictly newer release.
 
     Throttled: if a check ran within ``max_age_hours`` (tracked by a timestamp
@@ -218,18 +215,18 @@ def _auto_update_ytdlp():
 
 API_BASE = "https://www.googleapis.com/youtube/v3"
 
-def _require_api_key(api_key: Optional[str]) -> str:
+def _require_api_key(api_key: str | None) -> str:
     key = api_key or os.environ.get("YT_API_KEY")
     if not key:
         die("YouTube Data API key missing. Set $YT_API_KEY or pass --yt-api-key.")
     return key
 
-def _http_get_json(url: str, timeout: int = 10) -> Dict:
+def _http_get_json(url: str, timeout: int = 10) -> dict:
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
-def _parse_iso8601_duration(s: Optional[str]) -> Optional[int]:
+def _parse_iso8601_duration(s: str | None) -> int | None:
     """Convert ISO-8601 duration (PT#H#M#S) to seconds."""
     if not s or not s.startswith("PT"):
         return None
@@ -251,7 +248,7 @@ def _parse_iso8601_duration(s: Optional[str]) -> Optional[int]:
             num = ""
     return h * 3600 + m * 60 + sec
 
-def yt_api_search(query: str, limit: int, api_key: str) -> List[Dict]:
+def yt_api_search(query: str, limit: int, api_key: str) -> list[dict]:
     """Use search.list to get videoId / title / channelTitle. No descriptions."""
     qs = urllib.parse.urlencode({
         "part": "snippet",
@@ -262,7 +259,7 @@ def yt_api_search(query: str, limit: int, api_key: str) -> List[Dict]:
     })
     url = f"{API_BASE}/search?{qs}"
     data = _http_get_json(url)
-    out: List[Dict] = []
+    out: list[dict] = []
     for it in data.get("items", []):
         vid = it.get("id", {}).get("videoId")
         sn = it.get("snippet", {}) or {}
@@ -277,9 +274,9 @@ def yt_api_search(query: str, limit: int, api_key: str) -> List[Dict]:
         })
     return out
 
-def yt_api_durations(ids: List[str], api_key: str) -> Dict[str, Optional[int]]:
+def yt_api_durations(ids: list[str], api_key: str) -> dict[str, int | None]:
     """Batch videos.list(contentDetails) -> map id -> seconds."""
-    out: Dict[str, Optional[int]] = {}
+    out: dict[str, int | None] = {}
     base = f"{API_BASE}/videos"
     for i in range(0, len(ids), 50):
         chunk = ids[i:i+50]
@@ -299,7 +296,7 @@ def yt_api_durations(ids: List[str], api_key: str) -> Dict[str, Optional[int]]:
             out.setdefault(vid, None)
     return out
 
-def yt_api_video_info(video_id: str, api_key: str) -> Optional[Dict]:
+def yt_api_video_info(video_id: str, api_key: str) -> dict | None:
     """Fetch minimal info for a single video: title, uploader, duration."""
     qs = urllib.parse.urlencode({
         "part": "snippet,contentDetails",
@@ -328,7 +325,7 @@ def _meta_path(cache_dir: str, vid: str) -> str:
     # legacy flat sidecar path
     return os.path.join(cache_dir, f"{vid}.json")
 
-def save_sidecar(cache_dir: str, info_obj: Dict, *, track_dir: Optional[str] = None):
+def save_sidecar(cache_dir: str, info_obj: dict, *, track_dir: str | None = None):
     """Write minimal metadata JSON next to the audio file.
        Writes both the legacy <cache>/<id>.json and, if track_dir provided, <track_dir>/meta.json.
     """
@@ -358,7 +355,7 @@ def save_sidecar(cache_dir: str, info_obj: Dict, *, track_dir: Optional[str] = N
         except Exception:
             pass
 
-def _sanitize_title(title: Optional[str]) -> str:
+def _sanitize_title(title: str | None) -> str:
     """Make a filesystem-safe-ish filename from a title (keeps unicode)."""
     if not title:
         return ""
@@ -367,7 +364,7 @@ def _sanitize_title(title: Optional[str]) -> str:
     s = re.sub(r'\s+', ' ', s)
     return s[:200].strip()
 
-def _pick_existing_path(cache_dir: str, vid: str) -> Optional[str]:
+def _pick_existing_path(cache_dir: str, vid: str) -> str | None:
     """Find an existing file by id or fuzzy matches in flat layout."""
     # 1) id.ext exact
     for ext in KNOWN_EXTS:
@@ -394,7 +391,7 @@ def _iter_track_dirs(cache_dir: str):
     except Exception:
         return
 
-def _first_audio_in_dir(d: str) -> Optional[str]:
+def _first_audio_in_dir(d: str) -> str | None:
     try:
         for fname in os.listdir(d):
             p = os.path.join(d, fname)
@@ -406,7 +403,7 @@ def _first_audio_in_dir(d: str) -> Optional[str]:
         return None
     return None
 
-def find_existing(cache_dir: str, vid: str, title: Optional[str] = None) -> Optional[str]:
+def find_existing(cache_dir: str, vid: str, title: str | None = None) -> str | None:
     """
     Search cache_dir for a file matching the video id or the title (sanitized).
     Supports both layouts (per-track folder and legacy flat).
@@ -418,7 +415,7 @@ def find_existing(cache_dir: str, vid: str, title: Optional[str] = None) -> Opti
     # 0) per-track folder: look for meta.json where id matches
     for d in _iter_track_dirs(cache_dir):
         try:
-            with open(os.path.join(d, "meta.json"), "r", encoding="utf-8") as f:
+            with open(os.path.join(d, "meta.json"), encoding="utf-8") as f:
                 meta = json.load(f)
             if meta.get("id") == vid:
                 p = _first_audio_in_dir(d)
@@ -455,9 +452,9 @@ def find_existing(cache_dir: str, vid: str, title: Optional[str] = None) -> Opti
 
     return None
 
-def list_cached_tracks(cache_dir: str) -> List[Dict]:
+def list_cached_tracks(cache_dir: str) -> list[dict]:
     """Scan cache dir, return unique tracks with sidecar metadata if present. Supports both layouts."""
-    out: List[Dict] = []
+    out: list[dict] = []
     if not os.path.isdir(cache_dir):
         return out
 
@@ -465,7 +462,7 @@ def list_cached_tracks(cache_dir: str) -> List[Dict]:
     for d in _iter_track_dirs(cache_dir):
         meta = None
         try:
-            with open(os.path.join(d, "meta.json"), "r", encoding="utf-8") as f:
+            with open(os.path.join(d, "meta.json"), encoding="utf-8") as f:
                 meta = json.load(f)
         except Exception:
             meta = None
@@ -481,7 +478,7 @@ def list_cached_tracks(cache_dir: str) -> List[Dict]:
             })
 
     # legacy flat files + sidecars
-    seen_ids: Dict[str, Dict] = {}
+    seen_ids: dict[str, dict] = {}
     try:
         for name in os.listdir(cache_dir):
             base, ext = os.path.splitext(name)
@@ -493,7 +490,7 @@ def list_cached_tracks(cache_dir: str) -> List[Dict]:
                 entry["path"] = full
             elif ext == "json":
                 try:
-                    with open(full, "r", encoding="utf-8") as f:
+                    with open(full, encoding="utf-8") as f:
                         meta = json.load(f)
                     vid = meta.get("id") or base
                     entry = seen_ids.setdefault(vid, {})
@@ -527,7 +524,7 @@ _PLAYLIST_RE = re.compile(r"[?&]list=([a-zA-Z0-9_-]{10,})")
 def is_playlist_url(url: str) -> bool:
     return bool(_PLAYLIST_RE.search(url))
 
-def _base_ydl_opts(cache_dir: str) -> Dict:
+def _base_ydl_opts(cache_dir: str) -> dict:
     return {
         "quiet": True,
         "no_warnings": True,
@@ -542,7 +539,7 @@ def _base_ydl_opts(cache_dir: str) -> Dict:
         "socket_timeout": 10,
     }
 
-def _ydl_extract(url_or_query: str, ydl_opts: Dict, *, download: bool):
+def _ydl_extract(url_or_query: str, ydl_opts: dict, *, download: bool):
     """Wrapper around YoutubeDL.extract_info with optional auto-update and retry."""
     try:
         with YoutubeDL(ydl_opts) as ydl:
@@ -557,14 +554,14 @@ def _ydl_extract(url_or_query: str, ydl_opts: Dict, *, download: bool):
 def path_for(cache_dir: str, vid: str, ext: str) -> str:
     return os.path.join(cache_dir, f"{vid}.{normalize_ext(ext)}")
 
-def _track_dir_name(title: Optional[str], vid: Optional[str]) -> str:
+def _track_dir_name(title: str | None, vid: str | None) -> str:
     san_title = _sanitize_title(title) if title else None
     base = san_title or (vid or "track")
     if vid:
         base = f"{base} [{vid[:8]}]"
     return base
 
-def _first_audio_created(before: Set[str], after: Set[str], directory: str) -> Optional[str]:
+def _first_audio_created(before: set[str], after: set[str], directory: str) -> str | None:
     # Find new audio file created in directory
     try:
         new_files = list(set(os.listdir(directory)) - (before if directory == "." else set()))
@@ -576,7 +573,7 @@ def _first_audio_created(before: Set[str], after: Set[str], directory: str) -> O
             return os.path.join(directory, fname)
     return None
 
-def download_audio(url: str, opts: Options, *, api_key: Optional[str] = None) -> str:
+def download_audio(url: str, opts: Options, *, api_key: str | None = None) -> str:
     """
     Download audio and return the actual file path.
     New behavior: per-track folder layout. Legacy flat-cache still compatible.
@@ -639,12 +636,12 @@ def download_audio(url: str, opts: Options, *, api_key: Optional[str] = None) ->
     info("downloading audio-only…")
 
     # snapshot files inside tdir before download
-    before: Set[str] = set(os.listdir(tdir)) if os.path.isdir(tdir) else set()
+    before: set[str] = set(os.listdir(tdir)) if os.path.isdir(tdir) else set()
     info_dict = _ydl_extract(url, ydl_opts, download=True)
-    after: Set[str] = set(os.listdir(tdir)) if os.path.isdir(tdir) else set()
+    after: set[str] = set(os.listdir(tdir)) if os.path.isdir(tdir) else set()
 
     # 3) Determine final path
-    final_path: Optional[str] = None
+    final_path: str | None = None
     # yt-dlp may populate requested_downloads
     if isinstance(info_dict, dict) and info_dict.get("requested_downloads"):
         rd = info_dict["requested_downloads"][0]
@@ -676,8 +673,8 @@ def download_audio(url: str, opts: Options, *, api_key: Optional[str] = None) ->
 
 # ----------- Inspect / search (API-first) ----------
 
-def search_results(query: str, limit: int = 10, *, api_key: Optional[str] = None,
-                   want_duration: bool = True) -> List[Dict]:
+def search_results(query: str, limit: int = 10, *, api_key: str | None = None,
+                   want_duration: bool = True) -> list[dict]:
     """Fast search via YouTube Data API. Returns id/title/uploader/webpage_url/duration."""
     key = _require_api_key(api_key) if want_duration or api_key else (api_key or os.environ.get("YT_API_KEY"))
     if want_duration:
@@ -690,7 +687,7 @@ def search_results(query: str, limit: int = 10, *, api_key: Optional[str] = None
             r["duration"] = durs.get(r["id"])
     return results
 
-def video_info_from_url(url: str, *, api_key: Optional[str] = None) -> Dict:
+def video_info_from_url(url: str, *, api_key: str | None = None) -> dict:
     """Minimal info for a single URL using YouTube Data API. No descriptions."""
     key = _require_api_key(api_key)
     vid = extract_video_id(url)
@@ -701,14 +698,14 @@ def video_info_from_url(url: str, *, api_key: Optional[str] = None) -> Dict:
         die("video not found via API")
     return info_obj
 
-def video_info_from_query(query: str, *, api_key: Optional[str] = None) -> Dict:
+def video_info_from_query(query: str, *, api_key: str | None = None) -> dict:
     """Top-1 result via API (kept for completeness)."""
     res = search_results(query, limit=1, api_key=api_key, want_duration=True)
     if not res:
         die("no results")
     return res[0]
 
-def list_audio_formats(url: str) -> List[Dict]:
+def list_audio_formats(url: str) -> list[dict]:
     """Inspect CDN audio formats for a specific URL using yt-dlp (heavy)."""
     ydl_opts = {
         "quiet": True,
@@ -734,7 +731,7 @@ def list_audio_formats(url: str) -> List[Dict]:
 
 # ----------- Orchestration ----------
 
-def resolve_and_maybe_download(query_or_url: str, opts: Options, *, api_key: Optional[str] = None) -> str:
+def resolve_and_maybe_download(query_or_url: str, opts: Options, *, api_key: str | None = None) -> str:
     ensure_dir(opts.cache_dir)
 
     if is_url(query_or_url):

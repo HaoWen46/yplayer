@@ -3,7 +3,7 @@ name = "yplayer"
 version = "0.1.0"
 description = "CLI YouTube audio cache + player (audio-only via yt-dlp)."
 authors = [ { name = "You" } ]
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = [
   "yt-dlp",
   "python-dotenv",
@@ -12,7 +12,7 @@ readme = "README.md"
 license = "MIT"
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "ruff"]
 
 [project.scripts]
 yplay-worker = "yplayer.worker:main"
@@ -20,6 +20,15 @@ yplay-worker = "yplayer.worker:main"
 [tool.setuptools.packages.find]
 include = ["yplayer*"]
 
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# High-signal only: pyflakes (F, catches unused/undefined imports — the class
+# of bug that broke HEAD), import sorting (I), and pyupgrade (UP). Skip the
+# noisy pycodestyle line-length lints.
+select = ["F", "I", "UP"]
+
 [build-system]
-requires = ["setuptools>=67", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"

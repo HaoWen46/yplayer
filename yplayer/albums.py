@@ -1,8 +1,9 @@
 # yplayer/albums.py
 import json
 import os
-from typing import List, Dict, Optional
-from .core import find_existing, DEFAULT_CACHE_DIR
+
+from .core import DEFAULT_CACHE_DIR, find_existing
+
 
 class AlbumManager:
     def __init__(self, cache_dir: str = None):
@@ -10,7 +11,7 @@ class AlbumManager:
         self.albums_dir = os.path.join(self.cache_dir, "albums")
         os.makedirs(self.albums_dir, exist_ok=True)
 
-    def create_album(self, name: str, description: str = "", tracks: List[Dict] = None) -> bool:
+    def create_album(self, name: str, description: str = "", tracks: list[dict] = None) -> bool:
         """Create a new album"""
         if not name:
             return False
@@ -32,7 +33,7 @@ class AlbumManager:
         except Exception:
             return False
 
-    def list_albums(self) -> List[Dict]:
+    def list_albums(self) -> list[dict]:
         """List all albums with basic info"""
         albums = []
         try:
@@ -40,7 +41,7 @@ class AlbumManager:
                 if filename.endswith('.album.json'):
                     filepath = os.path.join(self.albums_dir, filename)
                     try:
-                        with open(filepath, 'r', encoding='utf-8') as f:
+                        with open(filepath, encoding='utf-8') as f:
                             data = json.load(f)
                             albums.append({
                                 "name": data.get("name", filename.replace('.album.json', '')),
@@ -57,10 +58,10 @@ class AlbumManager:
         albums.sort(key=lambda x: x["name"].lower())
         return albums
 
-    def get_album_tracks(self, album_path: str) -> List[Dict]:
+    def get_album_tracks(self, album_path: str) -> list[dict]:
         """Get tracks for a specific album, resolving to cached files"""
         try:
-            with open(album_path, 'r', encoding='utf-8') as f:
+            with open(album_path, encoding='utf-8') as f:
                 album_data = json.load(f)
 
             tracks = []
@@ -93,10 +94,10 @@ class AlbumManager:
         except Exception:
             return []
 
-    def add_track_to_album(self, album_path: str, track_info: Dict) -> bool:
+    def add_track_to_album(self, album_path: str, track_info: dict) -> bool:
         """Add a track to an existing album"""
         try:
-            with open(album_path, 'r', encoding='utf-8') as f:
+            with open(album_path, encoding='utf-8') as f:
                 album_data = json.load(f)
 
             # Check if track already exists
@@ -117,7 +118,7 @@ class AlbumManager:
     def remove_track_from_album(self, album_path: str, track_id: str) -> bool:
         """Remove a track from an album"""
         try:
-            with open(album_path, 'r', encoding='utf-8') as f:
+            with open(album_path, encoding='utf-8') as f:
                 album_data = json.load(f)
 
             original_count = len(album_data.get("tracks", []))
@@ -138,7 +139,7 @@ class AlbumManager:
         import re
         return re.sub(r'[^\w\s-]', '', name).strip().replace(' ', '_')
 
-    def get_album_by_name(self, name: str) -> Optional[str]:
+    def get_album_by_name(self, name: str) -> str | None:
         """Get album file path by name"""
         sanitized = self._sanitize_name(name)
         album_file = os.path.join(self.albums_dir, f"{sanitized}.album.json")

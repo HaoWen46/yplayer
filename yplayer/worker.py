@@ -14,22 +14,19 @@ Commands:
 """
 
 import json
-import sys
 import os
+import sys
 import threading
 
-# Ensure yt-dlp is up to date on worker start
 from .core import (
-    ensure_ytdlp_uptodate,
-    require_bins,
+    Options,
     download_audio,
+    ensure_ytdlp_uptodate,
+    list_audio_formats,
     search_results,
     video_info_from_url,
-    list_audio_formats,
-    Options,
 )
 from .playlist import extract_playlist_entries
-
 
 # The id of the request currently being handled, echoed back on every response
 # so the host can correlate replies and detect protocol desync.
@@ -66,7 +63,7 @@ def _handle_download(req: dict):
     try:
         meta_path = os.path.join(os.path.dirname(path), "meta.json")
         if os.path.exists(meta_path):
-            with open(meta_path, "r", encoding="utf-8") as f:
+            with open(meta_path, encoding="utf-8") as f:
                 meta = json.load(f)
     except Exception:
         pass

@@ -33,5 +33,7 @@ jobs:
       # dependency (the python-dotenv gap that broke HEAD) fails loudly.
       - name: Install
         run: pip install .[dev]
+      - name: Ruff
+        run: ruff check yplayer/
       - name: Smoke + protocol tests
         run: pytest -q

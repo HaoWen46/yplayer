@@ -1,7 +1,7 @@
 import shutil
 import subprocess
 import sys
-from typing import List, Optional
+
 
 class Colors:
     RESET      = "\033[0m"
@@ -36,7 +36,7 @@ class YplayerError(Exception):
     """
 
 
-def which(prog: str) -> Optional[str]:
+def which(prog: str) -> str | None:
     return shutil.which(prog)
 
 def die(msg: str, code: int = 1):
@@ -49,7 +49,7 @@ def die(msg: str, code: int = 1):
 def info(msg: str):
     sys.stderr.write(f"\x1b[36minfo:\x1b[0m {msg}\n")
 
-def run(cmd: List[str], check: bool = True, capture: bool = False):
+def run(cmd: list[str], check: bool = True, capture: bool = False):
     """Generic runner, used by playback tools (not yt-dlp anymore)."""
     kwargs = {"text": True}
     if capture:
