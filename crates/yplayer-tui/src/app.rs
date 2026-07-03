@@ -4,6 +4,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
+use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::stdout;
@@ -31,6 +32,8 @@ pub struct App {
     pub db: CacheIndex,
     pub config: Config,
     pub should_quit: bool,
+    // Set whenever visible state changes; gates redraws so the loop is idle-quiet.
+    pub dirty: bool,
     // Search state
     pub search_query: String,
     pub search_results: Vec<Track>,
@@ -63,6 +66,7 @@ impl App {
             db,
             config: cfg,
             should_quit: false,
+            dirty: true,
             search_query: String::new(),
             search_results: Vec::new(),
             search_selection: 0,
@@ -147,6 +151,10 @@ impl App {
     }
 
     pub async fn handle_action(&mut self, action: Action) {
+        // Any non-tick action is user intent that can change the view.
+        if !matches!(action, Action::Tick) {
+            self.dirty = true;
+        }
         match action {
             Action::Quit => {
                 match self.mode {
@@ -380,7 +388,73 @@ impl App {
                 self.player.poll_status().await;
                 self.check_loop().await;
                 self.clear_expired_status();
+                // Redraw only when something is actually animating or expiring,
+                // so a fully idle app doesn't repaint.
+                if self.player.is_playing()
+                    || self.status_msg.is_some()
+                    || self.confirm_delete_until.is_some()
+                {
+                    self.dirty = true;
+                }
             }
+        }
+    }
+
+    /// Handle one terminal event (key or resize). Key dispatch is mode-aware;
+    /// a handled key marks the view dirty so the loop repaints exactly once.
+    pub async fn on_terminal_event(&mut self, ev: event::Event) {
+        match ev {
+            event::Event::Key(key) => {
+                if key.kind != event::KeyEventKind::Press {
+                    return;
+                }
+                self.dirty = true;
+                match self.mode {
+                    ViewMode::Search => match key.code {
+                        event::KeyCode::Esc => self.handle_action(Action::Quit).await,
+                        event::KeyCode::Enter => self.handle_action(Action::Select).await,
+                        event::KeyCode::Up => self.handle_action(Action::MoveUp).await,
+                        event::KeyCode::Down => self.handle_action(Action::MoveDown).await,
+                        _ => self.handle_search_input(key),
+                    },
+                    ViewMode::DownloadInput => match key.code {
+                        event::KeyCode::Esc => {
+                            self.mode = self.prev_mode.take().unwrap_or(ViewMode::Library);
+                            self.download_input.clear();
+                        }
+                        event::KeyCode::Enter => self.execute_download().await,
+                        _ => self.handle_download_input(key),
+                    },
+                    ViewMode::RenameInput => match key.code {
+                        event::KeyCode::Esc => {
+                            self.mode = self.prev_mode.take().unwrap_or(ViewMode::Library);
+                            self.rename_input.clear();
+                        }
+                        event::KeyCode::Enter => self.execute_rename(),
+                        _ => self.handle_rename_input(key),
+                    },
+                    _ => {
+                        // Cancel a pending delete confirmation on any non-d/Esc key.
+                        let is_d = key.code == event::KeyCode::Char('d');
+                        let is_esc = key.code == event::KeyCode::Esc;
+                        if !is_d && !is_esc && self.confirm_delete_until.is_some() {
+                            self.confirm_delete_until = None;
+                            if self.status_msg.as_deref()
+                                == Some("Press d again to delete, Esc to cancel")
+                            {
+                                self.status_msg = None;
+                            }
+                        }
+                        if let Some(action) = events::map_key_public(key) {
+                            self.handle_action(action).await;
+                        }
+                    }
+                }
+            }
+            event::Event::Resize(_, _) => {
+                self.dirty = true;
+            }
+            _ => {}
         }
     }
 
@@ -682,79 +756,28 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let tick_rate = Duration::from_millis(50);
+    let mut reader = event::EventStream::new();
+    // Position/loop polling cadence. Much slower than the old 50ms busy-loop —
+    // mpv playback only needs a few refreshes per second.
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
 
     while !app.should_quit {
-        terminal.draw(|f| ui::draw(f, &app))?;
+        if app.dirty {
+            terminal.draw(|f| ui::draw(f, &app))?;
+            app.dirty = false;
+        }
 
-        if event::poll(tick_rate)? {
-            if let event::Event::Key(key) = event::read()? {
-                if key.kind != crossterm::event::KeyEventKind::Press {
-                    continue;
-                }
-
-                match app.mode {
-                    ViewMode::Search => match key.code {
-                        crossterm::event::KeyCode::Esc => {
-                            app.handle_action(Action::Quit).await;
-                        }
-                        crossterm::event::KeyCode::Enter => {
-                            app.handle_action(Action::Select).await;
-                        }
-                        crossterm::event::KeyCode::Up => {
-                            app.handle_action(Action::MoveUp).await;
-                        }
-                        crossterm::event::KeyCode::Down => {
-                            app.handle_action(Action::MoveDown).await;
-                        }
-                        _ => {
-                            app.handle_search_input(key);
-                        }
-                    },
-                    ViewMode::DownloadInput => match key.code {
-                        crossterm::event::KeyCode::Esc => {
-                            app.mode = app.prev_mode.take().unwrap_or(ViewMode::Library);
-                            app.download_input.clear();
-                        }
-                        crossterm::event::KeyCode::Enter => {
-                            app.execute_download().await;
-                        }
-                        _ => {
-                            app.handle_download_input(key);
-                        }
-                    },
-                    ViewMode::RenameInput => match key.code {
-                        crossterm::event::KeyCode::Esc => {
-                            app.mode = app.prev_mode.take().unwrap_or(ViewMode::Library);
-                            app.rename_input.clear();
-                        }
-                        crossterm::event::KeyCode::Enter => {
-                            app.execute_rename();
-                        }
-                        _ => {
-                            app.handle_rename_input(key);
-                        }
-                    },
-                    _ => {
-                        // Cancel pending delete confirmation on non-d/Esc keys
-                        let is_d = key.code == crossterm::event::KeyCode::Char('d');
-                        let is_esc = key.code == crossterm::event::KeyCode::Esc;
-                        if !is_d && !is_esc && app.confirm_delete_until.is_some() {
-                            app.confirm_delete_until = None;
-                            if app.status_msg.as_deref()
-                                == Some("Press d again to delete, Esc to cancel")
-                            {
-                                app.status_msg = None;
-                            }
-                        }
-                        if let Some(action) = events::map_key_public(key) {
-                            app.handle_action(action).await;
-                        }
-                    }
+        tokio::select! {
+            maybe_event = reader.next() => {
+                match maybe_event {
+                    Some(Ok(ev)) => app.on_terminal_event(ev).await,
+                    Some(Err(_)) => {}   // transient read error; keep going
+                    None => break,        // input stream closed
                 }
             }
-        } else {
-            app.handle_action(Action::Tick).await;
+            _ = tick.tick() => {
+                app.handle_action(Action::Tick).await;
+            }
         }
     }
 

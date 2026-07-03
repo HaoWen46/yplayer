@@ -10,7 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = [
     "rt-multi-thread",
