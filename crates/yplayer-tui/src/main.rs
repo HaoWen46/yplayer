@@ -59,10 +59,6 @@ struct Cli {
     /// YouTube Data API key
     #[arg(long = "yt-api-key")]
     yt_api_key: Option<String>,
-
-    /// How many tracks to prefetch for playlists
-    #[arg(long, default_value = "3")]
-    prefetch: usize,
 }
 
 #[tokio::main]
@@ -83,7 +79,6 @@ async fn main() -> anyhow::Result<()> {
     cfg.audio_quality = cli.audio_quality;
     cfg.player = cli.player;
     cfg.volume = cli.volume.or(file.volume);
-    cfg.prefetch_count = cli.prefetch;
     cfg.worker_python = file.worker_python;
 
     // Ensure cache directory exists

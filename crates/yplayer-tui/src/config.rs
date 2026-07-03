@@ -13,7 +13,6 @@ pub struct Config {
     pub audio_quality: Option<String>,
     pub player: Option<String>,
     pub volume: Option<f64>,
-    pub prefetch_count: usize,
     /// Pinned worker Python (e.g. a venv), overriding the .venv auto-discovery.
     pub worker_python: Option<String>,
 }
@@ -38,7 +37,6 @@ impl Config {
             audio_quality: None,
             player: None,
             volume: None,
-            prefetch_count: 3,
             worker_python: None,
         }
     }

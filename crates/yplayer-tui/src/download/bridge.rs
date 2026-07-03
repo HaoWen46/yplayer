@@ -91,6 +91,8 @@ impl From<WorkerFailure> for anyhow::Error {
 }
 
 pub struct Bridge {
+    // Owned only to keep the worker process alive (kill_on_drop); never read.
+    #[allow(dead_code)]
     child: Child,
     stdin: tokio::process::ChildStdin,
     reader: BufReader<tokio::process::ChildStdout>,
@@ -301,25 +303,8 @@ impl Bridge {
             .collect())
     }
 
-    pub async fn video_info(&mut self, url: &str, cfg: &Config) -> Result<Track> {
-        let resp = self
-            .send(WorkerCommand {
-                cmd: "video_info".to_string(),
-                url: Some(url.to_string()),
-                api_key: cfg.api_key.clone(),
-                query: None,
-                limit: None,
-                cache_dir: None,
-                format: None,
-                native: None,
-                embed_meta: None,
-            })
-            .await?;
-
-        let meta = resp.meta.context("No meta in video_info response")?;
-        parse_track_from_value(&meta).context("Failed to parse track from response")
-    }
-
+    // Playlist import (which consumes this) is wired up in a later phase.
+    #[allow(dead_code)]
     pub async fn playlist_entries(&mut self, url: &str) -> Result<Vec<Track>> {
         let resp = self
             .send(WorkerCommand {

@@ -23,13 +23,6 @@ pub struct Album {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AlbumTrack {
-    pub album_id: i64,
-    pub track_id: String,
-    pub position: i32,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoopMode {
     None,
@@ -95,6 +88,8 @@ pub enum ViewMode {
         album_id: i64,
         album_name: String,
     },
+    /// Playlist browse view — the renderer exists; entry is wired up in a later phase.
+    #[allow(dead_code)]
     Playlist {
         url: String,
     },
@@ -103,14 +98,4 @@ pub enum ViewMode {
     DownloadInput,
     /// Rename input for the currently selected track
     RenameInput,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlaybackState {
-    pub track_index: usize,
-    pub file_path: String,
-    pub paused: bool,
-    pub position: f64,
-    pub duration: f64,
-    pub volume: f64,
 }

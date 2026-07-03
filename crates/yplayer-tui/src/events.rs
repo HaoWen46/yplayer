@@ -1,5 +1,4 @@
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use std::time::Duration;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -26,15 +25,6 @@ pub enum Action {
     NextTrack,
     PrevTrack,
     Tick,
-}
-
-pub fn poll_event(timeout: Duration) -> Option<Action> {
-    if event::poll(timeout).unwrap_or(false) {
-        if let Ok(Event::Key(key)) = event::read() {
-            return map_key(key);
-        }
-    }
-    Some(Action::Tick)
 }
 
 pub fn map_key_public(key: KeyEvent) -> Option<Action> {

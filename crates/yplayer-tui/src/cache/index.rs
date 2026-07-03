@@ -95,15 +95,11 @@ impl CacheIndex {
                 track.audio_path,
                 track.format,
                 track.file_size,
-                track.added_at.unwrap_or_else(|| now()),
+                track.added_at.unwrap_or_else(now),
                 track.last_played,
             ],
         )?;
         Ok(())
-    }
-
-    pub fn list_tracks(&self) -> Result<Vec<Track>> {
-        self.list_tracks_sorted(SortMode::Title)
     }
 
     pub fn list_tracks_sorted(&self, sort: SortMode) -> Result<Vec<Track>> {
@@ -162,6 +158,8 @@ impl CacheIndex {
         Ok(())
     }
 
+    // Used by the cache tests today; a fetch-by-id primitive for later phases.
+    #[allow(dead_code)]
     pub fn get_track(&self, id: &str) -> Result<Option<Track>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, uploader, duration, webpage_url, audio_path, format, file_size, added_at, last_played
@@ -201,36 +199,6 @@ impl CacheIndex {
             params![now(), id],
         )?;
         Ok(())
-    }
-
-    pub fn search_tracks(&self, query: &str) -> Result<Vec<Track>> {
-        let pattern = format!("%{}%", query);
-        let mut stmt = self.conn.prepare(
-            "SELECT id, title, uploader, duration, webpage_url, audio_path, format, file_size, added_at, last_played
-             FROM tracks
-             WHERE title LIKE ?1 COLLATE NOCASE OR uploader LIKE ?1 COLLATE NOCASE
-             ORDER BY title COLLATE NOCASE",
-        )?;
-
-        let tracks = stmt
-            .query_map(params![pattern], |row| {
-                Ok(Track {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    uploader: row.get(2)?,
-                    duration: row.get(3)?,
-                    webpage_url: row.get(4)?,
-                    audio_path: row.get(5)?,
-                    format: row.get(6)?,
-                    file_size: row.get(7)?,
-                    added_at: row.get(8)?,
-                    last_played: row.get(9)?,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(tracks)
     }
 
     // --- Albums ---
@@ -314,27 +282,14 @@ impl CacheIndex {
         Ok(tracks)
     }
 
+    // Used by the cache tests today; album editing UI arrives in a later phase.
+    #[allow(dead_code)]
     pub fn add_track_to_album(&self, album_id: i64, track_id: &str, position: i32) -> Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO album_tracks (album_id, track_id, position) VALUES (?1, ?2, ?3)",
             params![album_id, track_id, position],
         )?;
         Ok(())
-    }
-
-    pub fn remove_track_from_album(&self, album_id: i64, track_id: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM album_tracks WHERE album_id = ?1 AND track_id = ?2",
-            params![album_id, track_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn track_count(&self) -> Result<i64> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0))?;
-        Ok(count)
     }
 
     /// Bulk insert tracks within a single transaction (for scanner).
@@ -355,7 +310,7 @@ impl CacheIndex {
                     track.audio_path,
                     track.format,
                     track.file_size,
-                    track.added_at.unwrap_or_else(|| now()),
+                    track.added_at.unwrap_or_else(now),
                     track.last_played,
                 ])?;
             }
@@ -386,6 +341,13 @@ impl CacheIndex {
         tx.commit()?;
         Ok(())
     }
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 #[cfg(test)]
@@ -452,11 +414,4 @@ mod tests {
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].track_count, 1);
     }
-}
-
-fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
 }

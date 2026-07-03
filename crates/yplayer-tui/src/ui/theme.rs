@@ -82,10 +82,6 @@ pub fn gauge_filled_style() -> Style {
     Style::default().fg(Color::Green)
 }
 
-pub fn gauge_unfilled_style() -> Style {
-    Style::default().fg(Color::DarkGray)
-}
-
 pub fn dim_style() -> Style {
     Style::default().add_modifier(Modifier::DIM)
 }
