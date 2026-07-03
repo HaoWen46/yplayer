@@ -1,4 +1,5 @@
 pub mod albums;
+pub mod help;
 pub mod input_overlay;
 pub mod library;
 pub mod player_bar;
@@ -48,8 +49,13 @@ pub fn draw(f: &mut Frame, app: &App) {
     // Player bar
     player_bar::draw(f, app, chunks[2]);
 
-    // Footer key hints
+    // Footer key hints (or the active status message)
     draw_footer(f, app, chunks[3]);
+
+    // Help overlay is drawn last so it sits above everything, including the bar.
+    if app.show_help {
+        help::draw_overlay(f);
+    }
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -111,6 +117,20 @@ fn draw_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
 
+    // An active status message takes over the footer (severity-colored) so it is
+    // visible even while a track is playing — including the delete confirmation.
+    if let Some(ref status) = app.status_msg {
+        use crate::app::Severity;
+        let style = match app.status_severity {
+            Severity::Info => theme::normal_style(),
+            Severity::Warn => theme::warn_style(),
+            Severity::Error => theme::error_style(),
+        };
+        let msg = Paragraph::new(Line::from(Span::styled(format!("  {}", status), style)));
+        f.render_widget(msg, area);
+        return;
+    }
+
     let hints: Vec<(&str, &str)> = match &app.mode {
         crate::types::ViewMode::Library => vec![
             ("\u{2191}/\u{2193}", "move"),
@@ -123,7 +143,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             ("/", "search"),
             ("Space", "pause"),
             ("l", "loop"),
-            ("\u{2190}/\u{2192}", "seek"),
+            ("?", "help"),
             ("q", "quit"),
         ],
         crate::types::ViewMode::Albums => vec![

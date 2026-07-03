@@ -15,17 +15,10 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
 
     if !app.player.is_playing() {
-        // Show status message if present, otherwise "No track playing"
-        if let Some(ref status) = app.status_msg {
-            let msg = Paragraph::new(Span::styled(
-                format!("  {}", status),
-                ratatui::style::Style::default().fg(ratatui::style::Color::Red),
-            ));
-            f.render_widget(msg, inner);
-        } else {
-            let msg = Paragraph::new(Span::styled("  No track playing", theme::dim_style()));
-            f.render_widget(msg, inner);
-        }
+        // Status messages render in the footer now (always visible); the bar
+        // just reports the idle state.
+        let msg = Paragraph::new(Span::styled("  No track playing", theme::dim_style()));
+        f.render_widget(msg, inner);
         return;
     }
 

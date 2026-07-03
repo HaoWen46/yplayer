@@ -27,6 +27,14 @@ pub enum WorkerEvent {
     DownloadFailed { url: String, error: String },
 }
 
+/// Severity of a transient status message; controls its color in the footer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Severity {
+    Info,
+    Warn,
+    Error,
+}
+
 pub struct App {
     pub mode: ViewMode,
     pub tracks: Vec<Track>,
@@ -55,7 +63,10 @@ pub struct App {
     prev_mode: Option<ViewMode>,
     // Status message (shown briefly)
     pub status_msg: Option<String>,
+    pub status_severity: Severity,
     status_msg_until: Option<std::time::Instant>,
+    // Whether the help overlay is open.
+    pub show_help: bool,
     // Delete confirmation: Some(Instant) = waiting for 2nd press, expires after 3s
     pub confirm_delete_until: Option<std::time::Instant>,
     // Background download tasks report results here; run() owns the receiver.
@@ -93,7 +104,9 @@ impl App {
             rename_input: String::new(),
             prev_mode: None,
             status_msg: None,
+            status_severity: Severity::Info,
             status_msg_until: None,
+            show_help: false,
             confirm_delete_until: None,
             worker_tx,
             worker_rx: Some(worker_rx),
@@ -149,7 +162,12 @@ impl App {
     }
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
+        self.set_status_sev(msg, Severity::Info);
+    }
+
+    pub fn set_status_sev(&mut self, msg: impl Into<String>, sev: Severity) {
         self.status_msg = Some(msg.into());
+        self.status_severity = sev;
         self.status_msg_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
     }
 
@@ -270,6 +288,9 @@ impl App {
             Action::ToggleLoop => {
                 self.loop_mode = self.loop_mode.toggle();
             }
+            Action::ToggleHelp => {
+                self.show_help = !self.show_help;
+            }
             Action::CycleSortMode => {
                 if matches!(self.mode, ViewMode::Library | ViewMode::Search) {
                     self.sort_mode = self.sort_mode.next();
@@ -329,6 +350,7 @@ impl App {
                             Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
                         self.status_msg =
                             Some("Press d again to delete, Esc to cancel".to_string());
+                        self.status_severity = Severity::Warn;
                         self.status_msg_until =
                             Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
                     }
@@ -431,6 +453,11 @@ impl App {
                     return;
                 }
                 self.dirty = true;
+                // While the help overlay is open, any key dismisses it.
+                if self.show_help {
+                    self.show_help = false;
+                    return;
+                }
                 match self.mode {
                     ViewMode::Search => match key.code {
                         event::KeyCode::Esc => self.handle_action(Action::Quit).await,
@@ -496,7 +523,7 @@ impl App {
                     self.playing = Some(track);
                 }
                 Err(e) => {
-                    self.set_status(format!("Playback error: {}", e));
+                    self.set_status_sev(format!("Playback error: {}", e), Severity::Error);
                 }
             }
         } else {
@@ -707,11 +734,10 @@ impl App {
                 self.set_status(format!("Downloaded: {}", title));
             }
             WorkerEvent::DownloadFailed { url, error } => {
-                self.set_status(format!(
-                    "Download failed: {} ({})",
-                    truncate_chars(&url, 30),
-                    error
-                ));
+                self.set_status_sev(
+                    format!("Download failed: {} ({})", truncate_chars(&url, 30), error),
+                    Severity::Error,
+                );
             }
         }
     }

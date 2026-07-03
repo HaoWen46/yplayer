@@ -86,6 +86,16 @@ pub fn dim_style() -> Style {
     Style::default().add_modifier(Modifier::DIM)
 }
 
+pub fn warn_style() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+
+pub fn error_style() -> Style {
+    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+}
+
 pub fn normal_style() -> Style {
     Style::default()
 }
