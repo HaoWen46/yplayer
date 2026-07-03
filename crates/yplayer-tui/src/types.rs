@@ -91,8 +91,13 @@ impl SortMode {
 pub enum ViewMode {
     Library,
     Albums,
-    AlbumDetail { album_id: i64, album_name: String },
-    Playlist { url: String },
+    AlbumDetail {
+        album_id: i64,
+        album_name: String,
+    },
+    Playlist {
+        url: String,
+    },
     Search,
     /// URL input for in-TUI download
     DownloadInput,

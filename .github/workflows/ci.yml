@@ -14,15 +14,14 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      # Hard gate: the code must build and pass its tests.
+      # Hard gates: the code must build, pass its tests, and stay formatted.
+      - name: Format check
+        run: cargo fmt --all --check
       - name: Test
         run: cargo test --workspace --verbose
       # Informational until the Phase 2 dead-code purge; tighten to -D warnings then.
       - name: Clippy
         run: cargo clippy --workspace --all-targets
-        continue-on-error: true
-      - name: Format check
-        run: cargo fmt --all --check
         continue-on-error: true
 
   python:

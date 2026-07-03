@@ -47,7 +47,9 @@ impl MpvPlayer {
     pub async fn play(&mut self, filepath: &str, volume: Option<f64>) -> Result<()> {
         self.stop().await;
 
-        let vol = volume.map(|v| (v * 100.0).clamp(0.0, 100.0) as u32).unwrap_or(100);
+        let vol = volume
+            .map(|v| (v * 100.0).clamp(0.0, 100.0) as u32)
+            .unwrap_or(100);
         self.volume = vol as f64;
 
         // Clean up old socket
@@ -85,9 +87,15 @@ impl MpvPlayer {
         if let Ok(stream) = UnixStream::connect(&self.socket_path).await {
             self.stream = Some(stream);
             // Observe properties for real-time updates
-            self.send_command(&["observe_property", "1", "time-pos"]).await.ok();
-            self.send_command(&["observe_property", "2", "pause"]).await.ok();
-            self.send_command(&["observe_property", "3", "duration"]).await.ok();
+            self.send_command(&["observe_property", "1", "time-pos"])
+                .await
+                .ok();
+            self.send_command(&["observe_property", "2", "pause"])
+                .await
+                .ok();
+            self.send_command(&["observe_property", "3", "duration"])
+                .await
+                .ok();
         }
 
         Ok(())
@@ -120,11 +128,7 @@ impl MpvPlayer {
         self.stream = None;
 
         if let Some(mut child) = self.process.take() {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                child.wait(),
-            )
-            .await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
             let _ = child.kill().await;
         }
 
@@ -200,11 +204,8 @@ impl MpvPlayer {
         stream.write_all(msg.as_bytes()).await?;
 
         let mut buf = vec![0u8; 4096];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            stream.read(&mut buf),
-        )
-        .await??;
+        let n = tokio::time::timeout(std::time::Duration::from_millis(100), stream.read(&mut buf))
+            .await??;
 
         if n == 0 {
             anyhow::bail!("mpv socket closed");

@@ -1,13 +1,13 @@
-pub mod theme;
-pub mod library;
 pub mod albums;
-pub mod playlist;
-pub mod player_bar;
-pub mod search;
 pub mod input_overlay;
+pub mod library;
+pub mod player_bar;
+pub mod playlist;
+pub mod search;
+pub mod theme;
 
-use ratatui::Frame;
 use crate::app::App;
+use ratatui::Frame;
 
 pub fn draw(f: &mut Frame, app: &App) {
     use ratatui::layout::{Constraint, Direction, Layout};
@@ -15,10 +15,10 @@ pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),      // header
-            Constraint::Min(4),         // main content
-            Constraint::Length(3),      // player bar
-            Constraint::Length(1),      // footer hints
+            Constraint::Length(2), // header
+            Constraint::Min(4),    // main content
+            Constraint::Length(3), // player bar
+            Constraint::Length(1), // footer hints
         ])
         .split(f.area());
 
@@ -53,38 +53,38 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    use ratatui::widgets::{Block, Borders, Paragraph};
     use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Paragraph};
 
     let mut spans = match &app.mode {
         crate::types::ViewMode::Library => vec![
             Span::styled("Yplayer \u{2014} Library", theme::header_style()),
-            Span::styled(
-                format!("  [{}]", app.sort_mode.label()),
-                theme::dim_style(),
-            ),
+            Span::styled(format!("  [{}]", app.sort_mode.label()), theme::dim_style()),
         ],
-        crate::types::ViewMode::Albums => vec![
-            Span::styled("Yplayer \u{2014} Albums", theme::header_style()),
-        ],
-        crate::types::ViewMode::AlbumDetail { album_name, .. } => vec![
-            Span::styled(
-                format!("Yplayer \u{2014} {}", album_name),
-                theme::header_style(),
-            ),
-        ],
-        crate::types::ViewMode::Playlist { .. } => vec![
-            Span::styled("Yplayer \u{2014} Playlist", theme::header_style()),
-        ],
-        crate::types::ViewMode::Search => vec![
-            Span::styled("Yplayer \u{2014} Search", theme::header_style()),
-        ],
-        crate::types::ViewMode::DownloadInput => vec![
-            Span::styled("Yplayer \u{2014} Download", theme::header_style()),
-        ],
-        crate::types::ViewMode::RenameInput => vec![
-            Span::styled("Yplayer \u{2014} Rename", theme::header_style()),
-        ],
+        crate::types::ViewMode::Albums => vec![Span::styled(
+            "Yplayer \u{2014} Albums",
+            theme::header_style(),
+        )],
+        crate::types::ViewMode::AlbumDetail { album_name, .. } => vec![Span::styled(
+            format!("Yplayer \u{2014} {}", album_name),
+            theme::header_style(),
+        )],
+        crate::types::ViewMode::Playlist { .. } => vec![Span::styled(
+            "Yplayer \u{2014} Playlist",
+            theme::header_style(),
+        )],
+        crate::types::ViewMode::Search => vec![Span::styled(
+            "Yplayer \u{2014} Search",
+            theme::header_style(),
+        )],
+        crate::types::ViewMode::DownloadInput => vec![Span::styled(
+            "Yplayer \u{2014} Download",
+            theme::header_style(),
+        )],
+        crate::types::ViewMode::RenameInput => vec![Span::styled(
+            "Yplayer \u{2014} Rename",
+            theme::header_style(),
+        )],
     };
 
     let playback_status = app.playback_status_text();
@@ -99,8 +99,11 @@ fn draw_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         spans.push(Span::styled(loop_status, theme::playback_style()));
     }
 
-    let header = Paragraph::new(Line::from(spans))
-        .block(Block::default().borders(Borders::BOTTOM).border_style(theme::border_style()));
+    let header = Paragraph::new(Line::from(spans)).block(
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(theme::border_style()),
+    );
     f.render_widget(header, area);
 }
 
@@ -157,14 +160,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             ("Esc", "close"),
             ("\u{2191}/\u{2193}", "navigate"),
         ],
-        crate::types::ViewMode::DownloadInput => vec![
-            ("Enter", "download"),
-            ("Esc", "cancel"),
-        ],
-        crate::types::ViewMode::RenameInput => vec![
-            ("Enter", "save"),
-            ("Esc", "cancel"),
-        ],
+        crate::types::ViewMode::DownloadInput => vec![("Enter", "download"), ("Esc", "cancel")],
+        crate::types::ViewMode::RenameInput => vec![("Enter", "save"), ("Esc", "cancel")],
     };
 
     let mut spans: Vec<Span> = Vec::new();

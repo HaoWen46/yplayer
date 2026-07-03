@@ -3,8 +3,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::app::App;
 use super::theme;
+use crate::app::App;
 
 pub fn draw_overlay(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -29,7 +29,11 @@ pub fn draw_overlay(f: &mut Frame, app: &App) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
         .split(inner);
 
     // Search input
@@ -52,9 +56,7 @@ pub fn draw_overlay(f: &mut Frame, app: &App) {
         .map(|(i, track)| {
             let is_selected = i == app.search_selection;
 
-            let mut spans = vec![
-                Span::styled(&track.title, theme::title_style()),
-            ];
+            let mut spans = vec![Span::styled(&track.title, theme::title_style())];
             if let Some(ref up) = track.uploader {
                 spans.push(Span::styled(" \u{2014} ", theme::separator_style()));
                 spans.push(Span::styled(up.as_str(), theme::uploader_style()));

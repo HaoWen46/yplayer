@@ -367,7 +367,12 @@ impl CacheIndex {
     /// Bulk insert album data (for scanner migration). Idempotent across launches:
     /// gets-or-creates the album and ignores album_tracks rows that already exist
     /// or reference missing tracks (skipped by OR IGNORE under foreign_keys=ON).
-    pub fn bulk_insert_album(&self, name: &str, description: &str, track_ids: &[(String, i32)]) -> Result<()> {
+    pub fn bulk_insert_album(
+        &self,
+        name: &str,
+        description: &str,
+        track_ids: &[(String, i32)],
+    ) -> Result<()> {
         let album_id = self.get_or_create_album(name, description)?;
         let tx = self.conn.unchecked_transaction()?;
         {

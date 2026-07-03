@@ -1,11 +1,11 @@
 mod app;
+mod cache;
 mod config;
+mod download;
 mod events;
+mod player;
 mod types;
 mod ui;
-mod player;
-mod cache;
-mod download;
 
 use clap::Parser;
 use config::Config;
@@ -125,11 +125,7 @@ fn print_search_results(results: &[types::Track]) {
         let uploader = r.uploader.as_deref().unwrap_or("?");
         let dur = format_duration(r.duration);
         let url = r.webpage_url.as_deref().unwrap_or("");
-        println!(
-            "  \x1b[35m[{:02}]\x1b[0m \x1b[34m{}\x1b[0m",
-            i + 1,
-            title
-        );
+        println!("  \x1b[35m[{:02}]\x1b[0m \x1b[34m{}\x1b[0m", i + 1, title);
         println!(
             "    \x1b[33m{}\x1b[0m \u{2022} \x1b[2m{}\x1b[0m",
             uploader, dur

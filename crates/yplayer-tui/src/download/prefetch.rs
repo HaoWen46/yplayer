@@ -23,11 +23,7 @@ pub struct PrefetchResult {
 }
 
 impl PrefetchManager {
-    pub async fn start(
-        entries: Vec<Track>,
-        cfg: Config,
-        lookahead: usize,
-    ) -> Result<Self> {
+    pub async fn start(entries: Vec<Track>, cfg: Config, lookahead: usize) -> Result<Self> {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<PrefetchCommand>();
         let (result_tx, result_rx) = mpsc::unbounded_channel::<PrefetchResult>();
 

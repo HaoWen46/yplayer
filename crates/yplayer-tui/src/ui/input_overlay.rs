@@ -3,8 +3,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::App;
 use super::theme;
+use crate::app::App;
 
 /// Draw a small one-line input prompt centered at the bottom of the screen.
 fn draw_input_prompt(f: &mut Frame, title: &str, value: &str, hint: &str) {
@@ -43,10 +43,20 @@ fn draw_input_prompt(f: &mut Frame, title: &str, value: &str, hint: &str) {
 
 /// Prompt for a YouTube URL to download.
 pub fn draw_download(f: &mut Frame, app: &App) {
-    draw_input_prompt(f, "Download URL", &app.download_input, "(Enter to start, Esc to cancel)");
+    draw_input_prompt(
+        f,
+        "Download URL",
+        &app.download_input,
+        "(Enter to start, Esc to cancel)",
+    );
 }
 
 /// Prompt for a new track title (rename).
 pub fn draw_rename(f: &mut Frame, app: &App) {
-    draw_input_prompt(f, "Rename Track", &app.rename_input, "(Enter to save, Esc to cancel)");
+    draw_input_prompt(
+        f,
+        "Rename Track",
+        &app.rename_input,
+        "(Enter to save, Esc to cancel)",
+    );
 }

@@ -3,8 +3,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 use ratatui::Frame;
 
-use crate::app::App;
 use super::theme;
+use crate::app::App;
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
@@ -23,10 +23,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             ));
             f.render_widget(msg, inner);
         } else {
-            let msg = Paragraph::new(Span::styled(
-                "  No track playing",
-                theme::dim_style(),
-            ));
+            let msg = Paragraph::new(Span::styled("  No track playing", theme::dim_style()));
             f.render_widget(msg, inner);
         }
         return;
@@ -50,9 +47,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         })
         .unwrap_or_else(|| "  \u{25b6} Playing...".to_string());
 
-    let info_line = Line::from(vec![
-        Span::styled(track_title, theme::title_style()),
-    ]);
+    let info_line = Line::from(vec![Span::styled(track_title, theme::title_style())]);
     f.render_widget(Paragraph::new(info_line), chunks[0]);
 
     // Row 2: Progress bar + time + volume
@@ -64,11 +59,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         0.0
     };
 
-    let time_str = format!(
-        "  {} / {}",
-        fmt_time(position),
-        fmt_time(duration)
-    );
+    let time_str = format!("  {} / {}", fmt_time(position), fmt_time(duration));
 
     let vol_str = format!("Vol: {}%", app.player.volume as u32);
 
@@ -76,13 +67,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     let pause_str = if app.player.is_paused { "[PAUSED]" } else { "" };
 
-    let label = format!(
-        "{}  {}  {}  {}",
-        time_str,
-        pause_str,
-        loop_str,
-        vol_str,
-    );
+    let label = format!("{}  {}  {}  {}", time_str, pause_str, loop_str, vol_str,);
 
     let gauge = Gauge::default()
         .ratio(ratio)

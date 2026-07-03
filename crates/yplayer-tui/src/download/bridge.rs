@@ -154,9 +154,15 @@ impl Bridge {
                 .and_then(|v| v.as_str())
                 .unwrap_or("Unknown")
                 .to_string(),
-            uploader: meta.get("uploader").and_then(|v| v.as_str()).map(String::from),
+            uploader: meta
+                .get("uploader")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             duration: meta.get("duration").and_then(|v| v.as_i64()),
-            webpage_url: meta.get("webpage_url").and_then(|v| v.as_str()).map(String::from),
+            webpage_url: meta
+                .get("webpage_url")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             audio_path: Some(path.clone()),
             format: Some(cfg.format.clone()),
             file_size: None,
@@ -183,7 +189,10 @@ impl Bridge {
             .await?;
 
         let results = resp.results.unwrap_or_default();
-        Ok(results.into_iter().filter_map(|v| parse_track_from_value(&v)).collect())
+        Ok(results
+            .into_iter()
+            .filter_map(|v| parse_track_from_value(&v))
+            .collect())
     }
 
     pub async fn video_info(&mut self, url: &str, cfg: &Config) -> Result<Track> {
@@ -221,7 +230,10 @@ impl Bridge {
             .await?;
 
         let entries = resp.entries.unwrap_or_default();
-        Ok(entries.into_iter().filter_map(|v| parse_track_from_value(&v)).collect())
+        Ok(entries
+            .into_iter()
+            .filter_map(|v| parse_track_from_value(&v))
+            .collect())
     }
 
     pub async fn list_formats(&mut self, url: &str) -> Result<Vec<String>> {
@@ -260,7 +272,10 @@ fn parse_track_from_value(v: &Value) -> Option<Track> {
             .to_string(),
         uploader: v.get("uploader").and_then(|v| v.as_str()).map(String::from),
         duration: v.get("duration").and_then(|v| v.as_i64()),
-        webpage_url: v.get("webpage_url").and_then(|v| v.as_str()).map(String::from),
+        webpage_url: v
+            .get("webpage_url")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         audio_path: v.get("path").and_then(|v| v.as_str()).map(String::from),
         format: None,
         file_size: None,
@@ -274,7 +289,14 @@ fn find_python() -> Result<String> {
     let exe = std::env::current_exe().ok();
     let cwd = std::env::current_dir().ok();
 
-    for base in [exe.as_ref().and_then(|p| p.parent().map(|p| p.to_path_buf())), cwd].into_iter().flatten() {
+    for base in [
+        exe.as_ref()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf())),
+        cwd,
+    ]
+    .into_iter()
+    .flatten()
+    {
         // Walk up to find .venv
         let mut dir = base.as_path();
         for _ in 0..5 {

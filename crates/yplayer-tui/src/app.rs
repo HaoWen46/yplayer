@@ -1,6 +1,8 @@
 use anyhow::Result;
 use crossterm::event;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -74,7 +76,10 @@ impl App {
     }
 
     pub fn load_library(&mut self) {
-        self.tracks = self.db.list_tracks_sorted(self.sort_mode).unwrap_or_default();
+        self.tracks = self
+            .db
+            .list_tracks_sorted(self.sort_mode)
+            .unwrap_or_default();
         // Prune tracks whose audio files no longer exist
         self.tracks.retain(|t| {
             t.audio_path
@@ -244,35 +249,33 @@ impl App {
                     }
                 }
             }
-            Action::GoBack => {
-                match &self.mode {
-                    ViewMode::AlbumDetail { .. } => {
-                        self.load_albums();
-                        self.mode = ViewMode::Albums;
-                        self.selection = 0;
-                    }
-                    ViewMode::Albums => {
-                        self.mode = ViewMode::Library;
-                        self.load_library();
-                        self.selection = 0;
-                    }
-                    ViewMode::Search => {
-                        self.mode = self.prev_mode.take().unwrap_or(ViewMode::Library);
-                        self.search_query.clear();
-                        self.search_results.clear();
-                        self.search_selection = 0;
-                    }
-                    ViewMode::DownloadInput => {
-                        self.mode = self.prev_mode.take().unwrap_or(ViewMode::Library);
-                        self.download_input.clear();
-                    }
-                    ViewMode::RenameInput => {
-                        self.mode = self.prev_mode.take().unwrap_or(ViewMode::Library);
-                        self.rename_input.clear();
-                    }
-                    _ => {}
+            Action::GoBack => match &self.mode {
+                ViewMode::AlbumDetail { .. } => {
+                    self.load_albums();
+                    self.mode = ViewMode::Albums;
+                    self.selection = 0;
                 }
-            }
+                ViewMode::Albums => {
+                    self.mode = ViewMode::Library;
+                    self.load_library();
+                    self.selection = 0;
+                }
+                ViewMode::Search => {
+                    self.mode = self.prev_mode.take().unwrap_or(ViewMode::Library);
+                    self.search_query.clear();
+                    self.search_results.clear();
+                    self.search_selection = 0;
+                }
+                ViewMode::DownloadInput => {
+                    self.mode = self.prev_mode.take().unwrap_or(ViewMode::Library);
+                    self.download_input.clear();
+                }
+                ViewMode::RenameInput => {
+                    self.mode = self.prev_mode.take().unwrap_or(ViewMode::Library);
+                    self.rename_input.clear();
+                }
+                _ => {}
+            },
             Action::Delete => {
                 if matches!(self.mode, ViewMode::Library | ViewMode::AlbumDetail { .. })
                     && !self.tracks.is_empty()
@@ -284,14 +287,12 @@ impl App {
                         self.delete_selected().await;
                     } else {
                         // First press — request confirmation
-                        self.confirm_delete_until = Some(
-                            std::time::Instant::now() + std::time::Duration::from_secs(3),
-                        );
+                        self.confirm_delete_until =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
                         self.status_msg =
                             Some("Press d again to delete, Esc to cancel".to_string());
-                        self.status_msg_until = Some(
-                            std::time::Instant::now() + std::time::Duration::from_secs(3),
-                        );
+                        self.status_msg_until =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
                     }
                 }
             }
@@ -515,8 +516,8 @@ impl App {
         if self.search_query.is_empty() {
             self.search_results = self.tracks.clone();
         } else {
-            use fuzzy_matcher::FuzzyMatcher;
             use fuzzy_matcher::skim::SkimMatcherV2;
+            use fuzzy_matcher::FuzzyMatcher;
 
             let matcher = SkimMatcherV2::default();
             let query = &self.search_query;

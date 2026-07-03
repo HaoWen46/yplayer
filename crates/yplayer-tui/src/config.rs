@@ -15,14 +15,12 @@ pub struct Config {
 
 impl Config {
     pub fn new(cache_dir: Option<String>, api_key: Option<String>) -> Self {
-        let cache_dir = cache_dir
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("Music")
-                    .join("yt-audio")
-            });
+        let cache_dir = cache_dir.map(PathBuf::from).unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("Music")
+                .join("yt-audio")
+        });
 
         let api_key = api_key.or_else(|| std::env::var("YT_API_KEY").ok());
 

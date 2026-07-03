@@ -2,7 +2,9 @@ use ratatui::style::{Color, Modifier, Style};
 
 // Core palette — mirrors the Python curses color pairs
 pub fn title_style() -> Style {
-    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn uploader_style() -> Style {
@@ -14,15 +16,21 @@ pub fn duration_style() -> Style {
 }
 
 pub fn cached_style() -> Style {
-    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn tag_style() -> Style {
-    Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(Color::Blue)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn header_style() -> Style {
-    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn selection_style() -> Style {
@@ -41,7 +49,9 @@ pub fn playing_indicator_style() -> Style {
 }
 
 pub fn arrow_style() -> Style {
-    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn separator_style() -> Style {
@@ -49,11 +59,15 @@ pub fn separator_style() -> Style {
 }
 
 pub fn key_hint_style() -> Style {
-    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn desc_hint_style() -> Style {
-    Style::default().fg(Color::White).add_modifier(Modifier::DIM)
+    Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::DIM)
 }
 
 pub fn border_style() -> Style {

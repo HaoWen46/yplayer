@@ -77,9 +77,15 @@ pub fn scan_and_index(cache_dir: &Path, db: &CacheIndex) -> Result<usize> {
                 .and_then(|v| v.as_str())
                 .unwrap_or(&id)
                 .to_string(),
-            uploader: meta.get("uploader").and_then(|v| v.as_str()).map(String::from),
+            uploader: meta
+                .get("uploader")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             duration: meta.get("duration").and_then(|v| v.as_i64()),
-            webpage_url: meta.get("webpage_url").and_then(|v| v.as_str()).map(String::from),
+            webpage_url: meta
+                .get("webpage_url")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             audio_path: Some(audio_path),
             format: ext,
             file_size,
@@ -143,7 +149,10 @@ pub fn scan_and_index(cache_dir: &Path, db: &CacheIndex) -> Result<usize> {
                     .and_then(|m| m.get("uploader"))
                     .and_then(|v| v.as_str())
                     .map(String::from),
-                duration: meta.as_ref().and_then(|m| m.get("duration")).and_then(|v| v.as_i64()),
+                duration: meta
+                    .as_ref()
+                    .and_then(|m| m.get("duration"))
+                    .and_then(|v| v.as_i64()),
                 webpage_url: meta
                     .as_ref()
                     .and_then(|m| m.get("webpage_url"))
@@ -207,7 +216,8 @@ pub fn scan_and_index(cache_dir: &Path, db: &CacheIndex) -> Result<usize> {
                                 let pos = t
                                     .get("order")
                                     .and_then(|v| v.as_i64())
-                                    .unwrap_or(i as i64 + 1) as i32;
+                                    .unwrap_or(i as i64 + 1)
+                                    as i32;
                                 Some((id, pos))
                             })
                             .collect()
