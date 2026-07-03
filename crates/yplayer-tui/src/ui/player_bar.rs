@@ -34,10 +34,11 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(inner);
 
-    // Row 1: Now playing info
+    // Row 1: Now playing info (read straight from the playing track, so it stays
+    // correct even while browsing a different album/view).
     let track_title = app
-        .playing_index
-        .and_then(|i| app.tracks.get(i))
+        .playing
+        .as_ref()
         .map(|t| {
             let mut s = format!("  \u{25b6} {}", t.title);
             if let Some(ref up) = t.uploader {

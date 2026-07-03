@@ -24,7 +24,7 @@ pub struct App {
     pub albums: Vec<Album>,
     pub selection: usize,
     pub offset: usize,
-    pub playing_index: Option<usize>,
+    pub playing: Option<Track>,
     pub loop_mode: LoopMode,
     pub sort_mode: SortMode,
     pub player: MpvPlayer,
@@ -56,7 +56,7 @@ impl App {
             albums: Vec::new(),
             selection: 0,
             offset: 0,
-            playing_index: None,
+            playing: None,
             loop_mode: LoopMode::None,
             sort_mode: SortMode::Title,
             player: MpvPlayer::new(),
@@ -112,6 +112,14 @@ impl App {
             ViewMode::Albums => self.albums.len(),
             _ => self.tracks.len(),
         }
+    }
+
+    /// Position of the currently-playing track within the visible `tracks`, if
+    /// present. Playback identity is keyed by track id, so list swaps (sort,
+    /// album navigation) never leave a stale index behind.
+    pub fn playing_index(&self) -> Option<usize> {
+        let id = &self.playing.as_ref()?.id;
+        self.tracks.iter().position(|t| &t.id == id)
     }
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
@@ -227,7 +235,7 @@ impl App {
             }
             Action::Stop => {
                 self.player.stop().await;
-                self.playing_index = None;
+                self.playing = None;
             }
             Action::ToggleLoop => {
                 self.loop_mode = self.loop_mode.toggle();
@@ -345,19 +353,22 @@ impl App {
                 }
             }
             Action::NextTrack => {
-                if let Some(idx) = self.playing_index {
-                    if self.tracks.is_empty() {
-                        return;
-                    }
+                if self.tracks.is_empty() {
+                    return;
+                }
+                if let Some(idx) = self.playing_index() {
                     let next = (idx + 1) % self.tracks.len();
                     self.selection = next;
                     self.play_track(next).await;
                 }
             }
             Action::PrevTrack => {
-                if let Some(idx) = self.playing_index {
+                if self.tracks.is_empty() {
+                    return;
+                }
+                if let Some(idx) = self.playing_index() {
                     let prev = if idx == 0 {
-                        self.tracks.len().saturating_sub(1)
+                        self.tracks.len() - 1
                     } else {
                         idx - 1
                     };
@@ -377,7 +388,7 @@ impl App {
         if idx >= self.tracks.len() {
             return;
         }
-        let track = &self.tracks[idx];
+        let track = self.tracks[idx].clone();
         if let Some(ref path) = track.audio_path {
             if !std::path::Path::new(path).exists() {
                 self.set_status(format!("File not found: {}", path));
@@ -385,8 +396,8 @@ impl App {
             }
             match self.player.play(path, self.config.volume).await {
                 Ok(()) => {
-                    self.playing_index = Some(idx);
                     let _ = self.db.update_last_played(&track.id);
+                    self.playing = Some(track);
                 }
                 Err(e) => {
                     self.set_status(format!("Playback error: {}", e));
@@ -421,10 +432,10 @@ impl App {
         }
         let track = &self.tracks[self.selection];
 
-        // Stop if we're playing this track
-        if self.playing_index == Some(self.selection) {
+        // Stop if we're deleting the track that's currently playing.
+        if self.playing.as_ref().map(|p| p.id.as_str()) == Some(track.id.as_str()) {
             self.player.stop().await;
-            self.playing_index = None;
+            self.playing = None;
         }
 
         // Delete the audio file + sidecar + parent dir if empty
@@ -448,18 +459,13 @@ impl App {
         if self.selection >= self.tracks.len() && self.selection > 0 {
             self.selection -= 1;
         }
-
-        if let Some(ref mut pi) = self.playing_index {
-            if *pi > self.selection {
-                *pi -= 1;
-            }
-        }
+        // No index fixup needed: playback identity is keyed by track id.
 
         self.set_status(format!("Deleted: {}", track_title));
     }
 
     async fn check_loop(&mut self) {
-        if self.playing_index.is_none() {
+        if self.playing.is_none() {
             return;
         }
         if self.player.is_playing() {
@@ -467,20 +473,22 @@ impl App {
         }
 
         match self.loop_mode {
-            LoopMode::Single => {
-                if let Some(idx) = self.playing_index {
-                    self.play_track(idx).await;
-                }
-            }
+            LoopMode::Single => match self.playing_index() {
+                Some(idx) => self.play_track(idx).await,
+                None => self.playing = None,
+            },
             LoopMode::All => {
-                if let Some(idx) = self.playing_index {
-                    if self.tracks.is_empty() {
-                        self.playing_index = None;
-                        return;
+                if self.tracks.is_empty() {
+                    self.playing = None;
+                    return;
+                }
+                match self.playing_index() {
+                    Some(idx) => {
+                        let next = (idx + 1) % self.tracks.len();
+                        self.selection = next;
+                        self.play_track(next).await;
                     }
-                    let next = (idx + 1) % self.tracks.len();
-                    self.selection = next;
-                    self.play_track(next).await;
+                    None => self.playing = None,
                 }
             }
             LoopMode::Shuffle => {
@@ -493,7 +501,7 @@ impl App {
                 }
             }
             LoopMode::None => {
-                self.playing_index = None;
+                self.playing = None;
             }
         }
     }
@@ -759,6 +767,52 @@ pub async fn run(cfg: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::truncate_chars;
+    use super::App;
+    use crate::cache::index::CacheIndex;
+    use crate::config::Config;
+    use crate::types::Track;
+
+    fn track(id: &str) -> Track {
+        Track {
+            id: id.to_string(),
+            title: id.to_string(),
+            uploader: None,
+            duration: None,
+            webpage_url: None,
+            audio_path: None,
+            format: None,
+            file_size: None,
+            added_at: None,
+            last_played: None,
+        }
+    }
+
+    fn test_app() -> (App, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = CacheIndex::open(&dir.path().join("t.db")).unwrap();
+        let cfg = Config::new(Some(dir.path().to_string_lossy().to_string()), None);
+        (App::new(cfg, db), dir)
+    }
+
+    #[test]
+    fn playing_index_follows_track_id_across_reorder() {
+        let (mut app, _dir) = test_app();
+        app.tracks = vec![track("a"), track("b"), track("c")];
+        app.playing = Some(track("b"));
+        assert_eq!(app.playing_index(), Some(1));
+
+        // Re-sorting / swapping the visible list must not desync playback.
+        app.tracks = vec![track("c"), track("a"), track("b")];
+        assert_eq!(app.playing_index(), Some(2));
+
+        // When the playing track isn't in the current view, there is no index.
+        app.tracks = vec![track("a"), track("c")];
+        assert_eq!(app.playing_index(), None);
+
+        // Nothing playing -> no index.
+        app.playing = None;
+        assert_eq!(app.playing_index(), None);
+    }
 
     #[test]
     fn truncate_chars_is_char_boundary_safe() {

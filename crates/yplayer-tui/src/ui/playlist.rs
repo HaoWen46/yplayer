@@ -13,7 +13,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, track)| {
             let is_selected = i == app.selection;
-            let is_playing = app.playing_index == Some(i);
+            let is_playing = app.playing_index() == Some(i);
 
             let mut spans: Vec<Span> = Vec::new();
 
