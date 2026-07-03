@@ -9,8 +9,8 @@ name = "yplay"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
 futures-util = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = [
