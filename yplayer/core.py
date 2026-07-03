@@ -531,6 +531,10 @@ def _base_ydl_opts(cache_dir: str) -> Dict:
     return {
         "quiet": True,
         "no_warnings": True,
+        # Keep stdout pure JSON for the worker protocol: send all yt-dlp output
+        # (incl. the download progress bar) to stderr, and disable progress.
+        "logtostderr": True,
+        "noprogress": True,
         "noplaylist": True,
         "outtmpl": os.path.join(cache_dir, "%(id)s.%(ext)s"),
         "format": "bestaudio/best",
@@ -609,6 +613,10 @@ def download_audio(url: str, opts: Options, *, api_key: Optional[str] = None) ->
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
+        # Keep stdout pure JSON for the worker protocol (yt-dlp otherwise writes
+        # its progress bar to stdout, which corrupts the JSON-line responses).
+        "logtostderr": True,
+        "noprogress": True,
         "noplaylist": True,
         "outtmpl": outtmpl,
         "format": "bestaudio/best",

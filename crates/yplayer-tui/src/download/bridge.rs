@@ -188,38 +188,41 @@ impl Bridge {
             .await
             .map_err(|e| WorkerFailure::Transport(e.into()))?;
 
-        let mut response_line = String::new();
-        let n = self
-            .reader
-            .read_line(&mut response_line)
-            .await
-            .map_err(|e| WorkerFailure::Transport(e.into()))?;
-        if n == 0 {
-            return Err(WorkerFailure::Transport(anyhow::anyhow!(
-                "worker closed unexpectedly"
-            )));
-        }
-
-        let resp: WorkerResponse = serde_json::from_str(&response_line).map_err(|e| {
-            WorkerFailure::Transport(anyhow::anyhow!("invalid JSON from worker: {e}"))
-        })?;
-
-        if let Some(rid) = resp.id {
-            if rid != id {
+        // Read until the reply whose id matches. Any non-JSON line (a stray
+        // print, or yt-dlp progress leaking to stdout) or a mismatched id is
+        // skipped rather than fatally desyncing the protocol.
+        loop {
+            let mut response_line = String::new();
+            let n = self
+                .reader
+                .read_line(&mut response_line)
+                .await
+                .map_err(|e| WorkerFailure::Transport(e.into()))?;
+            if n == 0 {
                 return Err(WorkerFailure::Transport(anyhow::anyhow!(
-                    "worker response id mismatch (got {rid}, want {id})"
+                    "worker closed unexpectedly"
                 )));
             }
-        }
 
-        if !resp.ok {
-            return Err(WorkerFailure::App(
-                resp.error
-                    .unwrap_or_else(|| "unknown worker error".to_string()),
-            ));
-        }
+            let resp: WorkerResponse = match serde_json::from_str(&response_line) {
+                Ok(r) => r,
+                Err(_) => continue, // not a JSON line — skip pollution
+            };
 
-        Ok(resp)
+            // Skip a reply that carries a different id (a late/stray response).
+            if matches!(resp.id, Some(rid) if rid != id) {
+                continue;
+            }
+
+            if !resp.ok {
+                return Err(WorkerFailure::App(
+                    resp.error
+                        .unwrap_or_else(|| "unknown worker error".to_string()),
+                ));
+            }
+
+            return Ok(resp);
+        }
     }
 
     pub async fn download(

@@ -112,10 +112,12 @@ impl MpvPlayer {
         self.position = 0.0;
         self.duration = 0.0;
 
-        // Connect with a short retry loop: the socket file existing does not
-        // mean mpv is accepting connections yet.
+        // Connect with a retry loop: the socket file existing does not mean mpv
+        // is accepting connections yet. The window is generous (~3s) because a
+        // cold first-ever mpv launch can be slow to create the socket, and
+        // missing it leaves the track with no IPC control for its whole duration.
         let mut connected = None;
-        for _ in 0..40 {
+        for _ in 0..120 {
             if let Ok(stream) = UnixStream::connect(&self.socket_path).await {
                 connected = Some(stream);
                 break;
