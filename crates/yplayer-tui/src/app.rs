@@ -1,12 +1,12 @@
 use anyhow::Result;
+use crossterm::ExecutableCommand;
 use crossterm::event;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use crossterm::ExecutableCommand;
 use futures_util::StreamExt;
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use std::io::stdout;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -154,20 +154,20 @@ impl App {
     }
 
     fn clear_expired_status(&mut self) {
-        if let Some(until) = self.status_msg_until {
-            if std::time::Instant::now() >= until {
-                self.status_msg = None;
-                self.status_msg_until = None;
-            }
+        if let Some(until) = self.status_msg_until
+            && std::time::Instant::now() >= until
+        {
+            self.status_msg = None;
+            self.status_msg_until = None;
         }
         // Also expire delete confirmation
-        if let Some(until) = self.confirm_delete_until {
-            if std::time::Instant::now() >= until {
-                self.confirm_delete_until = None;
-                if self.status_msg.as_deref() == Some("Press d again to delete, Esc to cancel") {
-                    self.status_msg = None;
-                    self.status_msg_until = None;
-                }
+        if let Some(until) = self.confirm_delete_until
+            && std::time::Instant::now() >= until
+        {
+            self.confirm_delete_until = None;
+            if self.status_msg.as_deref() == Some("Press d again to delete, Esc to cancel") {
+                self.status_msg = None;
+                self.status_msg_until = None;
             }
         }
     }
@@ -589,9 +589,7 @@ impl App {
             }
             LoopMode::Shuffle => {
                 if !self.tracks.is_empty() {
-                    use rand::Rng;
-                    let mut rng = rand::thread_rng();
-                    let next = rng.gen_range(0..self.tracks.len());
+                    let next = rand::random_range(0..self.tracks.len());
                     self.selection = next;
                     self.play_track(next).await;
                 }
@@ -620,8 +618,8 @@ impl App {
         if self.search_query.is_empty() {
             self.search_results = self.tracks.clone();
         } else {
-            use fuzzy_matcher::skim::SkimMatcherV2;
             use fuzzy_matcher::FuzzyMatcher;
+            use fuzzy_matcher::skim::SkimMatcherV2;
 
             let matcher = SkimMatcherV2::default();
             let query = &self.search_query;
@@ -637,11 +635,7 @@ impl App {
                         .and_then(|u| matcher.fuzzy_match(u, query))
                         .unwrap_or(0);
                     let score = title_score.max(uploader_score);
-                    if score > 0 {
-                        Some((score, t))
-                    } else {
-                        None
-                    }
+                    if score > 0 { Some((score, t)) } else { None }
                 })
                 .collect();
 
@@ -787,10 +781,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         app.sort_mode = sm;
     }
     app.load_library();
-    if let Some(id) = &state.last_track_id {
-        if let Some(pos) = app.tracks.iter().position(|t| &t.id == id) {
-            app.selection = pos;
-        }
+    if let Some(id) = &state.last_track_id
+        && let Some(pos) = app.tracks.iter().position(|t| &t.id == id)
+    {
+        app.selection = pos;
     }
 
     // Spawn the persistent worker actor (needs the Tokio runtime, so not in App::new).
@@ -863,8 +857,8 @@ pub async fn run(cfg: Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_chars;
     use super::App;
+    use super::truncate_chars;
     use crate::cache::index::CacheIndex;
     use crate::config::Config;
     use crate::types::Track;

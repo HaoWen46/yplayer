@@ -125,7 +125,11 @@ for line in sys.stdin:
     fn fake_cmd(dir: &std::path::Path, name: &str, body: &str) {
         let path = dir.join(name);
         std::fs::write(&path, body).unwrap();
-        std::env::set_var("YPLAY_WORKER_CMD", format!("python3 {}", path.display()));
+        // set_var is unsafe on edition 2024 (not thread-safe); this test is
+        // single-threaded and the only consumer of YPLAY_WORKER_CMD.
+        unsafe {
+            std::env::set_var("YPLAY_WORKER_CMD", format!("python3 {}", path.display()));
+        }
     }
 
     // One serial test to avoid racing on the process-global YPLAY_WORKER_CMD.
@@ -151,6 +155,8 @@ for line in sys.stdin:
             .expect_err("worker reported an error");
         assert!(err.contains("video unavailable"), "got: {err}");
 
-        std::env::remove_var("YPLAY_WORKER_CMD");
+        unsafe {
+            std::env::remove_var("YPLAY_WORKER_CMD");
+        }
     }
 }

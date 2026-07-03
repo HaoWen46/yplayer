@@ -173,59 +173,58 @@ pub fn scan_and_index(cache_dir: &Path, db: &CacheIndex) -> Result<usize> {
 
     // Pass 3: Albums
     let albums_dir = cache_dir.join("albums");
-    if albums_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&albums_dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if !path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.ends_with(".album.json"))
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-
-                let data: Value = match std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                {
-                    Some(v) => v,
-                    None => continue,
-                };
-
-                let name = data
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown")
-                    .to_string();
-                let description = data
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                let track_ids: Vec<(String, i32)> = data
-                    .get("tracks")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .enumerate()
-                            .filter_map(|(i, t)| {
-                                let id = t.get("id")?.as_str()?.to_string();
-                                let pos = t
-                                    .get("order")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(i as i64 + 1)
-                                    as i32;
-                                Some((id, pos))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                db.bulk_insert_album(&name, &description, &track_ids).ok();
+    if albums_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&albums_dir)
+    {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with(".album.json"))
+                .unwrap_or(false)
+            {
+                continue;
             }
+
+            let data: Value = match std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+            {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let name = data
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown")
+                .to_string();
+            let description = data
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let track_ids: Vec<(String, i32)> = data
+                .get("tracks")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .enumerate()
+                        .filter_map(|(i, t)| {
+                            let id = t.get("id")?.as_str()?.to_string();
+                            let pos =
+                                t.get("order")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(i as i64 + 1) as i32;
+                            Some((id, pos))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            db.bulk_insert_album(&name, &description, &track_ids).ok();
         }
     }
 
@@ -236,12 +235,11 @@ fn find_audio_in_dir(dir: &Path) -> Option<String> {
     let entries = std::fs::read_dir(dir).ok()?;
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
-        if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if KNOWN_AUDIO_EXTS.contains(&ext.to_lowercase().as_str()) {
-                    return Some(path.to_string_lossy().to_string());
-                }
-            }
+        if path.is_file()
+            && let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && KNOWN_AUDIO_EXTS.contains(&ext.to_lowercase().as_str())
+        {
+            return Some(path.to_string_lossy().to_string());
         }
     }
     None

@@ -1,11 +1,11 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::process::{Child, Command};
 
 #[derive(Debug)]
@@ -205,22 +205,21 @@ impl MpvPlayer {
             return;
         }
 
-        if let Ok(val) = self.get_property("time-pos").await {
-            if let Some(pos) = val.as_f64() {
-                self.position = pos;
-            }
+        if let Ok(val) = self.get_property("time-pos").await
+            && let Some(pos) = val.as_f64()
+        {
+            self.position = pos;
         }
-        if let Ok(val) = self.get_property("pause").await {
-            if let Some(paused) = val.as_bool() {
-                self.is_paused = paused;
-            }
+        if let Ok(val) = self.get_property("pause").await
+            && let Some(paused) = val.as_bool()
+        {
+            self.is_paused = paused;
         }
-        if self.duration <= 0.0 {
-            if let Ok(val) = self.get_property("duration").await {
-                if let Some(dur) = val.as_f64() {
-                    self.duration = dur;
-                }
-            }
+        if self.duration <= 0.0
+            && let Ok(val) = self.get_property("duration").await
+            && let Some(dur) = val.as_f64()
+        {
+            self.duration = dur;
         }
     }
 
