@@ -6,12 +6,12 @@ authors = [ { name = "You" } ]
 requires-python = ">=3.9"
 dependencies = [
   "yt-dlp",
+  "python-dotenv",
 ]
 readme = "README.md"
 license = "MIT"
 
 [project.scripts]
-yplay-py = "yplayer.cli:main"
 yplay-worker = "yplayer.worker:main"
 
 [tool.setuptools.packages.find]

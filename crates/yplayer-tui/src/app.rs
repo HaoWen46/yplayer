@@ -82,6 +82,10 @@ impl App {
                 .map(|p| std::path::Path::new(p).exists())
                 .unwrap_or(false)
         });
+        // Keep the selection in range: retain() may have shrunk the list below it.
+        if self.selection >= self.tracks.len() {
+            self.selection = self.tracks.len().saturating_sub(1);
+        }
     }
 
     pub fn load_albums(&mut self) {
@@ -148,8 +152,19 @@ impl App {
                         self.rename_input.clear();
                     }
                     _ => {
-                        self.confirm_delete_until = None;
-                        self.should_quit = true;
+                        if self.confirm_delete_until.is_some() {
+                            // A delete is pending: Esc/quit cancels the confirmation
+                            // instead of exiting the whole app.
+                            self.confirm_delete_until = None;
+                            if self.status_msg.as_deref()
+                                == Some("Press d again to delete, Esc to cancel")
+                            {
+                                self.status_msg = None;
+                                self.status_msg_until = None;
+                            }
+                        } else {
+                            self.should_quit = true;
+                        }
                     }
                 }
             }
@@ -330,6 +345,9 @@ impl App {
             }
             Action::NextTrack => {
                 if let Some(idx) = self.playing_index {
+                    if self.tracks.is_empty() {
+                        return;
+                    }
                     let next = (idx + 1) % self.tracks.len();
                     self.selection = next;
                     self.play_track(next).await;
@@ -455,6 +473,10 @@ impl App {
             }
             LoopMode::All => {
                 if let Some(idx) = self.playing_index {
+                    if self.tracks.is_empty() {
+                        self.playing_index = None;
+                        return;
+                    }
                     let next = (idx + 1) % self.tracks.len();
                     self.selection = next;
                     self.play_track(next).await;
@@ -558,7 +580,7 @@ impl App {
             return;
         }
 
-        self.set_status(format!("Downloading {}…", &url[..url.len().min(40)]));
+        self.set_status(format!("Downloading {}…", truncate_chars(&url, 40)));
 
         match Bridge::new(&self.config).await {
             Ok(mut bridge) => match bridge.download(&url, &self.config).await {
@@ -600,6 +622,29 @@ impl App {
     }
 }
 
+/// Truncate to at most `max_chars` characters (not bytes), so status messages
+/// never slice through a multi-byte UTF-8 codepoint (e.g. CJK titles or emoji).
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
+/// Restore the terminal to its normal state. Safe to call more than once.
+fn restore_terminal() -> std::io::Result<()> {
+    disable_raw_mode()?;
+    stdout().execute(LeaveAlternateScreen)?;
+    Ok(())
+}
+
+/// RAII guard that restores the terminal on any exit path from `run` —
+/// including early `?` returns and panics unwinding through it.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = restore_terminal();
+    }
+}
+
 pub async fn run(cfg: Config) -> Result<()> {
     let db = CacheIndex::open(&cfg.db_path())?;
 
@@ -612,7 +657,17 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut app = App::new(cfg, db);
     app.load_library();
 
+    // Restore the terminal before printing any panic message, so a crash never
+    // leaves the shell in raw mode / the alternate screen.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = restore_terminal();
+        default_hook(info);
+    }));
+
     enable_raw_mode()?;
+    // From here on, any return or unwind restores the terminal via Drop.
+    let _guard = TerminalGuard;
     stdout().execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -695,8 +750,26 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
 
     app.player.stop().await;
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
+    // Terminal restored by TerminalGuard's Drop.
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_chars;
+
+    #[test]
+    fn truncate_chars_is_char_boundary_safe() {
+        // ASCII truncates by character count.
+        assert_eq!(truncate_chars("hello world", 5), "hello");
+        // Fewer characters than the limit returns the whole string.
+        assert_eq!(truncate_chars("hi", 5), "hi");
+        // Multi-byte CJK must never slice mid-codepoint (a byte slice at 4 would panic).
+        let jp = "ずっと真夜中でいいのに。";
+        assert_eq!(truncate_chars(jp, 4), "ずっと真");
+        assert_eq!(truncate_chars(jp, 100), jp);
+        // Emoji are counted as characters, not bytes.
+        assert_eq!(truncate_chars("🎧🎵🎶", 2), "🎧🎵");
+    }
 }

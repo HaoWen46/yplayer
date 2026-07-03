@@ -37,7 +37,6 @@ from .config import (
     YTDL_AUDIO_FORMAT,
 )
 from .utils import which, die, info, normalize_ext
-from .enhanced_playback import EnhancedPlayer
 
 # ----------- URL / ID helpers -----------
 
@@ -483,31 +482,6 @@ def list_cached_tracks(cache_dir: str) -> List[Dict]:
     out.sort(key=lambda x: (x.get("title") or os.path.basename(x["path"])).lower())
     return out
 
-def list_cached_playlists(cache_dir: str) -> List[Dict]:
-    """Return cached playlist manifests as browse-items."""
-    out = []
-    if not os.path.isdir(cache_dir):
-        return out
-
-    from .playlist import PlaylistManifest  # local import to avoid cycle
-    for name in os.listdir(cache_dir):
-        if not name.endswith(".plist.json"):
-            continue
-        try:
-            m = PlaylistManifest.load(os.path.join(cache_dir, name))
-            out.append(
-                {
-                    "type": "playlist",
-                    "title": m.title,
-                    "id": m.id,
-                    "count": len(m.tracks),
-                    "path": os.path.join(cache_dir, name),
-                }
-            )
-        except Exception:
-            pass
-    return out
-
 # ----------- YTDL helpers (download only) ----------
 
 # Recognise playlist URLs
@@ -737,10 +711,3 @@ def resolve_and_maybe_download(query_or_url: str, opts: Options, *, api_key: Opt
         pass
 
     return download_audio(info_obj["webpage_url"], opts, api_key=api_key)
-
-def run_and_maybe_play(query_or_url: str, opts: Options, *, api_key: Optional[str] = None) -> str:
-    path = resolve_and_maybe_download(query_or_url, opts, api_key=api_key)
-    if opts.play_after and not opts.print_only:
-        player = EnhancedPlayer(prefer=opts.player)
-        player.play(filepath=path, volume=opts.volume)
-    return path
