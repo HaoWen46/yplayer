@@ -99,9 +99,9 @@ pub struct Bridge {
 
 impl Bridge {
     pub async fn new(cfg: &Config) -> Result<Self> {
-        // Tests can inject a fake worker via YPLAY_WORKER_CMD; otherwise prefer
-        // the venv Python next to the Rust binary.
-        let (program, args) = worker_command()?;
+        // Tests can inject a fake worker via YPLAY_WORKER_CMD; otherwise use the
+        // pinned worker Python from config, falling back to .venv auto-discovery.
+        let (program, args) = worker_command(cfg.worker_python.as_deref())?;
 
         // Send worker stderr (tracebacks, yt-dlp / pip output) to a log file rather
         // than the terminal — inheriting it would corrupt the raw-mode alternate screen.
@@ -389,7 +389,7 @@ fn parse_track_from_value(v: &Value) -> Option<Track> {
 
 /// The command used to launch the worker. Overridable via YPLAY_WORKER_CMD
 /// (whitespace-separated) so tests can substitute a fake worker.
-fn worker_command() -> Result<(String, Vec<String>)> {
+fn worker_command(pinned_python: Option<&str>) -> Result<(String, Vec<String>)> {
     if let Ok(custom) = std::env::var("YPLAY_WORKER_CMD") {
         let mut parts: Vec<String> = custom.split_whitespace().map(String::from).collect();
         if parts.is_empty() {
@@ -398,10 +398,11 @@ fn worker_command() -> Result<(String, Vec<String>)> {
         let program = parts.remove(0);
         return Ok((program, parts));
     }
-    Ok((
-        find_python()?,
-        vec!["-m".to_string(), "yplayer.worker".to_string()],
-    ))
+    let python = match pinned_python {
+        Some(p) => p.to_string(),
+        None => find_python()?,
+    };
+    Ok((python, vec!["-m".to_string(), "yplayer.worker".to_string()]))
 }
 
 fn find_python() -> Result<String> {

@@ -25,8 +25,8 @@ struct Cli {
     download_only: bool,
 
     /// Audio format (mp3, m4a, opus, flac, wav)
-    #[arg(long, default_value = "mp3")]
-    format: String,
+    #[arg(long)]
+    format: Option<String>,
 
     /// Skip conversion and metadata embedding
     #[arg(long)]
@@ -69,14 +69,22 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let mut cfg = Config::new(cli.dir, cli.yt_api_key);
-    cfg.format = cli.format;
+    // Config file provides defaults; CLI flags override them.
+    let file = config::FileConfig::load();
+    let cache_dir = cli.dir.or(file.cache_dir);
+    let api_key = cli.yt_api_key.or(file.api_key);
+    let mut cfg = Config::new(cache_dir, api_key);
+    cfg.format = cli
+        .format
+        .or(file.format)
+        .unwrap_or_else(|| "mp3".to_string());
     cfg.native = cli.native;
     cfg.embed_meta = !cli.no_meta;
     cfg.audio_quality = cli.audio_quality;
     cfg.player = cli.player;
-    cfg.volume = cli.volume;
+    cfg.volume = cli.volume.or(file.volume);
     cfg.prefetch_count = cli.prefetch;
+    cfg.worker_python = file.worker_python;
 
     // Ensure cache directory exists
     std::fs::create_dir_all(&cfg.cache_dir)?;

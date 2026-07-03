@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 
 use crate::cache::index::CacheIndex;
 use crate::cache::scanner;
-use crate::config::Config;
+use crate::config::{Config, SessionState};
 use crate::download::worker::WorkerHandle;
 use crate::events::{self, Action};
 use crate::player::mpv::MpvPlayer;
@@ -36,6 +36,8 @@ pub struct App {
     pub playing: Option<Track>,
     pub loop_mode: LoopMode,
     pub sort_mode: SortMode,
+    // Authoritative session volume (0..100); persists across tracks and launches.
+    pub volume: f64,
     pub player: MpvPlayer,
     pub db: CacheIndex,
     pub config: Config,
@@ -67,6 +69,10 @@ pub struct App {
 impl App {
     pub fn new(cfg: Config, db: CacheIndex) -> Self {
         let (worker_tx, worker_rx) = mpsc::unbounded_channel();
+        let volume = cfg
+            .volume
+            .map(|v| (v * 100.0).clamp(0.0, 100.0))
+            .unwrap_or(100.0);
         Self {
             mode: ViewMode::Library,
             tracks: Vec::new(),
@@ -76,6 +82,7 @@ impl App {
             playing: None,
             loop_mode: LoopMode::None,
             sort_mode: SortMode::Title,
+            volume,
             player: MpvPlayer::new(),
             db,
             config: cfg,
@@ -366,15 +373,15 @@ impl App {
                 }
             }
             Action::VolumeUp => {
+                self.volume = (self.volume + 5.0).min(100.0);
                 if self.player.is_playing() {
-                    let new_vol = (self.player.volume + 5.0).min(100.0);
-                    let _ = self.player.set_volume(new_vol).await;
+                    let _ = self.player.set_volume(self.volume).await;
                 }
             }
             Action::VolumeDown => {
+                self.volume = (self.volume - 5.0).max(0.0);
                 if self.player.is_playing() {
-                    let new_vol = (self.player.volume - 5.0).max(0.0);
-                    let _ = self.player.set_volume(new_vol).await;
+                    let _ = self.player.set_volume(self.volume).await;
                 }
             }
             Action::NextTrack => {
@@ -485,7 +492,7 @@ impl App {
                 self.set_status(format!("File not found: {}", path));
                 return;
             }
-            match self.player.play(path, self.config.volume).await {
+            match self.player.play(path, Some(self.volume / 100.0)).await {
                 Ok(()) => {
                     let _ = self.db.update_last_played(&track.id);
                     self.playing = Some(track);
@@ -772,7 +779,21 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
 
     let mut app = App::new(cfg, db);
+
+    // Restore persisted session state (volume, sort order) before the first load.
+    let state = SessionState::load(&app.config.state_path());
+    if let Some(v) = state.volume {
+        app.volume = v.clamp(0.0, 100.0);
+    }
+    if let Some(sm) = state.sort_mode {
+        app.sort_mode = sm;
+    }
     app.load_library();
+    if let Some(id) = &state.last_track_id {
+        if let Some(pos) = app.tracks.iter().position(|t| &t.id == id) {
+            app.selection = pos;
+        }
+    }
 
     // Spawn the persistent worker actor (needs the Tokio runtime, so not in App::new).
     app.worker = Some(WorkerHandle::spawn(app.config.clone()));
@@ -824,6 +845,19 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
 
     app.player.stop().await;
+
+    // Persist session state so volume / sort / last track survive the next launch.
+    let last_track_id = app
+        .playing
+        .as_ref()
+        .map(|t| t.id.clone())
+        .or_else(|| app.tracks.get(app.selection).map(|t| t.id.clone()));
+    SessionState {
+        volume: Some(app.volume),
+        sort_mode: Some(app.sort_mode),
+        last_track_id,
+    }
+    .save(&app.config.state_path());
     // Terminal restored by TerminalGuard's Drop.
 
     Ok(())

@@ -30,7 +30,7 @@ pub struct AlbumTrack {
     pub position: i32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoopMode {
     None,
     Single,
@@ -59,7 +59,7 @@ impl LoopMode {
 }
 
 /// How the library list is sorted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SortMode {
     Title,
     RecentlyPlayed,
