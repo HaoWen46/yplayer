@@ -9,6 +9,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::stdout;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 use crate::cache::index::CacheIndex;
 use crate::cache::scanner;
@@ -18,6 +19,13 @@ use crate::events::{self, Action};
 use crate::player::mpv::MpvPlayer;
 use crate::types::{Album, LoopMode, SortMode, Track, ViewMode};
 use crate::ui;
+
+/// Result of a background download task, delivered to the event loop.
+#[derive(Debug)]
+pub enum WorkerEvent {
+    DownloadDone { track: Track },
+    DownloadFailed { url: String, error: String },
+}
 
 pub struct App {
     pub mode: ViewMode,
@@ -49,10 +57,14 @@ pub struct App {
     status_msg_until: Option<std::time::Instant>,
     // Delete confirmation: Some(Instant) = waiting for 2nd press, expires after 3s
     pub confirm_delete_until: Option<std::time::Instant>,
+    // Background download tasks report results here; run() owns the receiver.
+    worker_tx: mpsc::UnboundedSender<WorkerEvent>,
+    worker_rx: Option<mpsc::UnboundedReceiver<WorkerEvent>>,
 }
 
 impl App {
     pub fn new(cfg: Config, db: CacheIndex) -> Self {
+        let (worker_tx, worker_rx) = mpsc::unbounded_channel();
         Self {
             mode: ViewMode::Library,
             tracks: Vec::new(),
@@ -76,6 +88,8 @@ impl App {
             status_msg: None,
             status_msg_until: None,
             confirm_delete_until: None,
+            worker_tx,
+            worker_rx: Some(worker_rx),
         }
     }
 
@@ -422,7 +436,7 @@ impl App {
                             self.mode = self.prev_mode.take().unwrap_or(ViewMode::Library);
                             self.download_input.clear();
                         }
-                        event::KeyCode::Enter => self.execute_download().await,
+                        event::KeyCode::Enter => self.execute_download(),
                         _ => self.handle_download_input(key),
                     },
                     ViewMode::RenameInput => match key.code {
@@ -653,9 +667,9 @@ impl App {
         }
     }
 
-    async fn execute_download(&mut self) {
+    fn execute_download(&mut self) {
         let url = self.download_input.trim().to_string();
-        // Return to previous mode first so UI shows
+        // Return to previous mode first so the UI shows immediately.
         self.mode = self.prev_mode.take().unwrap_or(ViewMode::Library);
         self.download_input.clear();
 
@@ -665,20 +679,45 @@ impl App {
 
         self.set_status(format!("Downloading {}…", truncate_chars(&url, 40)));
 
-        match Bridge::new(&self.config).await {
-            Ok(mut bridge) => match bridge.download(&url, &self.config).await {
-                Ok(result) => {
-                    let title = result.track.title.clone();
-                    let _ = self.db.upsert_track(&result.track);
-                    self.load_library();
-                    self.set_status(format!("Downloaded: {}", title));
-                }
-                Err(e) => {
-                    self.set_status(format!("Download failed: {}", e));
-                }
-            },
-            Err(e) => {
-                self.set_status(format!("Worker error: {}", e));
+        // Run the download off the event loop; the result comes back over the
+        // worker channel so the UI stays responsive for the whole download.
+        let tx = self.worker_tx.clone();
+        let cfg = self.config.clone();
+        tokio::spawn(async move {
+            let ev = match Bridge::new(&cfg).await {
+                Ok(mut bridge) => match bridge.download(&url, &cfg).await {
+                    Ok(result) => WorkerEvent::DownloadDone {
+                        track: result.track,
+                    },
+                    Err(e) => WorkerEvent::DownloadFailed {
+                        url,
+                        error: e.to_string(),
+                    },
+                },
+                Err(e) => WorkerEvent::DownloadFailed {
+                    url,
+                    error: format!("worker: {e}"),
+                },
+            };
+            let _ = tx.send(ev);
+        });
+    }
+
+    fn on_worker_event(&mut self, ev: WorkerEvent) {
+        self.dirty = true;
+        match ev {
+            WorkerEvent::DownloadDone { track } => {
+                let title = track.title.clone();
+                let _ = self.db.upsert_track(&track);
+                self.load_library();
+                self.set_status(format!("Downloaded: {}", title));
+            }
+            WorkerEvent::DownloadFailed { url, error } => {
+                self.set_status(format!(
+                    "Download failed: {} ({})",
+                    truncate_chars(&url, 30),
+                    error
+                ));
             }
         }
     }
@@ -756,6 +795,8 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
+    // run() owns the receiver end; App keeps the sender to hand to spawned tasks.
+    let mut worker_rx = app.worker_rx.take().expect("worker_rx already taken");
     let mut reader = event::EventStream::new();
     // Position/loop polling cadence. Much slower than the old 50ms busy-loop —
     // mpv playback only needs a few refreshes per second.
@@ -777,6 +818,9 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
             _ = tick.tick() => {
                 app.handle_action(Action::Tick).await;
+            }
+            Some(wev) = worker_rx.recv() => {
+                app.on_worker_event(wev);
             }
         }
     }
