@@ -18,8 +18,18 @@ public final class LibraryStore {
     /// Set by a `resync` event; cleared by `load`.
     public private(set) var needsResync = false
 
-    /// Folded title and uploader per track id, for `search`.
-    @ObservationIgnored private var folded: [String: String] = [:]
+    /// Sort keys, aligned with `libraryOrder`.
+    @ObservationIgnored private var sortKeys: [SortKey] = []
+    /// Folded title and uploader (UTF-8) per track, aligned with `libraryOrder`, for `search`.
+    @ObservationIgnored private var searchKeys: [[UInt8]] = []
+    /// The previous search's folded query and matches (indices into `libraryOrder`); nil after
+    /// any library change.
+    @ObservationIgnored private var lastSearch: (needle: [UInt8], matches: [Int])?
+
+    /// How long a toast is shown or kept.
+    public static let toastLifetime: TimeInterval = 10
+    /// The most toasts kept.
+    public static let maxToasts = 3
 
     public init() {}
 
@@ -35,24 +45,49 @@ public final class LibraryStore {
         albums.first { $0.id == id }
     }
 
-    /// Tracks whose folded title or uploader contains the folded query, in library order.
+    /// Tracks whose folded title or uploader contains the folded query, in library order. A
+    /// query that extends the previous one filters the previous matches only.
     public func search(_ query: String) -> [Track] {
-        if query.isEmpty { return [] }
-        let needle = SearchNormalizer.fold(query)
-        return libraryOrder.compactMap { id in
-            guard let haystack = folded[id], haystack.range(of: needle, options: .literal) != nil
-            else { return nil }
-            return tracks[id]
+        let needle = Array(SearchNormalizer.fold(query).utf8)
+        if needle.isEmpty { return [] }
+        let matches: [Int]
+        if let last = lastSearch, needle.starts(with: last.needle) {
+            matches = last.matches.filter { Self.contains(searchKeys[$0], needle) }
+        } else {
+            matches = searchKeys.indices.filter { Self.contains(searchKeys[$0], needle) }
         }
+        lastSearch = (needle, matches)
+        return matches.compactMap { tracks[libraryOrder[$0]] }
     }
 
     public func load(_ snapshot: LibrarySnapshot) {
         tracks = Dictionary(snapshot.tracks.map { ($0.id, $0) }, uniquingKeysWith: { $1 })
-        libraryOrder = tracks.values.sorted(by: Self.precedes).map(\.id)
+        var entries = tracks.values.map { (key: SortKey($0), search: Self.searchKey($0)) }
+        entries.sort { $0.key.precedes($1.key) }
+        sortKeys = entries.map(\.key)
+        searchKeys = entries.map(\.search)
+        lastSearch = nil
+        libraryOrder = sortKeys.map(\.id)
         albums = snapshot.albums.sorted(by: Self.namePrecedes)
-        folded = tracks.mapValues(Self.searchKey)
+        downloads = downloads.filter { tracks[$0.key]?.state == .downloading }
         libraryVersion = snapshot.libraryVersion
         needsResync = false
+    }
+
+    /// Appends `toast` after dropping toasts older than `toastLifetime`, unless it repeats the
+    /// newest toast exactly; keeps the newest `maxToasts`.
+    public func appendToast(_ toast: ToastItem) {
+        var kept = toasts.filter {
+            toast.createdAt.timeIntervalSince($0.createdAt) < Self.toastLifetime
+        }
+        if let newest = kept.last, newest.severity == toast.severity,
+            newest.message == toast.message
+        {
+            toasts = kept
+            return
+        }
+        kept.append(toast)
+        toasts = Array(kept.suffix(Self.maxToasts))
     }
 
     public func apply(_ update: ClientUpdate) {
@@ -101,7 +136,7 @@ public final class LibraryStore {
                     phase: download.phase, fraction: fraction)
             }
         case .toast(let toast):
-            toasts.append(ToastItem(severity: toast.severity, message: toast.message))
+            appendToast(ToastItem(severity: toast.severity, message: toast.message))
         case .resync:
             needsResync = true
         case .unknown:
@@ -130,41 +165,117 @@ public final class LibraryStore {
     }
 
     private func upsert(_ track: Track) {
-        tracks[track.id] = track
-        folded[track.id] = Self.searchKey(track)
-        var order = libraryOrder
-        order.removeAll { $0 == track.id }
-        let index =
-            order.firstIndex { id in
-                guard let other = tracks[id] else { return false }
-                return Self.precedes(track, other)
-            } ?? order.endIndex
-        order.insert(track.id, at: index)
-        libraryOrder = order
+        let old = tracks.updateValue(track, forKey: track.id)
+        lastSearch = nil
+        let key = SortKey(track)
+        let search = Self.searchKey(track)
+        guard let old else {
+            let index = insertionIndex(key)
+            sortKeys.insert(key, at: index)
+            searchKeys.insert(search, at: index)
+            libraryOrder.insert(track.id, at: index)
+            return
+        }
+        let from = insertionIndex(SortKey(old))
+        if old.addedAt == track.addedAt, old.title == track.title {
+            searchKeys[from] = search
+            return
+        }
+        sortKeys.remove(at: from)
+        searchKeys.remove(at: from)
+        let to = insertionIndex(key)
+        sortKeys.insert(key, at: to)
+        searchKeys.insert(search, at: to)
+        if to != from {
+            Self.move(&libraryOrder, from: from, to: to)
+        }
     }
 
     private func remove(trackID id: String) {
-        tracks[id] = nil
-        folded[id] = nil
-        libraryOrder.removeAll { $0 == id }
+        if let old = tracks.removeValue(forKey: id) {
+            let index = insertionIndex(SortKey(old))
+            sortKeys.remove(at: index)
+            searchKeys.remove(at: index)
+            libraryOrder.remove(at: index)
+            lastSearch = nil
+        }
         for index in albums.indices where albums[index].trackIDs.contains(id) {
             albums[index].trackIDs.removeAll { $0 == id }
         }
         downloads[id] = nil
     }
 
-    private static func precedes(_ a: Track, _ b: Track) -> Bool {
-        let aAdded = a.addedAt ?? .min
-        let bAdded = b.addedAt ?? .min
-        if aAdded != bAdded { return aAdded > bAdded }
-        return a.title.localizedStandardCompare(b.title) == .orderedAscending
+    /// The first index in `sortKeys` whose key does not precede `key` (binary search); for a
+    /// key in `sortKeys`, its index.
+    private func insertionIndex(_ key: SortKey) -> Int {
+        var low = 0
+        var high = sortKeys.count
+        while low < high {
+            let mid = (low + high) / 2
+            if sortKeys[mid].precedes(key) {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        return low
+    }
+
+    private static func move(_ order: inout [String], from: Int, to: Int) {
+        let id = order.remove(at: from)
+        order.insert(id, at: to)
+    }
+
+    /// Whether `needle` occurs in `haystack`: `memchr` for its last byte, then `memcmp` of the
+    /// bytes before it (a first-byte probe is slow on CJK text, full of the lead byte E3).
+    private static func contains(_ haystack: [UInt8], _ needle: [UInt8]) -> Bool {
+        let tail = needle.count - 1
+        guard haystack.count > tail else { return false }
+        return haystack.withUnsafeBytes { haystack in
+            needle.withUnsafeBytes { needle in
+                guard let base = haystack.baseAddress, let pattern = needle.baseAddress else {
+                    return false
+                }
+                let end = base + haystack.count
+                var from = base + tail
+                while from < end, let found = memchr(from, Int32(needle[tail]), end - from) {
+                    let hit = UnsafeRawPointer(found)
+                    if memcmp(hit - tail, pattern, tail) == 0 { return true }
+                    from = hit + 1
+                }
+                return false
+            }
+        }
     }
 
     private static func namePrecedes(_ a: Album, _ b: Album) -> Bool {
         a.name.localizedStandardCompare(b.name) == .orderedAscending
     }
 
-    private static func searchKey(_ track: Track) -> String {
-        SearchNormalizer.fold(track.title + "\n" + (track.uploader ?? ""))
+    private static func searchKey(_ track: Track) -> [UInt8] {
+        Array(SearchNormalizer.fold(track.title + "\n" + (track.uploader ?? "")).utf8)
+    }
+}
+
+/// A track's place in `libraryOrder`: `addedAt` descending, then title (Finder order), then id.
+private struct SortKey {
+    let addedAt: Int64
+    /// The title as a Foundation string, so comparisons do not bridge.
+    let title: NSString
+    let id: String
+
+    init(_ track: Track) {
+        addedAt = track.addedAt ?? .min
+        title = NSString(string: track.title)
+        id = track.id
+    }
+
+    func precedes(_ other: SortKey) -> Bool {
+        if addedAt != other.addedAt { return addedAt > other.addedAt }
+        switch title.localizedStandardCompare(other.title as String) {
+        case .orderedAscending: return true
+        case .orderedDescending: return false
+        case .orderedSame: return id < other.id
+        }
     }
 }

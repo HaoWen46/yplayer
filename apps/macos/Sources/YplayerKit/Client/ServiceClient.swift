@@ -57,7 +57,9 @@ public actor ServiceClient {
 
     public func send<R: Decodable & Sendable>(_ cmd: Command, as type: R.Type) async throws -> R {
         guard ready, let socket else { throw Self.notConnected }
-        return try await request(cmd, on: socket).result(as: type)
+        let result = try await request(cmd, on: socket).result(as: type)
+        backoff = .seconds(1)
+        return result
     }
 
     public func send(_ cmd: Command) async throws {
@@ -65,6 +67,7 @@ public actor ServiceClient {
         if let error = try await request(cmd, on: socket).error {
             throw error
         }
+        backoff = .seconds(1)
     }
 
     private static var notConnected: ServiceError {
@@ -106,7 +109,6 @@ public actor ServiceClient {
                 .result(as: SubscribeResult.self)
             guard self.socket === socket else { throw Self.notConnected }
             ready = true
-            backoff = .seconds(1)
             output.yield(.connected(subscribed))
             for event in early {
                 output.yield(.event(event))

@@ -232,3 +232,76 @@ private func sampleStore() -> LibraryStore {
     #expect(results.count == 5_000)
     #expect(elapsed < .milliseconds(20))
 }
+
+/// `count` tracks with distinct `addedAt`, mixed CJK and Latin titles, one in six by ZUTOMAYO.
+private func largeLibrary(_ count: Int) -> [Track] {
+    let words = ["秒針を噛む", "お勉強しといてよ", "正しくなれない", "Night", "Blue", "Remix", "Live", "はむ"]
+    let uploaders = ["ずっと真夜中でいいのに。 ZUTOMAYO", "YOASOBI", "Ado", "Vaundy", "King Gnu", "米津玄師"]
+    return (0..<count).map { i in
+        track(
+            String(format: "id%06d", i),
+            "\(words[i % words.count]) \(words[(i / words.count) % words.count]) \(i)",
+            addedAt: 1_700_000_000 + Int64(i), uploader: uploaders[i % uploaders.count])
+    }
+}
+
+@MainActor
+@Test func perKeystrokeSearchOverTwentyThousandTracksIsFast() {
+    let store = LibraryStore()
+    store.load(LibrarySnapshot(tracks: largeLibrary(20_000), albums: [], libraryVersion: 1))
+
+    let clock = ContinuousClock()
+    for query in ["zutomayo", "ずっと真夜中"] {
+        var slowest: Duration = .zero
+        var typed = ""
+        var results: [Track] = []
+        for character in query {
+            typed.append(character)
+            let elapsed = clock.measure {
+                results = store.search(typed)
+            }
+            slowest = max(slowest, elapsed)
+        }
+        print("per-keystroke search over 20,000 tracks (\(query)): slowest \(slowest)")
+        let fresh = LibraryStore()
+        fresh.load(LibrarySnapshot(tracks: largeLibrary(20_000), albums: [], libraryVersion: 1))
+        #expect(results.map(\.id) == fresh.search(query).map(\.id))
+        #expect(results.count == 3_334)
+        #expect(slowest < .milliseconds(20))
+    }
+}
+
+@MainActor
+@Test func loadAndUpsertOverTwentyThousandTracksAreFast() {
+    let tracks = largeLibrary(20_000)
+    let store = LibraryStore()
+    let clock = ContinuousClock()
+    let load = clock.measure {
+        store.load(LibrarySnapshot(tracks: tracks, albums: [], libraryVersion: 1))
+    }
+
+    var upserts: Duration = .zero
+    for k in 0..<200 {
+        var upserted: Track
+        if k.isMultiple(of: 2) {
+            upserted = track(
+                "new\(k)", "Night \(k)", addedAt: 1_700_000_000 + Int64((k * 7_919) % 20_000))
+        } else {
+            upserted = tracks[(k * 197) % tracks.count]
+            upserted.title = "renamed \(k)"
+        }
+        upserts += clock.measure {
+            store.apply(.event(.trackUpsert(upserted)))
+        }
+    }
+    let upsert = upserts / 200
+    print("20,000 tracks: load \(load), upsert \(upsert)")
+
+    let fresh = LibraryStore()
+    fresh.load(
+        LibrarySnapshot(tracks: Array(store.tracks.values), albums: [], libraryVersion: 1))
+    #expect(store.libraryOrder == fresh.libraryOrder)
+    #expect(store.search("renamed 1").map(\.id) == fresh.search("renamed 1").map(\.id))
+    #expect(load < .milliseconds(450))
+    #expect(upsert < .microseconds(1_500))
+}

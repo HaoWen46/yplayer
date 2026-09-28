@@ -29,8 +29,8 @@ struct TrackRow: View {
     @ViewState private var hovering = false
 
     var body: some View {
-        if let track = model.store.tracks[trackID] {
-            HStack(spacing: 10) {
+        HStack(spacing: 10) {
+            if let track = model.store.tracks[trackID] {
                 TrackArtwork(path: track.thumbPath)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(track.title)
@@ -51,14 +51,14 @@ struct TrackRow: View {
                 Spacer(minLength: 4)
                 status(track)
             }
-            .padding(.horizontal, 6)
-            .padding(.vertical, 4)
-            .background(
-                .primary.opacity(hovering ? 0.06 : 0), in: .rect(cornerRadius: 8)
-            )
-            .contentShape(.rect)
-            .onHover { hovering = $0 }
         }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        .background(
+            .primary.opacity(hovering ? 0.06 : 0), in: .rect(cornerRadius: 8)
+        )
+        .contentShape(.rect)
+        .onHover { hovering = $0 }
     }
 
     @ViewBuilder

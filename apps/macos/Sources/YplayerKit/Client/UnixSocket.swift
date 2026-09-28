@@ -36,15 +36,13 @@ final class UnixSocket: Sendable {
     func receive() async throws -> Data? {
         try await withCheckedThrowingContinuation { continuation in
             connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) {
-                data, _, isComplete, error in
+                data, _, _, error in
                 if let data, !data.isEmpty {
                     continuation.resume(returning: data)
                 } else if let error {
                     continuation.resume(throwing: error)
-                } else if isComplete {
-                    continuation.resume(returning: nil)
                 } else {
-                    continuation.resume(returning: Data())
+                    continuation.resume(returning: nil)
                 }
             }
         }
@@ -61,9 +59,12 @@ final class UnixSocket: Sendable {
 
 /// Splits a byte stream into `\n`-terminated lines.
 struct LineFramer {
-    /// Longest accepted line, without its `\n` (the service's `MAX_LINE`).
-    static let maxLine = 1 << 20
+    /// Longest accepted incoming line, without its `\n` (a `library.get` reply carries the
+    /// whole library).
+    static let maxLine = 64 << 20
     private var buffer = Data()
+    /// Bytes at the start of `buffer` already searched for `\n`.
+    private var scanned = 0
 
     /// Appends `chunk` and returns the complete lines (without `\n`); nil when a line
     /// exceeds `maxLine`.
@@ -71,12 +72,15 @@ struct LineFramer {
         buffer.append(chunk)
         var lines: [Data] = []
         var start = buffer.startIndex
-        while let newline = buffer[start...].firstIndex(of: UInt8(ascii: "\n")) {
+        var from = start + scanned
+        while let newline = buffer[from...].firstIndex(of: UInt8(ascii: "\n")) {
             guard newline - start <= Self.maxLine else { return nil }
             lines.append(Data(buffer[start..<newline]))
             start = newline + 1
+            from = start
         }
         buffer.removeSubrange(buffer.startIndex..<start)
+        scanned = buffer.count
         guard buffer.count <= Self.maxLine else { return nil }
         return lines
     }

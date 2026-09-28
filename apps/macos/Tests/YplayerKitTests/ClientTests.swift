@@ -102,6 +102,21 @@ private actor Recorder {
     }
 }
 
+@Test func lineFramerAcceptsFiveMegabyteLine() throws {
+    var framer = LineFramer()
+    var line = Data(repeating: UInt8(ascii: "x"), count: 5_000_000)
+    line.append(UInt8(ascii: "\n"))
+    var lines: [Data] = []
+    var offset = 0
+    while offset < line.count {
+        let end = min(offset + 64 * 1024, line.count)
+        let framed = framer.append(line.subdata(in: offset..<end))
+        lines += try #require(framed)
+        offset = end
+    }
+    #expect(lines.map(\.count) == [5_000_000])
+}
+
 private func record(_ client: ServiceClient) -> Recorder {
     let recorder = Recorder()
     Task {
@@ -177,7 +192,7 @@ struct ClientTests {
         let service = try TestService(5)
         defer { service.cleanup() }
         try await service.start()
-        let (_, log) = try await connect(service)
+        let (client, log) = try await connect(service)
 
         try await service.stop()
         try await waitUntil("disconnected") { await !log.disconnects.isEmpty }
@@ -191,7 +206,8 @@ struct ClientTests {
         let retries = await log.disconnects
         #expect(zip(retries, retries.dropFirst()).allSatisfy { $1 == $0 * 2 })
 
-        // A successful connect resets the backoff to 1 s.
+        // A successful request after connecting resets the backoff to 1 s.
+        _ = try await client.send(.libraryGet, as: LibrarySnapshot.self)
         try await service.stop()
         try await waitUntil("disconnected again") {
             await log.disconnects.count == retries.count + 1

@@ -6,7 +6,7 @@ public enum DropPayload {
             let line = string.trimmingCharacters(in: .whitespacesAndNewlines)
                 .prefix { !$0.isNewline }
                 .trimmingCharacters(in: .whitespaces)
-            if case .success = YouTubeURL.videoID(from: line) {
+            if case .success(let id) = YouTubeURL.videoID(from: line), id != line {
                 return line
             }
         }

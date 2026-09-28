@@ -21,10 +21,14 @@ public struct ToastItem: Equatable, Identifiable, Sendable {
     public let id: UUID
     public var severity: Severity
     public var message: String
+    public let createdAt: Date
 
-    public init(id: UUID = UUID(), severity: Severity, message: String) {
+    public init(
+        id: UUID = UUID(), severity: Severity, message: String, createdAt: Date = .now
+    ) {
         self.id = id
         self.severity = severity
         self.message = message
+        self.createdAt = createdAt
     }
 }
