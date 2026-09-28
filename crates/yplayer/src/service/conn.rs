@@ -120,6 +120,11 @@ async fn write_lines(mut wr: OwnedWriteHalf, mut lines: mpsc::Receiver<Out>) {
         if wr.write_all(&line).await.is_err() {
             return;
         }
+        // A full-library reply is megabytes built and freed in one go.
+        if line.len() > 1 << 20 {
+            drop(line);
+            crate::mem::release_free_memory();
+        }
     }
     let _ = wr.shutdown().await;
 }
