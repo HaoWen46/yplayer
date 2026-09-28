@@ -1,6 +1,8 @@
 use clap::{CommandFactory, Parser, Subcommand};
+use std::path::PathBuf;
 use yplayer::config::{self, Config};
 use yplayer::download::bridge::Bridge;
+use yplayer::service::{self, ServeOptions};
 use yplayer::types::Track;
 
 #[derive(Parser, Debug)]
@@ -21,6 +23,15 @@ enum Commands {
     },
     /// List audio formats for a URL
     Formats { url: String },
+    /// Run the background service
+    Serve {
+        /// Cache directory (default: config file, else ~/Music/yt-audio)
+        #[arg(long)]
+        dir: Option<String>,
+        /// Socket path (default: $YPLAY_SOCKET, else <state dir>/yplay.sock)
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -33,7 +44,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let file = config::FileConfig::load();
-    let mut cfg = Config::new(file.cache_dir, file.api_key);
+    let dir = match &command {
+        Commands::Serve { dir, .. } => dir.clone(),
+        _ => None,
+    };
+    let mut cfg = Config::new(dir.or(file.cache_dir), file.api_key);
     cfg.volume = file.volume;
     cfg.worker_python = file.worker_python;
 
@@ -52,6 +67,14 @@ async fn main() -> anyhow::Result<()> {
             for f in formats {
                 println!("{}", f);
             }
+        }
+        Commands::Serve { socket, .. } => {
+            service::serve(ServeOptions {
+                config: cfg,
+                socket_path: socket.unwrap_or_else(Config::socket_path),
+                state_dir: Config::state_dir(),
+            })
+            .await?;
         }
     }
 

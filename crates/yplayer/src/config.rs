@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::types::LoopMode;
 
@@ -44,6 +44,21 @@ impl Config {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("yplayer")
+    }
+
+    /// Service socket: `YPLAY_SOCKET`, else `<state_dir>/yplay.sock`.
+    pub fn socket_path() -> PathBuf {
+        std::env::var_os("YPLAY_SOCKET")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Self::state_dir().join("yplay.sock"))
+    }
+
+    pub fn worker_log_path(state_dir: &Path) -> PathBuf {
+        state_dir.join("worker.log")
+    }
+
+    pub fn update_stamp_path(state_dir: &Path) -> PathBuf {
+        state_dir.join("ytdlp_update_check")
     }
 }
 
