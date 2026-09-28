@@ -4,5 +4,7 @@ pub mod http;
 pub mod library;
 pub mod lyrics;
 pub mod player;
+pub mod protocol;
 pub mod types;
 pub mod updater;
+pub mod ytid;
