@@ -67,7 +67,7 @@ While watching YouTube in Safari (or Chrome), the user drags the page URL onto a
 2. App sends `add {url, album, play: true}`.
 3. Service: if the track row exists with `state=complete` and its audio file exists → link to album (if not already), bump `albums.last_used_at`, play the local file. No network.
 4. Else: insert/refresh the row with `state=downloading` (title = video id placeholder, `audio_path=''`), link to album, emit `track.upsert` + `album.upsert`, then send a download job to the worker.
-5. Worker: one `extract_info(url, download=True)` call (a single metadata fetch) with `format=bestaudio`, `nopart=True`, `outtmpl={'default': '<cache>/%(title).150B [%(id).8s]/audio.%(ext)s', 'thumbnail': '<cache>/%(title).150B [%(id).8s]/cover.%(ext)s'}`, `writethumbnail=True` (thumbnail kept as-is) → the first progress callback with bytes on disk emits `started {path, dir, meta}` (service sets title/uploader/duration/audio_path) → throttled `progress` → writes `meta.json` LAST → final `ok` response.
+5. Worker: one `extract_info(url, download=True)` call (a single metadata fetch) with `format=bestaudio`, `nopart=True`, `outtmpl='<cache>/%(title).150B [%(id).8s]/audio.%(ext)s'`, `extractor_args={'youtube': {'skip': ['hls', 'dash']}}`, and NO `writethumbnail` (yt-dlp probes thumbnails best-first before the media download — measured ~9 s of misses on the test video) → the first progress callback with bytes on disk emits `started {path, dir, meta}` (service sets title/uploader/duration/audio_path) → throttled `progress` → after the audio completes, one GET of `https://i.ytimg.com/vi/<id>/hqdefault.jpg` → `<dir>/cover.jpg` (non-fatal) → writes `meta.json` LAST → final `ok` response.
 6. On `started`: service tells mpv `loadfile appending://<abs path>` (plays the growing file; measured ~3.2 s to first audio vs 11.6–12.5 s today).
 7. On final `ok`: row → `state=complete`, `audio_path`, `thumb_path`, `file_size`; emit `track.upsert` + `download done`.
 8. Play context after a drop-play: queue = [dropped track] + the album's other tracks in album order.
@@ -125,7 +125,7 @@ While watching YouTube in Safari (or Chrome), the user drags the page URL onto a
 - Confirmations: "Remove 'X' from <Album>?" (song stays in library); "Delete 'X' from your library? The <size> file moves to the Trash." (destructive red button).
 - Downloading rows show a progress ring; failed rows show a retry affordance.
 - Lyrics: synced lines highlighted by the local position clock.
-- Artwork: `cover.<ext>` sidecar (webp decodes natively), decoded at display size, in-memory cache.
+- Artwork: `cover.<ext>` sidecar (`cover.jpg` for new downloads; legacy covers may be webp, which decodes natively), decoded at display size, in-memory cache.
 - Now Playing / media keys: `MPNowPlayingInfoCenter` (title, artist, duration, elapsed, rate, artwork, `playbackState`) updated only on `player` events; `MPRemoteCommandCenter` play/pause/toggle/next/prev/seek forward to the service.
 - Connection: on socket loss show "Reconnecting…" and retry with backoff 1 s → 30 s max; re-`subscribe` + `library.get` on reconnect.
 
