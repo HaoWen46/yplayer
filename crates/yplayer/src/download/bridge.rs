@@ -302,7 +302,7 @@ fn parse_track_from_value(v: &Value) -> Option<Track> {
 
 /// The command used to launch the worker. Overridable via YPLAY_WORKER_CMD
 /// (whitespace-separated) so tests can substitute a fake worker.
-fn worker_command(pinned_python: Option<&str>) -> Result<(String, Vec<String>)> {
+pub(crate) fn worker_command(pinned_python: Option<&str>) -> Result<(String, Vec<String>)> {
     if let Ok(custom) = std::env::var("YPLAY_WORKER_CMD") {
         let mut parts: Vec<String> = custom.split_whitespace().map(String::from).collect();
         if parts.is_empty() {
