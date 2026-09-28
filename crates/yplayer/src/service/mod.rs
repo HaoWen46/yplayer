@@ -50,6 +50,9 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     let (db, rebuilt) = open_db(&config)?;
     owner_only_files(&config);
     let listener = bind_socket(&socket_path).await?;
+    // An mpv left playing by a killed previous instance stops now, not at the
+    // next play.
+    crate::player::mpv::quit_orphan(&socket_path.with_extension("mpv.sock")).await;
     recover_interrupted(&config.cache_dir, &db)?;
 
     let spawner = ProcessSpawner {

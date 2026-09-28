@@ -432,9 +432,15 @@ impl<S: MpvSpawner> Core<S> {
         self.engine
             .play(context.clone(), order, &track_id, &r)
             .await?;
-        self.db.touch_last_played(&track_id)?;
-        if let ContextRef::Album(album_id) = context {
-            self.db.touch_album(album_id)?;
+        // Bookkeeping only: playback already started, so a failed write (e.g.
+        // a full disk) is logged instead of reported as a failed play.
+        if let Err(e) = self.db.touch_last_played(&track_id) {
+            eprintln!("could not record last played for {track_id}: {e}");
+        }
+        if let ContextRef::Album(album_id) = context
+            && let Err(e) = self.db.touch_album(album_id)
+        {
+            eprintln!("could not record album use for {album_id}: {e}");
         }
         Ok(json!({}))
     }
@@ -642,7 +648,9 @@ impl<S: MpvSpawner> Core<S> {
         self.engine
             .play(ContextRef::Album(album_id), order, track_id, &r)
             .await?;
-        self.db.touch_last_played(track_id)?;
+        if let Err(e) = self.db.touch_last_played(track_id) {
+            eprintln!("could not record last played for {track_id}: {e}");
+        }
         Ok(())
     }
 

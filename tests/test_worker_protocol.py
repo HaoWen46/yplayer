@@ -170,7 +170,7 @@ def _download(h, rid: int, url: str):
 
 def test_ready_line_has_protocol_2(harness):
     first = harness.stdout.wait_for(lambda m: True)
-    assert first == {"event": "ready", "ok": True, "protocol": 2}
+    assert first == {"event": "ready", "ok": True, "protocol": 2, "slots": 8}
 
 
 def test_download_streams_started_then_throttled_progress_then_ok(harness, monkeypatch):

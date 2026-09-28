@@ -27,6 +27,9 @@ from yt_dlp.utils import DownloadCancelled
 from .core import download_track, list_audio_formats, search_results
 from .playlist import extract_playlist_entries
 
+# Concurrent jobs; announced in the ready line so the host never sends more.
+SLOTS = 8
+
 # Serializes stdout writes from the reader thread and the pool threads.
 _out_lock = threading.Lock()
 
@@ -106,10 +109,10 @@ def main():
 
     # Announce readiness so the host can tell a live worker from one that failed
     # to import/start, and can begin sending requests.
-    _respond({"event": "ready", "ok": True, "protocol": 2})
+    _respond({"event": "ready", "ok": True, "protocol": 2, "slots": SLOTS})
 
     # Leaving the block on stdin EOF waits for running jobs; then exit 0.
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=SLOTS) as pool:
         for line in sys.stdin:
             line = line.strip()
             if not line:

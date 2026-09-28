@@ -252,7 +252,7 @@ impl MpvProcess {
 /// An mpv still serving `socket_path` was left behind by a killed service:
 /// ask it to quit and wait up to 1 s for it to close the connection. Then
 /// remove the socket file.
-async fn quit_orphan(socket_path: &Path) {
+pub async fn quit_orphan(socket_path: &Path) {
     if let Ok(mut stream) = UnixStream::connect(socket_path).await
         && stream
             .write_all(b"{\"command\":[\"quit\"]}\n")

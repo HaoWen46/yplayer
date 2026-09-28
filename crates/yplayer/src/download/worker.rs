@@ -20,7 +20,8 @@ const PROTOCOL: u64 = 2;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LINE: usize = 4 << 20;
 const BACKGROUND_SLOTS: usize = 3;
-const PRIORITY_SLOTS: usize = 1;
+/// Concurrent jobs assumed when the worker's handshake does not declare `slots`.
+const DEFAULT_SLOTS: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct WorkerOptions {
@@ -91,6 +92,7 @@ impl WorkerHandle {
             generation: 0,
             jobs: HashMap::new(),
             queue: VecDeque::new(),
+            slots: DEFAULT_SLOTS,
             idle_deadline: None,
             restart_pending: false,
             lines_tx,
@@ -172,6 +174,9 @@ struct Actor {
     generation: u64,
     jobs: HashMap<JobId, Job>,
     queue: VecDeque<Queued>,
+    /// Jobs the worker runs at once (its handshake's `slots`); never exceeded,
+    /// so every job sent starts at once and its deadline can start with it.
+    slots: usize,
     idle_deadline: Option<Instant>,
     restart_pending: bool,
     lines_tx: mpsc::UnboundedSender<ReaderEvent>,
@@ -206,18 +211,20 @@ impl Actor {
             .min()
     }
 
-    /// Send queued jobs while slots are free: at most `BACKGROUND_SLOTS`
-    /// background jobs, and play-requested jobs up to the total.
+    /// Send queued jobs while the worker has free slots: background jobs use at
+    /// most `BACKGROUND_SLOTS` (keeping one slot free when the worker has more
+    /// than one), play-requested jobs any free slot.
     async fn dispatch(&mut self) {
         loop {
-            if self.jobs.len() >= BACKGROUND_SLOTS + PRIORITY_SLOTS {
+            if self.jobs.len() >= self.slots {
                 return;
             }
+            let background_cap = BACKGROUND_SLOTS.min(self.slots.saturating_sub(1).max(1));
             let background = self.jobs.values().filter(|j| !j.priority).count();
             let Some(i) = self
                 .queue
                 .iter()
-                .position(|q| q.priority || background < BACKGROUND_SLOTS)
+                .position(|q| q.priority || background < background_cap)
             else {
                 return;
             };
@@ -287,7 +294,9 @@ impl Actor {
             id,
             Job {
                 tx,
-                deadline: None,
+                // The worker has a free slot, so its `running` line is due at
+                // once; a job that never starts still times out.
+                deadline: Some(Instant::now() + self.opts.inactivity_timeout),
                 priority,
             },
         );
@@ -340,7 +349,7 @@ impl Actor {
         let stdin = child.stdin.take().context("no stdin on worker")?;
         let stdout = child.stdout.take().context("no stdout on worker")?;
         let mut stdout = BufReader::new(stdout);
-        await_ready(&mut stdout, &self.opts.log_path).await?;
+        self.slots = await_ready(&mut stdout, &self.opts.log_path).await?;
 
         self.generation += 1;
         tokio::spawn(read_lines(self.generation, stdout, self.lines_tx.clone()));
@@ -510,7 +519,8 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
 
 /// Read the `ready` line, so a worker that failed to start (or speaks another
 /// protocol) is reported on the job that spawned it.
-async fn await_ready(stdout: &mut BufReader<ChildStdout>, log_path: &Path) -> Result<()> {
+/// Read the `ready` line; returns the worker's declared `slots` (concurrent jobs).
+async fn await_ready(stdout: &mut BufReader<ChildStdout>, log_path: &Path) -> Result<usize> {
     let mut line = Vec::new();
     let read = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_line_bounded(stdout, &mut line))
         .await
@@ -532,7 +542,9 @@ async fn await_ready(stdout: &mut BufReader<ChildStdout>, log_path: &Path) -> Re
     {
         anyhow::bail!("unexpected worker handshake: {}", text.trim());
     }
-    Ok(())
+    Ok(v.get("slots")
+        .and_then(Value::as_u64)
+        .map_or(DEFAULT_SLOTS, |n| (n as usize).max(1)))
 }
 
 /// Forward every JSON stdout line to the actor; non-JSON lines (stray prints)
@@ -702,8 +714,10 @@ def meta(vid):
 
 def download(req):
     n = req["id"]
-    send({"id": n, "event": "running"})
     kind, _, vid = req["url"].partition(":")
+    if kind == "mute":
+        return
+    send({"id": n, "event": "running"})
     d = os.path.join(req["cache_dir"], "T [" + vid[:8] + "]")
     path = os.path.join(d, "audio.webm")
     m = meta(vid)
@@ -739,7 +753,10 @@ def download(req):
 note("spawns", str(os.getpid()))
 sys.stderr.write("fake worker stderr pid=%d\n" % os.getpid())
 sys.stderr.flush()
-send({"event": "ready", "ok": True, "protocol": 2})
+ready = {"event": "ready", "ok": True, "protocol": 2}
+if pool:
+    ready["slots"] = int(sys.argv[1])
+send(ready)
 while True:
     line = sys.stdin.readline()
     if not line:
@@ -1023,6 +1040,26 @@ note("exits", str(os.getpid()))
                 "job {i}: {msgs:?}"
             );
         }
+        assert!(!worker.busy());
+    }
+
+    #[tokio::test]
+    async fn a_job_the_worker_never_starts_times_out() {
+        let _env = ENV_LOCK.lock().await;
+        let (tmp, worker) = setup_args(LONG, Duration::from_millis(300), "4");
+        let cache = tmp.path().join("cache");
+        let (_job, mut rx) = worker.download("mute:muteaaaaaa".into(), cache, true);
+        let msgs = until_terminal(&mut rx).await;
+        assert!(
+            matches!(
+                msgs.last(),
+                Some(WorkerMsg::Failed {
+                    cancelled: false,
+                    ..
+                })
+            ),
+            "{msgs:?}"
+        );
         assert!(!worker.busy());
     }
 
