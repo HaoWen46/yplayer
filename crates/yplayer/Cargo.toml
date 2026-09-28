@@ -2,7 +2,7 @@
 name = "yplayer"
 version = "0.2.0"
 edition = "2024"
-description = "Fast terminal YouTube audio player — Rust TUI with Ratatui"
+description = "yplayer background service and CLI: cached YouTube audio playback via mpv"
 
 [lib]
 path = "src/lib.rs"
