@@ -60,7 +60,12 @@ if [ ! -f "$DB" ]; then
 elif [ -e "$BAK" ]; then
     echo "==> backup already exists: $BAK (not overwritten)"
 else
-    cp -p "$DB" "$BAK"
+    # sqlite3 .backup also captures changes still in the -wal file; cp would not.
+    if command -v sqlite3 >/dev/null 2>&1; then
+        sqlite3 "$DB" ".backup '$BAK'"
+    else
+        cp -p "$DB" "$BAK"
+    fi
     echo "==> backed up $DB -> $BAK"
 fi
 
