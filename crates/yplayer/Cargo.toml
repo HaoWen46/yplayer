@@ -31,6 +31,7 @@ dirs = "6"
 anyhow = "1"
 which = "8"
 rand = "0.10"
+regex-lite = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
