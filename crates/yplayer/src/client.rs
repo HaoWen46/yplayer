@@ -308,11 +308,16 @@ pub async fn now(socket: &Path) -> Result<(), ClientError> {
     Ok(())
 }
 
-/// `yplay albums`: `name  (n songs)` per album.
+/// `yplay albums`: `name  (n songs)` per album (`1 song`).
 pub async fn albums(socket: &Path) -> Result<(), ClientError> {
     let mut conn = Conn::connect(socket).await?;
     for album in library(&mut conn).await?.albums {
-        println!("{}  ({} songs)", album.name, album.track_ids.len());
+        let n = album.track_ids.len();
+        println!(
+            "{}  ({n} song{})",
+            album.name,
+            if n == 1 { "" } else { "s" }
+        );
     }
     Ok(())
 }

@@ -64,8 +64,10 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     let http: Arc<dyn HttpGet> = Arc::new(CurlHttp {
         user_agent: USER_AGENT.to_string(),
     });
+    // YPLAY_NO_UPDATE disables the yt-dlp update check (tests, offline use).
     let updater = worker_command(config.worker_python.as_deref())
         .ok()
+        .filter(|_| std::env::var_os("YPLAY_NO_UPDATE").is_none())
         .map(|(python, _)| {
             Arc::new(Updater {
                 python,

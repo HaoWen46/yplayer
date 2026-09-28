@@ -121,6 +121,9 @@ fn serve_add_wait_cached_now_albums_and_sigterm() {
             ),
         )
         .env("YPLAY_MPV_EXTRA_ARGS", "--ao=null")
+        // Keep the service's state dir and update check off the user's machine.
+        .env("HOME", dir.path())
+        .env("YPLAY_NO_UPDATE", "1")
         .spawn()
         .unwrap();
     let mut server = Server {
