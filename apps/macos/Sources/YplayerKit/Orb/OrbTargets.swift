@@ -19,15 +19,12 @@ public struct OrbTargets: Equatable, Sendable {
             default: a.name.localizedStandardCompare(b.name) == .orderedAscending
             }
         }
-        let bubbles = sorted.prefix(max(maxBubbles, 0)).map {
+        let recent = sorted.first.flatMap { $0.lastUsedAt == nil ? nil : $0 }
+        let center: OrbTarget = recent.map { .album(id: $0.id, name: $0.name) } ?? .inbox
+        // The core already offers the center album, so the bubbles are the next ones.
+        let bubbles = sorted.filter { $0.id != recent?.id }.prefix(max(maxBubbles, 0)).map {
             OrbTarget.album(id: $0.id, name: $0.name)
         }
-        let center: OrbTarget =
-            if let recent = sorted.first, recent.lastUsedAt != nil {
-                .album(id: recent.id, name: recent.name)
-            } else {
-                .inbox
-            }
         return OrbTargets(bubbles: bubbles + [.newAlbum], center: center)
     }
 }

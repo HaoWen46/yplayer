@@ -76,9 +76,10 @@ private func album(_ id: Int64, _ name: String, lastUsedAt: Int64?) -> Album {
     ])
     #expect(
         targets.bubbles == [
-            .album(id: 4, name: "New"), .album(id: 2, name: "Old"), .album(id: 3, name: "alpha"),
-            .album(id: 1, name: "zeta"), .newAlbum,
+            .album(id: 2, name: "Old"), .album(id: 3, name: "alpha"), .album(id: 1, name: "zeta"),
+            .newAlbum,
         ])
+    // The center album is not repeated as a bubble.
     #expect(targets.center == .album(id: 4, name: "New"))
 }
 
@@ -86,12 +87,12 @@ private func album(_ id: Int64, _ name: String, lastUsedAt: Int64?) -> Album {
     let albums = (1...8).map { album(Int64($0), "A\($0)", lastUsedAt: Int64($0)) }
     #expect(
         OrbTargets.make(albums: albums).bubbles == [
-            .album(id: 8, name: "A8"), .album(id: 7, name: "A7"), .album(id: 6, name: "A6"),
-            .album(id: 5, name: "A5"), .album(id: 4, name: "A4"), .newAlbum,
+            .album(id: 7, name: "A7"), .album(id: 6, name: "A6"), .album(id: 5, name: "A5"),
+            .album(id: 4, name: "A4"), .album(id: 3, name: "A3"), .newAlbum,
         ])
     #expect(
         OrbTargets.make(albums: albums, maxBubbles: 2).bubbles == [
-            .album(id: 8, name: "A8"), .album(id: 7, name: "A7"), .newAlbum,
+            .album(id: 7, name: "A7"), .album(id: 6, name: "A6"), .newAlbum,
         ])
     #expect(OrbTargets.make(albums: albums).center == .album(id: 8, name: "A8"))
 }
