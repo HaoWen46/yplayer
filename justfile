@@ -12,14 +12,26 @@ check-rust:
     cargo test --workspace
 
 check-python:
-    ruff check yplayer/
-    pytest -q
+    .venv/bin/ruff check yplayer/
+    .venv/bin/python -m pytest -q
 
 # Auto-fix what can be fixed.
 fix:
     cargo fmt --all
     ruff check yplayer/ --fix
 
-# Real-worker end-to-end check (network); run before releases.
+# Build, install ~/.local/bin/yplay, and (re)start the com.yplayer.service LaunchAgent.
+install:
+    scripts/install.sh
+
+# Remove the LaunchAgent and ~/.local/bin/yplay (keeps cache, DB, config).
+uninstall:
+    scripts/uninstall.sh
+
+# Check the running service against the performance budget (STATE: idle | playing).
+perf STATE:
+    scripts/perf-budget.sh {{STATE}}
+
+# Ignored tests (real mpv, network, CLI end-to-end); run before releases.
 e2e:
     cargo test --workspace -- --ignored
