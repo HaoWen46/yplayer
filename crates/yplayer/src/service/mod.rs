@@ -1169,7 +1169,10 @@ while True:
             .await;
     }
 
+    // Moves a real folder into the user's Trash, so it only runs on request
+    // (`cargo test -- --ignored delete_to_trash`), never in the default suite.
     #[tokio::test]
+    #[ignore]
     async fn delete_to_trash_moves_folder_to_trash() {
         LocalSet::new()
             .run_until(async {
