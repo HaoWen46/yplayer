@@ -23,7 +23,10 @@ pub struct ReconcileReport {
     /// Existing tracks whose `thumb_path` was filled in (see `attach_covers`).
     pub updated: Vec<String>,
     pub skipped_dirs: Vec<PathBuf>,
-    pub deleted_partials: Vec<PathBuf>,
+    /// Partial download folders of failed or interrupted tracks, as
+    /// `(track id, folder)`. Reconcile only reports them: the service removes
+    /// them afterwards, checking what is downloading at that moment.
+    pub partial_dirs: Vec<(String, PathBuf)>,
 }
 
 /// Bring the DB in line with the cache dir: import entries no row references,
@@ -93,13 +96,7 @@ pub fn reconcile(
                     None => report.skipped_dirs.push(path),
                 }
             } else if let Some(id) = dir_id8(&path).and_then(|s| partials.get(s)) {
-                match safe_fs::remove_track_dir(cache_dir, &path, id, RemoveMode::Cleanup) {
-                    Ok(()) => report.deleted_partials.push(path),
-                    Err(e) => {
-                        eprintln!("reconcile: not removing {}: {e}", path.display());
-                        report.skipped_dirs.push(path);
-                    }
-                }
+                report.partial_dirs.push((id.to_string(), path));
             } else {
                 report.skipped_dirs.push(path);
             }
@@ -195,6 +192,27 @@ fn extract_embedded_cover(audio: &Path, dir: &Path) -> Option<PathBuf> {
         .ok()?;
     fs::rename(&tmp, &dest).ok()?;
     Some(dest)
+}
+
+/// Remove reported partial folders whose track is not downloading now (the
+/// in-flight set is taken when this runs, not when the scan started). Returns
+/// the removed folders.
+pub fn remove_partials(
+    cache_dir: &Path,
+    partial_dirs: &[(String, PathBuf)],
+    in_flight: &HashSet<String>,
+) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    for (id, path) in partial_dirs {
+        if in_flight.contains(id) {
+            continue;
+        }
+        match safe_fs::remove_track_dir(cache_dir, path, id, RemoveMode::Cleanup) {
+            Ok(()) => removed.push(path.clone()),
+            Err(e) => eprintln!("reconcile: not removing {}: {e}", path.display()),
+        }
+    }
+    removed
 }
 
 /// Rows left in state downloading by a previous run: delete their partial
@@ -573,7 +591,7 @@ mod tests {
         expected.sort();
         assert_eq!(report.skipped_dirs, expected);
         assert!(report.imported.is_empty());
-        assert!(report.deleted_partials.is_empty());
+        assert!(report.partial_dirs.is_empty());
         assert!(plain.join("notes.txt").exists());
         assert!(bracketed.exists());
     }
@@ -591,12 +609,25 @@ mod tests {
         let report = reconcile(dir.path(), &db, &in_flight).unwrap();
         assert!(partial.exists());
         assert_eq!(report.skipped_dirs, std::slice::from_ref(&partial));
-        assert!(report.deleted_partials.is_empty());
+        assert!(report.partial_dirs.is_empty());
 
+        // Reported, not removed: the service removes it after re-checking
+        // what is in flight (see `remove_partials`).
         let report = reconcile(dir.path(), &db, &none()).unwrap();
-        assert!(!partial.exists());
-        assert_eq!(report.deleted_partials, [partial]);
+        assert!(partial.exists());
+        assert_eq!(
+            report.partial_dirs,
+            [("abcdefghijk".to_string(), partial.clone())]
+        );
         assert!(report.skipped_dirs.is_empty());
+
+        // A download that started meanwhile keeps its folder.
+        let removed = remove_partials(dir.path(), &report.partial_dirs, &in_flight);
+        assert!(removed.is_empty());
+        assert!(partial.exists());
+        let removed = remove_partials(dir.path(), &report.partial_dirs, &none());
+        assert_eq!(removed, std::slice::from_ref(&partial));
+        assert!(!partial.exists());
         assert!(db.get_track("abcdefghijk").unwrap().is_some());
     }
 
@@ -613,7 +644,7 @@ mod tests {
 
         let report = reconcile(dir.path(), &db, &none()).unwrap();
         assert!(folder.join("meta.json").exists());
-        assert!(report.deleted_partials.is_empty());
+        assert!(report.partial_dirs.is_empty());
         assert!(report.imported.is_empty());
 
         db.upsert_track(&row("abcdefghijk", Some(&audio), TrackState::Downloading))
@@ -751,6 +782,10 @@ mod tests {
         fs::write(other.join("audio.webm"), b"x").unwrap();
 
         let report = reconcile(dir.path(), &db, &none());
+        let removed = report
+            .as_ref()
+            .ok()
+            .map(|r| remove_partials(dir.path(), &r.partial_dirs, &none()));
         let stuck_dl = dir.path().join("Stuck dl [stuckdlx]");
         fs::create_dir(&stuck_dl).unwrap();
         fs::write(stuck_dl.join("audio.webm"), b"x").unwrap();
@@ -767,7 +802,13 @@ mod tests {
 
         let report = report.unwrap();
         assert_eq!(report.imported, ["GJI4Gv7NbmE"]);
-        assert!(report.skipped_dirs.contains(&stuck));
+        assert!(
+            report
+                .partial_dirs
+                .contains(&("abcdefghijk".to_string(), stuck.clone()))
+        );
+        // Removing it fails (read-only folder); that is logged, not fatal.
+        assert!(removed.unwrap().is_empty());
         assert!(stuck.join("audio.webm").exists());
         assert_eq!(recovered.unwrap(), ["stuckdlxxxx"]);
         assert_eq!(

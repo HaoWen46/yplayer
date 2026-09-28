@@ -43,7 +43,12 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("creating {}", state_dir.display()))?;
     std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))?;
+    // A second instance must exit before it touches (or moves aside) the live DB.
+    if UnixStream::connect(&socket_path).await.is_ok() {
+        bail!("yplay serve is already running ({})", socket_path.display());
+    }
     let (db, rebuilt) = open_db(&config)?;
+    owner_only_files(&config);
     let listener = bind_socket(&socket_path).await?;
     recover_interrupted(&config.cache_dir, &db)?;
 
@@ -146,6 +151,25 @@ fn open_db(config: &Config) -> Result<(Db, bool)> {
             Ok((Db::open(&path, &config.cache_dir)?, true))
         }
         other => Ok((other?, false)),
+    }
+}
+
+/// Make the library DB (and its `-wal`/`-shm`) and the session file owner-only;
+/// files created before the umask existed keep their old mode otherwise.
+fn owner_only_files(config: &Config) {
+    let db = config.db_path();
+    let candidates = [
+        db.clone(),
+        PathBuf::from(format!("{}-wal", db.display())),
+        PathBuf::from(format!("{}-shm", db.display())),
+        config.state_path(),
+    ];
+    for path in candidates {
+        if path.exists()
+            && let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        {
+            eprintln!("could not make {} owner-only: {e}", path.display());
+        }
     }
 }
 

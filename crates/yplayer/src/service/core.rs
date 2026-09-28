@@ -12,7 +12,7 @@ use crate::config::{Config, SessionState};
 use crate::download::worker::{JobId, WorkerHandle, WorkerMsg};
 use crate::http::HttpGet;
 use crate::library::db::{Db, DbError, LyricsRow};
-use crate::library::reconcile::{ReconcileReport, reconcile};
+use crate::library::reconcile::{ReconcileReport, reconcile, remove_partials};
 use crate::library::safe_fs::{self, RemoveMode};
 use crate::lyrics::{self, LyricsOutcome};
 use crate::player::engine::{Engine, EngineError, TrackResolver};
@@ -892,7 +892,14 @@ impl<S: MpvSpawner> Core<S> {
     fn on_reconciled(&mut self, result: Result<ReconcileReport, String>) {
         self.reconciling = false;
         let report = match result {
-            Ok(report) => report,
+            Ok(report) => {
+                remove_partials(
+                    &self.config.cache_dir,
+                    &report.partial_dirs,
+                    &self.downloads.in_flight(),
+                );
+                report
+            }
             Err(e) => {
                 eprintln!("reconcile failed: {e}");
                 return;
