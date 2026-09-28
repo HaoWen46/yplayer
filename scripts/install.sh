@@ -67,10 +67,11 @@ elif [ -e "$BAK" ]; then
 else
     # sqlite3 .backup also captures changes still in the -wal file; cp would not.
     if command -v sqlite3 >/dev/null 2>&1; then
-        sqlite3 "$DB" ".backup '$BAK'"
+        (umask 077 && sqlite3 "$DB" ".backup '$BAK'")
     else
-        cp -p "$DB" "$BAK"
+        (umask 077 && cp "$DB" "$BAK")
     fi
+    chmod 600 "$BAK"*
     echo "==> backed up $DB -> $BAK"
 fi
 
