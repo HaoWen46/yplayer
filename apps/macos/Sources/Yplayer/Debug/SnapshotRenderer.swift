@@ -21,6 +21,17 @@ enum SnapshotRenderer {
             ("popover-disconnected", popover(DebugFixtures.disconnectedModel())),
             ("popover-confirm-delete", popover(DebugFixtures.confirmDeleteModel())),
             ("popover-empty", popover(DebugFixtures.emptyModel())),
+            ("card-playing", card(DebugFixtures.artworkModel(fixtureArtwork()))),
+            ("card-paused", card(DebugFixtures.pausedModel(fixtureArtwork()))),
+            ("card-nothing", card(DebugFixtures.emptyModel())),
+            (
+                "popover-lyrics",
+                lyricsPopover(DebugFixtures.artworkModel(fixtureArtwork()), DebugFixtures.lyrics)
+            ),
+            (
+                "lyrics-missing",
+                lyricsPopover(DebugFixtures.artworkModel(fixtureArtwork()), .missing)
+            ),
         ]
     }
 
@@ -60,5 +71,54 @@ enum SnapshotRenderer {
         screencapture.waitUntilExit()
         guard screencapture.terminationStatus == 0, FileManager.default.fileExists(atPath: path)
         else { throw Failure(description: "screencapture failed for \(url.lastPathComponent)") }
+    }
+}
+
+extension SnapshotRenderer {
+    /// A gradient JPEG in the temporary directory standing in for a track's `cover.jpg`.
+    fileprivate static func fixtureArtwork() -> String? {
+        let cover = ZStack {
+            LinearGradient(
+                colors: [.indigo, .purple, .pink, .orange], startPoint: .topLeading,
+                endPoint: .bottomTrailing)
+            Image(systemName: "moon.stars.fill")
+                .font(.system(size: 180))
+                .foregroundStyle(.white.opacity(0.85))
+        }
+        .frame(width: 480, height: 480)
+        guard let image = ImageRenderer(content: cover).cgImage,
+            let jpeg = NSBitmapImageRep(cgImage: image).representation(
+                using: .jpeg, properties: [:])
+        else { return nil }
+        let url = FileManager.default.temporaryDirectory.appending(
+            path: "yplayer-fixture-cover.jpg")
+        guard (try? jpeg.write(to: url)) != nil else { return nil }
+        return url.path(percentEncoded: false)
+    }
+
+    /// The now-playing card alone, at the top of a popover-sized window.
+    fileprivate static func card(_ model: AppModel) -> AnyView {
+        AnyView(
+            NowPlayingCard(model: model)
+                .padding(12)
+                .frame(width: size.width, height: size.height, alignment: .top)
+                .background(.windowBackground)
+                .environment(\.appearsActive, true)
+                .onAppear { restartClock(model.store) })
+    }
+
+    /// The popover with the lyrics view shown and `lyrics` in place of a fetch.
+    fileprivate static func lyricsPopover(_ model: AppModel, _ lyrics: LyricsResult) -> AnyView {
+        AnyView(
+            popover(model)
+                .environment(\.lyricsFixture, lyrics)
+                .onAppear { restartClock(model.store) })
+    }
+
+    /// Restarts a playing fixture's clock at 1:02 when its state is shown (models are built before
+    /// the first capture, so later captures would otherwise show a later position).
+    private static func restartClock(_ store: LibraryStore) {
+        guard store.player?.state == .playing else { return }
+        store.apply(.event(.player(DebugFixtures.player())))
     }
 }

@@ -103,6 +103,24 @@ enum DebugFixtures {
         return model(store)
     }
 
+    /// The fixture library playing track 1 with `artwork` as its cover.
+    static func artworkModel(_ artwork: String?) -> AppModel {
+        let store = store()
+        var track = tracks[0]
+        track.thumbPath = artwork
+        store.apply(.event(.trackUpsert(track)))
+        return model(store)
+    }
+
+    /// `artworkModel`, paused at 1:02.
+    static func pausedModel(_ artwork: String?) -> AppModel {
+        let model = artworkModel(artwork)
+        var paused = player()
+        paused.state = .paused
+        model.store.apply(.event(.player(paused)))
+        return model
+    }
+
     private static func track(
         _ n: Int, _ title: String, _ uploader: String, _ duration: Int, size: Int64?,
         state: TrackState = .complete
