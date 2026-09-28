@@ -301,6 +301,7 @@ impl<S: MpvSpawner> Engine<S> {
                         self.queue.advance_auto();
                         self.current_path = Some(path);
                         self.position = 0.0;
+                        self.duration = None;
                         self.at_ms = now_ms();
                         let _ = self.preload(r).await;
                         true
@@ -419,6 +420,7 @@ impl<S: MpvSpawner> Engine<S> {
         }
         self.state = PlayState::Playing;
         self.current_path = Some(path);
+        self.duration = None;
         self.preloaded = None;
         self.awaiting_load = true;
         self.position = start;
@@ -788,9 +790,13 @@ mod tests {
         // The current file's own path is not a transition.
         assert!(!e.on_mpv_event(g, prop("path", json!(p("a"))), &r).await);
         assert_eq!(track(&e).as_deref(), Some("a"));
+        e.on_mpv_event(g, prop("duration", json!(120.0)), &r).await;
+        assert_eq!(e.state().duration, Some(120.0));
 
         assert!(e.on_mpv_event(g, prop("path", json!(p("b"))), &r).await);
         assert_eq!(track(&e).as_deref(), Some("b"));
+        // The previous track's length must not linger until mpv reports b's.
+        assert_eq!(e.state().duration, None);
         assert_eq!(
             fake.commands(),
             vec![cmd(&[json!("playlist-clear")]), loadfile(&p("c"), "append")]

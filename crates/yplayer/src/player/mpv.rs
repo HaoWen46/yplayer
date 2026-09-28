@@ -146,6 +146,9 @@ impl MpvProcess {
             .arg("--demuxer-max-bytes=32MiB")
             .arg("--demuxer-max-back-bytes=8MiB")
             .arg("--prefetch-playlist=yes")
+            // coreaudio rejects the default planar float on macOS 27 and mpv falls
+            // back to avfoundation, which buffers ~4 s (early handoffs, cut endings).
+            .arg("--audio-format=float")
             .arg(format!("--volume={}", opts.volume));
         if let Some(ao) = &opts.ao {
             cmd.arg(format!("--ao={ao}"));
