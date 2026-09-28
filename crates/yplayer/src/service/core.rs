@@ -940,7 +940,6 @@ impl<S: MpvSpawner> Core<S> {
             self.library_version += 1;
         }
         self.flush_startup_toast();
-        crate::mem::release_free_memory();
     }
 
     /// Run the updater on a blocking thread when it is due and no download

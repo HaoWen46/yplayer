@@ -4,7 +4,6 @@ pub mod download;
 pub mod http;
 pub mod library;
 pub mod lyrics;
-pub mod mem;
 pub mod player;
 pub mod protocol;
 pub mod service;
