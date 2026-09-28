@@ -26,6 +26,15 @@ pub struct Track {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrackMeta {
+    pub id: String,
+    pub title: String,
+    pub uploader: Option<String>,
+    pub duration: Option<i64>,
+    pub webpage_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Album {
     pub id: i64,
     pub name: String,
