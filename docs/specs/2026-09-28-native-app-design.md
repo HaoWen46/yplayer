@@ -197,6 +197,7 @@ Each sub-project gets its own implementation plan and is completed and verified 
 - Playing: service 0.00 wakeups/s, 3.5 MB; mpv 2.9 % CPU, 46 MB.
 - New URL (`yplay add --wait`, worker cold start included): first audio 3.7 s, downloaded 4.9 s; cache hit: `cached — playing` in 0.009 s with no worker request.
 - Handoff: one mpv process across tracks; natural handoff 0.13 s before end of file (coreaudio buffer).
+- Idle shutdown: paused at 0:04 → mpv gone after 10 min → idle budget PASS (service 6.2 MB after activity) → `resume` respawned mpv and continued from 0:04.
 - Unavailable video: fails in 2.1 s with yt-dlp's message; no pip run. Undo mid-download: cancelled in 10 ms, partial folder removed. Delete: folder moved to Trash.
 - Lyrics: synced lines fetched in 3.8 s, cached reads instant; LRCLIB latency is erratic (see Lyrics).
 - Migration: 8 existing tracks preserved, DB backed up to `.yplayer.db.pre-service.bak`; a folder with `meta.json` but no audio was left untouched.
