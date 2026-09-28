@@ -203,6 +203,15 @@ Each sub-project gets its own implementation plan and is completed and verified 
 - Migration: 8 existing tracks preserved, DB backed up to `.yplayer.db.pre-service.bak`; a folder with `meta.json` but no audio was left untouched.
 - Known gaps: VBR mp3s from the old pipeline seek inaccurately (mpv estimates positions; a seek near the end can land at the end); a single player change emits 3–4 near-identical `player` events (clients should coalesce).
 
+## SP2 verification results (2026-09-29, installed app + service, real library)
+
+- App, popover closed, nothing playing: 0.00 % CPU, 0.00 idle wakeups/s, 14–16 MB before first open; ~41–43 MB after the popover has been used (was 54 MB before the popover was recreated per open; the rest is SwiftUI runtime + CJK font caches).
+- App, popover open and playing: 0.66 % CPU, 0.45 wakeups/s (scrubber ticks once per second).
+- Open/close cycles: footprint flat across 6 cycles (no leak).
+- User-confirmed: the play/pause media key toggles playback; Control Center's Now Playing shows the current song from the app; the popover opens from the menu bar, Space toggles, Esc closes; search `はむ` finds `Ham`.
+- Toolchain notes: Swift tests need `-plugin-path …/plugins/testing`; the SwiftUI macros plugin is Xcode-only, so views use `@ViewState` (`typealias ViewState = SwiftUI.State`); `ImageRenderer` cannot draw glass, so snapshots render in an offscreen window captured with `screencapture -l`.
+- Known gap: tracks from the old mp3 pipeline have their cover embedded in the mp3 (no `cover.jpg`), so they show placeholder art in the app and in Now Playing.
+
 ## Out of scope (v1)
 
 - Full library window; YouTube search/browse in the app; playlist import; browser extensions; bookmarklets; `yplay://` URL scheme and Shortcuts/share-sheet integration; Safari tab drags; lyrics editing; cross-platform; notarization/distribution beyond this machine; homebrew `yt-dlp` (it is outdated and broken — the app always uses its own venv copy).
