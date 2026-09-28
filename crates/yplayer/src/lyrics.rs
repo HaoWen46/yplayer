@@ -1,5 +1,6 @@
 use crate::http::HttpGet;
 use regex_lite::Regex;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 /// Parse LRC text into `(seconds, line)` pairs, sorted by time. Metadata tags
@@ -46,15 +47,19 @@ const TIMEOUT: Duration = Duration::from_secs(6);
 /// inside Japanese quote brackets; otherwise strip bracketed decorations and
 /// common tags (MV, Official Video, feat. ...).
 pub fn clean_track_title(title: &str) -> String {
-    let quoted = Regex::new(r"[『「【]([^』」】]+)[』」】]").expect("valid regex");
-    if let Some(c) = quoted.captures(title) {
+    static QUOTED: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"[『「【]([^』」】]+)[』」】]").expect("valid regex"));
+    static BRACKETS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"[\(\[（【][^\)\]）】]*[\)\]）】]").expect("valid regex"));
+    static TAGS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(?:MV|M/V|Music Video|Official.*|Lyric.*|feat\..*)\b")
+            .expect("valid regex")
+    });
+    if let Some(c) = QUOTED.captures(title) {
         return c[1].trim().to_string();
     }
-    let brackets = Regex::new(r"[\(\[（【][^\)\]）】]*[\)\]）】]").expect("valid regex");
-    let tags = Regex::new(r"(?i)\b(?:MV|M/V|Music Video|Official.*|Lyric.*|feat\..*)\b")
-        .expect("valid regex");
-    let t = brackets.replace_all(title, "");
-    let t = tags.replace_all(&t, "");
+    let t = BRACKETS.replace_all(title, "");
+    let t = TAGS.replace_all(&t, "");
     t.trim().to_string()
 }
 
