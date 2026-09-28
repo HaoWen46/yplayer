@@ -65,6 +65,12 @@ pub fn classify_mpv_line(line: &str) -> MpvLine {
     MpvLine::Other
 }
 
+impl Default for MpvPlayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MpvPlayer {
     pub fn new() -> Self {
         let socket_path = std::env::temp_dir().join(format!("yplayer_mpv_{}", std::process::id()));

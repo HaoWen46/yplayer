@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/yplayer-tui"]
+members = ["crates/yplayer"]
 resolver = "2"
 
 # Smaller, faster release binary. LTO + a single codegen unit shrink the

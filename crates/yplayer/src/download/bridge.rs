@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
 use crate::config::Config;
-use crate::types::Track;
+use crate::types::{Track, TrackState};
 
 #[derive(Debug, Serialize, Default)]
 struct WorkerCommand {
@@ -18,21 +18,7 @@ struct WorkerCommand {
     #[serde(skip_serializing_if = "Option::is_none")]
     limit: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cache_dir: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    format: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     api_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    native: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    embed_meta: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    track_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    artist_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    duration: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,8 +104,7 @@ impl Bridge {
         let log_path = cfg.cache_dir.join(".worker.log");
         let stderr = std::fs::OpenOptions::new()
             .create(true)
-            .write(true)
-            .truncate(true)
+            .append(true)
             .open(&log_path)
             .map(Stdio::from)
             .unwrap_or_else(|_| Stdio::null());
@@ -235,59 +220,6 @@ impl Bridge {
         }
     }
 
-    pub async fn download(
-        &mut self,
-        url: &str,
-        cfg: &Config,
-    ) -> Result<DownloadResult, WorkerFailure> {
-        let resp = self
-            .send(WorkerCommand {
-                cmd: "download".to_string(),
-                url: Some(url.to_string()),
-                cache_dir: Some(cfg.cache_dir.to_string_lossy().to_string()),
-                format: Some(cfg.format.clone()),
-                api_key: cfg.api_key.clone(),
-                native: Some(cfg.native),
-                embed_meta: Some(cfg.embed_meta),
-                ..Default::default()
-            })
-            .await?;
-
-        let path = resp
-            .path
-            .ok_or_else(|| WorkerFailure::App("no path in download response".to_string()))?;
-        let meta = resp.meta.unwrap_or(Value::Null);
-
-        let track = Track {
-            id: meta
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            title: meta
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown")
-                .to_string(),
-            uploader: meta
-                .get("uploader")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            duration: meta.get("duration").and_then(|v| v.as_i64()),
-            webpage_url: meta
-                .get("webpage_url")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            audio_path: Some(path.clone()),
-            format: Some(cfg.format.clone()),
-            file_size: None,
-            added_at: None,
-            last_played: None,
-        };
-
-        Ok(DownloadResult { path, track })
-    }
-
     pub async fn search(&mut self, query: &str, limit: usize, cfg: &Config) -> Result<Vec<Track>> {
         let resp = self
             .send(WorkerCommand {
@@ -341,30 +273,6 @@ impl Bridge {
             .collect();
         Ok(formats)
     }
-
-    /// Fetch synced lyrics (LRC text) for a track. Returns Ok(None) when the
-    /// worker found none (an application-level "not found", not a failure).
-    pub async fn lyrics(
-        &mut self,
-        track_name: &str,
-        artist_name: Option<&str>,
-        duration: Option<i64>,
-    ) -> Result<Option<String>, WorkerFailure> {
-        match self
-            .send(WorkerCommand {
-                cmd: "lyrics".to_string(),
-                track_name: Some(track_name.to_string()),
-                artist_name: artist_name.map(str::to_string),
-                duration,
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(resp) => Ok(resp.synced),
-            Err(WorkerFailure::App(_)) => Ok(None), // "no lyrics found"
-            Err(e) => Err(e),
-        }
-    }
 }
 
 fn parse_track_from_value(v: &Value) -> Option<Track> {
@@ -387,6 +295,8 @@ fn parse_track_from_value(v: &Value) -> Option<Track> {
         file_size: None,
         added_at: None,
         last_played: None,
+        state: TrackState::Complete,
+        thumb_path: None,
     })
 }
 

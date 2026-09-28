@@ -2,13 +2,13 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::path::Path;
 
-use crate::types::{Album, SortMode, Track};
+use crate::types::{Album, Track, TrackState};
 
-pub struct CacheIndex {
+pub struct Db {
     conn: Connection,
 }
 
-impl CacheIndex {
+impl Db {
     pub fn open(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path)
             .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
@@ -102,21 +102,11 @@ impl CacheIndex {
         Ok(())
     }
 
-    pub fn list_tracks_sorted(&self, sort: SortMode) -> Result<Vec<Track>> {
-        let order = match sort {
-            SortMode::Title => "title COLLATE NOCASE",
-            SortMode::RecentlyPlayed => "COALESCE(last_played, 0) DESC, title COLLATE NOCASE",
-            SortMode::RecentlyAdded => "COALESCE(added_at, 0) DESC, title COLLATE NOCASE",
-            SortMode::Uploader => "COALESCE(uploader, '') COLLATE NOCASE, title COLLATE NOCASE",
-        };
-
-        let sql = format!(
+    pub fn list_tracks(&self) -> Result<Vec<Track>> {
+        let mut stmt = self.conn.prepare(
             "SELECT id, title, uploader, duration, webpage_url, audio_path, format, file_size, added_at, last_played
-             FROM tracks ORDER BY {}",
-            order
-        );
-
-        let mut stmt = self.conn.prepare(&sql)?;
+             FROM tracks ORDER BY COALESCE(added_at, 0) DESC, title COLLATE NOCASE",
+        )?;
 
         let tracks = stmt
             .query_map([], |row| {
@@ -131,6 +121,8 @@ impl CacheIndex {
                     file_size: row.get(7)?,
                     added_at: row.get(8)?,
                     last_played: row.get(9)?,
+                    state: TrackState::Complete,
+                    thumb_path: None,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -179,6 +171,8 @@ impl CacheIndex {
                     file_size: row.get(7)?,
                     added_at: row.get(8)?,
                     last_played: row.get(9)?,
+                    state: TrackState::Complete,
+                    thumb_path: None,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -204,24 +198,32 @@ impl CacheIndex {
     // --- Albums ---
 
     pub fn list_albums(&self) -> Result<Vec<Album>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT a.id, a.name, a.description, a.created_at,
-                    (SELECT COUNT(*) FROM album_tracks WHERE album_id = a.id) as track_count
-             FROM albums a ORDER BY a.name COLLATE NOCASE",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, created_at FROM albums ORDER BY name COLLATE NOCASE")?;
+        let mut ids_stmt = self
+            .conn
+            .prepare("SELECT track_id FROM album_tracks WHERE album_id = ?1 ORDER BY position")?;
 
-        let albums = stmt
-            .query_map([], |row| {
-                Ok(Album {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    description: row.get(2)?,
-                    created_at: row.get(3)?,
-                    track_count: row.get::<_, i64>(4)? as usize,
-                })
-            })?
+        let rows: Vec<(i64, String, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .filter_map(|r| r.ok())
             .collect();
+
+        let mut albums = Vec::with_capacity(rows.len());
+        for (id, name, created_at) in rows {
+            let track_ids = ids_stmt
+                .query_map(params![id], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            albums.push(Album {
+                id,
+                name,
+                track_ids,
+                created_at,
+                last_used_at: None,
+            });
+        }
 
         Ok(albums)
     }
@@ -274,6 +276,8 @@ impl CacheIndex {
                     file_size: row.get(7)?,
                     added_at: row.get(8)?,
                     last_played: row.get(9)?,
+                    state: TrackState::Complete,
+                    thumb_path: None,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -366,12 +370,14 @@ mod tests {
             file_size: Some(1234),
             added_at: None,
             last_played: None,
+            state: TrackState::Complete,
+            thumb_path: None,
         }
     }
 
-    fn open_temp() -> (CacheIndex, tempfile::TempDir) {
+    fn open_temp() -> (Db, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let db = CacheIndex::open(&dir.path().join("test.db")).unwrap();
+        let db = Db::open(&dir.path().join("test.db")).unwrap();
         (db, dir)
     }
 
@@ -398,7 +404,7 @@ mod tests {
         db.delete_track("t1").unwrap();
         assert_eq!(db.get_album_tracks(album).unwrap().len(), 1);
         let albums = db.list_albums().unwrap();
-        assert_eq!(albums[0].track_count, 1);
+        assert_eq!(albums[0].track_ids.len(), 1);
     }
 
     #[test]
@@ -412,6 +418,6 @@ mod tests {
         db.bulk_insert_album("Mix", "", &rows).unwrap();
         let albums = db.list_albums().unwrap();
         assert_eq!(albums.len(), 1);
-        assert_eq!(albums[0].track_count, 1);
+        assert_eq!(albums[0].track_ids.len(), 1);
     }
 }

@@ -1,17 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::types::SortMode;
+use crate::types::LoopMode;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
     pub api_key: Option<String>,
-    pub format: String,
-    pub native: bool,
-    pub embed_meta: bool,
-    pub audio_quality: Option<String>,
-    pub player: Option<String>,
     pub volume: Option<f64>,
     /// Pinned worker Python (e.g. a venv), overriding the .venv auto-discovery.
     pub worker_python: Option<String>,
@@ -31,11 +26,6 @@ impl Config {
         Self {
             cache_dir,
             api_key,
-            format: "mp3".to_string(),
-            native: false,
-            embed_meta: true,
-            audio_quality: None,
-            player: None,
             volume: None,
             worker_python: None,
         }
@@ -49,6 +39,12 @@ impl Config {
     pub fn state_path(&self) -> PathBuf {
         self.cache_dir.join(".yplayer_state.json")
     }
+
+    pub fn state_dir() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("yplayer")
+    }
 }
 
 /// User configuration loaded from `~/.config/yplayer/config.toml`. Every field
@@ -56,7 +52,6 @@ impl Config {
 #[derive(Debug, Default, Deserialize)]
 pub struct FileConfig {
     pub cache_dir: Option<String>,
-    pub format: Option<String>,
     pub volume: Option<f64>,
     pub api_key: Option<String>,
     pub worker_python: Option<String>,
@@ -86,9 +81,13 @@ pub struct SessionState {
     #[serde(default)]
     pub volume: Option<f64>,
     #[serde(default)]
-    pub sort_mode: Option<SortMode>,
+    pub loop_mode: Option<LoopMode>,
     #[serde(default)]
     pub last_track_id: Option<String>,
+    #[serde(default)]
+    pub last_position: Option<f64>,
+    #[serde(default)]
+    pub last_context: Option<serde_json::Value>,
 }
 
 impl SessionState {
@@ -116,15 +115,40 @@ mod tests {
         let path = dir.path().join("state.json");
         let state = SessionState {
             volume: Some(65.0),
-            sort_mode: Some(SortMode::RecentlyPlayed),
+            loop_mode: Some(LoopMode::All),
             last_track_id: Some("abc123".to_string()),
+            last_position: Some(42.5),
+            last_context: Some(serde_json::json!({"album_id": 3})),
         };
         state.save(&path);
 
         let loaded = SessionState::load(&path);
         assert_eq!(loaded.volume, Some(65.0));
-        assert_eq!(loaded.sort_mode, Some(SortMode::RecentlyPlayed));
+        assert_eq!(loaded.loop_mode, Some(LoopMode::All));
         assert_eq!(loaded.last_track_id.as_deref(), Some("abc123"));
+        assert_eq!(loaded.last_position, Some(42.5));
+        assert_eq!(
+            loaded.last_context,
+            Some(serde_json::json!({"album_id": 3}))
+        );
+    }
+
+    #[test]
+    fn old_session_file_with_sort_mode_still_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"volume": 65.0, "sort_mode": "RecentlyPlayed", "last_track_id": "abc123"}"#,
+        )
+        .unwrap();
+
+        let loaded = SessionState::load(&path);
+        assert_eq!(loaded.volume, Some(65.0));
+        assert_eq!(loaded.last_track_id.as_deref(), Some("abc123"));
+        assert!(loaded.loop_mode.is_none());
+        assert!(loaded.last_position.is_none());
+        assert!(loaded.last_context.is_none());
     }
 
     #[test]
@@ -138,7 +162,6 @@ mod tests {
     fn file_config_parses_partial_toml() {
         let cfg: FileConfig = toml::from_str("volume = 0.5\nformat = \"opus\"\n").unwrap();
         assert_eq!(cfg.volume, Some(0.5));
-        assert_eq!(cfg.format.as_deref(), Some("opus"));
         assert!(cfg.cache_dir.is_none());
     }
 }
