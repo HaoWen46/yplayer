@@ -134,4 +134,25 @@ enum DebugFixtures {
             addedAt: 1_790_600_000 - Int64(n) * 3_600, lastPlayed: nil, state: state,
             thumbPath: nil)
     }
+
+    /// Songs: the downloading and failed tracks re-added as the newest, so they lead the list.
+    static func songsModel() -> AppModel {
+        let store = store()
+        for var track in tracks where track.state != .complete {
+            track.addedAt = 1_790_700_000
+            store.apply(.event(.trackUpsert(track)))
+        }
+        return model(store)
+    }
+
+    /// A katakana "ハム" title for the search state (query "はむ" folds to it).
+    static let kanaTrack = track(
+        9, "とっとこハム太郎 OP『ハム太郎とっとこうた』", "ハムちゃんず", 203, size: 3_874_210)
+
+    /// The fixture library plus `kanaTrack`.
+    static func searchModel() -> AppModel {
+        let store = store()
+        store.apply(.event(.trackUpsert(kanaTrack)))
+        return model(store)
+    }
 }

@@ -32,6 +32,25 @@ enum SnapshotRenderer {
                 "lyrics-missing",
                 lyricsPopover(DebugFixtures.artworkModel(fixtureArtwork()), .missing)
             ),
+            (
+                "popover-albums",
+                popover(
+                    DebugFixtures.model(DebugFixtures.store()), route: LibraryRoute(tab: .albums))
+            ),
+            (
+                "popover-album-detail",
+                popover(
+                    DebugFixtures.model(DebugFixtures.store()),
+                    route: LibraryRoute(tab: .albums, albumID: 2))
+            ),
+            (
+                "popover-songs",
+                popover(DebugFixtures.songsModel(), route: LibraryRoute(tab: .songs))
+            ),
+            (
+                "popover-search",
+                popover(DebugFixtures.searchModel(), route: LibraryRoute(tab: .search, query: "はむ"))
+            ),
         ]
     }
 
@@ -50,6 +69,11 @@ enum SnapshotRenderer {
             PopoverView(model: model)
                 .background(.windowBackground)
                 .environment(\.appearsActive, true))
+    }
+
+    /// The popover with the library at `route`.
+    private static func popover(_ model: AppModel, route: LibraryRoute) -> AnyView {
+        AnyView(popover(model).environment(\.initialLibraryRoute, route))
     }
 
     private static func capture(_ view: AnyView, to url: URL) async throws {
