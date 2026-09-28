@@ -35,3 +35,11 @@ perf STATE:
 # Ignored tests (real mpv, network, CLI end-to-end); run before releases.
 e2e:
     cargo test --workspace -- --ignored
+
+# Menu-bar app Swift tests.
+swift-test:
+    scripts/swift-test.sh
+
+# Build and ad-hoc sign build/Yplayer.app.
+app:
+    scripts/build-app.sh

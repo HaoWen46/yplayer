@@ -20,3 +20,7 @@ target/
 
 # Claude Code project settings
 .claude/
+
+# Swift build output and app bundle
+apps/macos/.build/
+build/
