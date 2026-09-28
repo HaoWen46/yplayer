@@ -28,6 +28,24 @@ pub struct Queue {
     rng: StdRng,
 }
 
+/// The copy gets its own random stream (`StdRng` is not `Clone`).
+impl Clone for Queue {
+    fn clone(&self) -> Queue {
+        Queue {
+            context: self.context.clone(),
+            base: self.base.clone(),
+            order: self.order.clone(),
+            next_cycle: self.next_cycle.clone(),
+            current: self.current.clone(),
+            cur_idx: self.cur_idx,
+            next_idx: self.next_idx,
+            up_next: self.up_next.clone(),
+            loop_mode: self.loop_mode,
+            rng: rand::make_rng(),
+        }
+    }
+}
+
 impl Default for Queue {
     fn default() -> Self {
         Self::new()
