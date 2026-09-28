@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -18,6 +18,9 @@ pub type JobId = u64;
 
 const PROTOCOL: u64 = 2;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_LINE: usize = 4 << 20;
+const BACKGROUND_SLOTS: usize = 3;
+const PRIORITY_SLOTS: usize = 1;
 
 #[derive(Debug, Clone)]
 pub struct WorkerOptions {
@@ -53,6 +56,7 @@ pub enum WorkerMsg {
         error: String,
         cancelled: bool,
         transport: bool,
+        dir: Option<String>,
     },
 }
 
@@ -67,12 +71,7 @@ pub struct WorkerHandle {
 }
 
 enum Cmd {
-    Download {
-        id: JobId,
-        url: String,
-        cache_dir: PathBuf,
-        tx: mpsc::UnboundedSender<WorkerMsg>,
-    },
+    Download(Queued),
     Cancel(JobId),
     RestartWhenIdle,
 }
@@ -91,6 +90,7 @@ impl WorkerHandle {
             proc: None,
             generation: 0,
             jobs: HashMap::new(),
+            queue: VecDeque::new(),
             idle_deadline: None,
             restart_pending: false,
             lines_tx,
@@ -107,16 +107,18 @@ impl WorkerHandle {
         &self,
         url: String,
         cache_dir: PathBuf,
+        priority: bool,
     ) -> (JobId, mpsc::UnboundedReceiver<WorkerMsg>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         self.in_flight.fetch_add(1, Ordering::SeqCst);
-        let cmd = Cmd::Download {
+        let cmd = Cmd::Download(Queued {
             id,
             url,
             cache_dir,
             tx,
-        };
+            priority,
+        });
         if self.cmds.send(cmd).is_err() {
             // Actor gone: the dropped sender closes `rx` without a message.
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -145,7 +147,16 @@ struct Proc {
 
 struct Job {
     tx: mpsc::UnboundedSender<WorkerMsg>,
-    deadline: Instant,
+    deadline: Option<Instant>,
+    priority: bool,
+}
+
+struct Queued {
+    id: JobId,
+    url: String,
+    cache_dir: PathBuf,
+    tx: mpsc::UnboundedSender<WorkerMsg>,
+    priority: bool,
 }
 
 enum ReaderEvent {
@@ -160,6 +171,7 @@ struct Actor {
     proc: Option<Proc>,
     generation: u64,
     jobs: HashMap<JobId, Job>,
+    queue: VecDeque<Queued>,
     idle_deadline: Option<Instant>,
     restart_pending: bool,
     lines_tx: mpsc::UnboundedSender<ReaderEvent>,
@@ -181,6 +193,7 @@ impl Actor {
                 Some(ev) = lines.recv() => self.on_reader(ev),
                 _ = sleep_until_opt(deadline) => self.on_deadline().await,
             }
+            self.dispatch().await;
         }
         self.close();
     }
@@ -188,26 +201,57 @@ impl Actor {
     fn next_deadline(&self) -> Option<Instant> {
         self.jobs
             .values()
-            .map(|j| j.deadline)
+            .filter_map(|j| j.deadline)
             .chain(self.idle_deadline)
             .min()
     }
 
+    /// Send queued jobs while slots are free: at most `BACKGROUND_SLOTS`
+    /// background jobs, and play-requested jobs up to the total.
+    async fn dispatch(&mut self) {
+        loop {
+            if self.jobs.len() >= BACKGROUND_SLOTS + PRIORITY_SLOTS {
+                return;
+            }
+            let background = self.jobs.values().filter(|j| !j.priority).count();
+            let Some(i) = self
+                .queue
+                .iter()
+                .position(|q| q.priority || background < BACKGROUND_SLOTS)
+            else {
+                return;
+            };
+            let Some(job) = self.queue.remove(i) else {
+                return;
+            };
+            self.start_job(job).await;
+        }
+    }
+
     async fn on_cmd(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::Download {
-                id,
-                url,
-                cache_dir,
-                tx,
-            } => self.start_job(id, url, cache_dir, tx).await,
+            Cmd::Download(job) => {
+                self.idle_deadline = None;
+                self.queue.push_back(job);
+            }
             Cmd::Cancel(job) => {
                 if self.jobs.contains_key(&job) {
                     self.send_cancel(job).await;
+                } else if let Some(i) = self.queue.iter().position(|q| q.id == job)
+                    && let Some(q) = self.queue.remove(i)
+                {
+                    self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    let _ = q.tx.send(WorkerMsg::Failed {
+                        error: "cancelled".to_string(),
+                        cancelled: true,
+                        transport: false,
+                        dir: None,
+                    });
+                    self.after_job_end();
                 }
             }
             Cmd::RestartWhenIdle => {
-                if self.jobs.is_empty() {
+                if self.jobs.is_empty() && self.queue.is_empty() {
                     self.close();
                 } else {
                     self.restart_pending = true;
@@ -218,10 +262,13 @@ impl Actor {
 
     async fn start_job(
         &mut self,
-        id: JobId,
-        url: String,
-        cache_dir: PathBuf,
-        tx: mpsc::UnboundedSender<WorkerMsg>,
+        Queued {
+            id,
+            url,
+            cache_dir,
+            tx,
+            priority,
+        }: Queued,
     ) {
         self.idle_deadline = None;
         if self.proc.is_none()
@@ -232,11 +279,18 @@ impl Actor {
                 error: format!("{e:#}"),
                 cancelled: false,
                 transport: true,
+                dir: None,
             });
             return;
         }
-        let deadline = Instant::now() + self.opts.inactivity_timeout;
-        self.jobs.insert(id, Job { tx, deadline });
+        self.jobs.insert(
+            id,
+            Job {
+                tx,
+                deadline: None,
+                priority,
+            },
+        );
         let req = json!({
             "id": id,
             "cmd": "download",
@@ -263,7 +317,16 @@ impl Actor {
             .open(&self.opts.log_path)
             .map(Stdio::from)
             .unwrap_or_else(|_| Stdio::null());
-        let mut child = Command::new(&program)
+        let mut cmd = Command::new(&program);
+        if let Some(dir) = self
+            .opts
+            .log_path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+        {
+            cmd.current_dir(dir);
+        }
+        let mut child = cmd
             .args(&args)
             // launchd gives no terminal locale; titles cross stdout as UTF-8.
             .env("PYTHONIOENCODING", "utf-8")
@@ -331,7 +394,7 @@ impl Actor {
         let Some(job) = self.jobs.get_mut(&id) else {
             return;
         };
-        job.deadline = Instant::now() + self.opts.inactivity_timeout;
+        job.deadline = Some(Instant::now() + self.opts.inactivity_timeout);
         if let Some(event) = v.get("event") {
             let msg = match event.as_str() {
                 Some("started") => parse_started(&v),
@@ -347,12 +410,14 @@ impl Actor {
                     error: format!("malformed worker reply: {v}"),
                     cancelled: false,
                     transport: false,
+                    dir: None,
                 })
             } else {
                 WorkerMsg::Failed {
                     error: str_field(&v, "error").unwrap_or_else(|| "unknown worker error".into()),
                     cancelled: v.get("cancelled").and_then(Value::as_bool).unwrap_or(false),
                     transport: false,
+                    dir: str_field(&v, "dir"),
                 }
             };
             self.finish(id, msg);
@@ -364,7 +429,7 @@ impl Actor {
         let stalled: Vec<JobId> = self
             .jobs
             .iter()
-            .filter(|(_, j)| j.deadline <= now)
+            .filter(|(_, j)| j.deadline.is_some_and(|d| d <= now))
             .map(|(id, _)| *id)
             .collect();
         for id in stalled {
@@ -379,6 +444,7 @@ impl Actor {
                     error,
                     cancelled: false,
                     transport: false,
+                    dir: None,
                 },
             );
         }
@@ -402,13 +468,14 @@ impl Actor {
                 error: error.to_string(),
                 cancelled: false,
                 transport: true,
+                dir: None,
             });
         }
         self.after_job_end();
     }
 
     fn after_job_end(&mut self) {
-        if !self.jobs.is_empty() {
+        if !self.jobs.is_empty() || !self.queue.is_empty() {
             return;
         }
         if self.restart_pending {
@@ -445,15 +512,17 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
 /// protocol) is reported on the job that spawned it.
 async fn await_ready(stdout: &mut BufReader<ChildStdout>, log_path: &Path) -> Result<()> {
     let mut line = Vec::new();
-    let n = tokio::time::timeout(HANDSHAKE_TIMEOUT, stdout.read_until(b'\n', &mut line))
+    let read = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_line_bounded(stdout, &mut line))
         .await
         .context("worker did not send its readiness handshake in time")?
         .context("failed reading worker handshake")?;
-    if n == 0 {
-        anyhow::bail!(
+    match read {
+        LineRead::Eof => anyhow::bail!(
             "worker exited before handshake (see {})",
             log_path.display()
-        );
+        ),
+        LineRead::TooLong => anyhow::bail!("worker handshake line longer than {MAX_LINE} bytes"),
+        LineRead::Line => {}
     }
     let text = String::from_utf8_lossy(&line);
     let v: Value = serde_json::from_str(text.trim())
@@ -475,10 +544,12 @@ async fn read_lines(
 ) {
     let mut line = Vec::new();
     loop {
-        line.clear();
-        match stdout.read_until(b'\n', &mut line).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {
+        match read_line_bounded(&mut stdout, &mut line).await {
+            Ok(LineRead::Eof) | Err(_) => break,
+            Ok(LineRead::TooLong) => {
+                eprintln!("worker: discarded a stdout line longer than {MAX_LINE} bytes");
+            }
+            Ok(LineRead::Line) => {
                 if let Ok(v) = serde_json::from_slice::<Value>(&line)
                     && tx.send(ReaderEvent::Line(v)).is_err()
                 {
@@ -488,6 +559,57 @@ async fn read_lines(
         }
     }
     let _ = tx.send(ReaderEvent::Eof(generation));
+}
+
+enum LineRead {
+    Line,
+    TooLong,
+    Eof,
+}
+
+/// Read one line into `line`; a line over `MAX_LINE` bytes is skipped to its
+/// end without being buffered and reported as `TooLong`.
+async fn read_line_bounded<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> std::io::Result<LineRead> {
+    line.clear();
+    let mut too_long = false;
+    loop {
+        let (n, done) = {
+            let buf = reader.fill_buf().await?;
+            if buf.is_empty() {
+                return Ok(if too_long {
+                    LineRead::TooLong
+                } else if line.is_empty() {
+                    LineRead::Eof
+                } else {
+                    LineRead::Line
+                });
+            }
+            let (n, done) = match buf.iter().position(|&b| b == b'\n') {
+                Some(i) => (i + 1, true),
+                None => (buf.len(), false),
+            };
+            if !too_long {
+                if line.len() + n > MAX_LINE {
+                    too_long = true;
+                    line.clear();
+                } else {
+                    line.extend_from_slice(&buf[..n]);
+                }
+            }
+            (n, done)
+        };
+        reader.consume(n);
+        if done {
+            return Ok(if too_long {
+                LineRead::TooLong
+            } else {
+                LineRead::Line
+            });
+        }
+    }
 }
 
 fn str_field(v: &Value, key: &str) -> Option<String> {
@@ -554,10 +676,12 @@ mod tests {
     // to the script so tests can observe the process from outside.
     const FAKE_WORKER: &str = r#"
 import json, os, sys, threading, time
+from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 lock = threading.Lock()
 cancels = {}
+pool = ThreadPoolExecutor(int(sys.argv[1])) if len(sys.argv) > 1 else None
 
 
 def note(name, text):
@@ -578,6 +702,7 @@ def meta(vid):
 
 def download(req):
     n = req["id"]
+    send({"id": n, "event": "running"})
     kind, _, vid = req["url"].partition(":")
     d = os.path.join(req["cache_dir"], "T [" + vid[:8] + "]")
     path = os.path.join(d, "audio.webm")
@@ -599,8 +724,12 @@ def download(req):
         os._exit(3)
     if kind == "wait":
         cancels[n].wait()
-        send({"id": n, "ok": False, "error": "cancelled", "cancelled": True})
+        send({"id": n, "ok": False, "error": "cancelled", "cancelled": True, "dir": d})
         return
+    if kind == "tick":
+        for k in range(3):
+            time.sleep(0.1)
+            send({"id": n, "event": "progress", "bytes": k, "total": None})
     send({"id": n, "event": "progress", "bytes": 100, "total": 200})
     send({"id": n, "event": "progress", "bytes": 200, "total": None})
     send({"id": n, "ok": True, "path": path, "dir": d, "meta": m,
@@ -623,7 +752,10 @@ while True:
         send({"id": req["id"], "ok": True})
     elif req["cmd"] == "download":
         cancels[req["id"]] = threading.Event()
-        threading.Thread(target=download, args=(req,), daemon=True).start()
+        if pool:
+            pool.submit(download, req)
+        else:
+            threading.Thread(target=download, args=(req,), daemon=True).start()
 note("exits", str(os.getpid()))
 "#;
 
@@ -631,10 +763,18 @@ note("exits", str(os.getpid()))
     const WAIT: Duration = Duration::from_secs(5);
 
     fn setup(idle: Duration, inactivity: Duration) -> (tempfile::TempDir, WorkerHandle) {
+        setup_args(idle, inactivity, "")
+    }
+
+    fn setup_args(
+        idle: Duration,
+        inactivity: Duration,
+        args: &str,
+    ) -> (tempfile::TempDir, WorkerHandle) {
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("fake_worker.py");
         std::fs::write(&script, FAKE_WORKER).unwrap();
-        let cmd = format!("/usr/bin/python3 {}", script.display());
+        let cmd = format!("/usr/bin/python3 {} {args}", script.display());
         // SAFETY: every test that touches the environment holds ENV_LOCK.
         unsafe { std::env::set_var("YPLAY_WORKER_CMD", cmd) };
         let worker = WorkerHandle::spawn(WorkerOptions {
@@ -700,7 +840,7 @@ note("exits", str(os.getpid()))
         let cache = tmp.path().join("cache");
         assert!(!worker.busy());
 
-        let (_job, mut rx) = worker.download("stream:aaaaaaaaaaa".into(), cache.clone());
+        let (_job, mut rx) = worker.download("stream:aaaaaaaaaaa".into(), cache.clone(), false);
         assert!(worker.busy());
         let dir = cache.join("T [aaaaaaaa]").display().to_string();
         let path = format!("{dir}/audio.webm");
@@ -746,8 +886,8 @@ note("exits", str(os.getpid()))
         let (tmp, worker) = setup(LONG, LONG);
         let cache = tmp.path().join("cache");
 
-        let (a, mut rx_a) = worker.download("slow:aaaaaaaaaaa".into(), cache.clone());
-        let (b, mut rx_b) = worker.download("stream:bbbbbbbbbbb".into(), cache.clone());
+        let (a, mut rx_a) = worker.download("slow:aaaaaaaaaaa".into(), cache.clone(), false);
+        let (b, mut rx_b) = worker.download("stream:bbbbbbbbbbb".into(), cache.clone(), false);
         assert_ne!(a, b);
 
         // b completes while a is still sleeping inside the fake.
@@ -770,7 +910,8 @@ note("exits", str(os.getpid()))
         let _env = ENV_LOCK.lock().await;
         let (tmp, worker) = setup(LONG, LONG);
 
-        let (job, mut rx) = worker.download("wait:ccccccccccc".into(), tmp.path().join("cache"));
+        let (job, mut rx) =
+            worker.download("wait:ccccccccccc".into(), tmp.path().join("cache"), false);
         assert!(matches!(recv(&mut rx).await, WorkerMsg::Started { .. }));
         worker.cancel(job);
         assert_eq!(
@@ -779,6 +920,7 @@ note("exits", str(os.getpid()))
                 error: "cancelled".to_string(),
                 cancelled: true,
                 transport: false,
+                dir: Some(tmp.path().join("cache/T [cccccccc]").display().to_string()),
             }
         );
         assert!(!worker.busy());
@@ -794,7 +936,7 @@ note("exits", str(os.getpid()))
         let (tmp, worker) = setup(LONG, LONG);
         let cache = tmp.path().join("cache");
 
-        let (_job, mut rx) = worker.download("crash:ddddddddddd".into(), cache.clone());
+        let (_job, mut rx) = worker.download("crash:ddddddddddd".into(), cache.clone(), false);
         assert!(matches!(recv(&mut rx).await, WorkerMsg::Started { .. }));
         let msg = recv(&mut rx).await;
         assert!(
@@ -810,7 +952,7 @@ note("exits", str(os.getpid()))
         );
         assert!(!worker.busy());
 
-        let (_job, mut rx) = worker.download("stream:eeeeeeeeeee".into(), cache);
+        let (_job, mut rx) = worker.download("stream:eeeeeeeeeee".into(), cache, false);
         let msgs = until_terminal(&mut rx).await;
         assert!(
             matches!(msgs.last(), Some(WorkerMsg::Done { meta: m, .. }) if *m == meta("eeeeeeeeeee"))
@@ -826,7 +968,8 @@ note("exits", str(os.getpid()))
         let (tmp, worker) = setup(Duration::from_millis(200), LONG);
         let exits = tmp.path().join("exits");
 
-        let (_job, mut rx) = worker.download("stream:fffffffffff".into(), tmp.path().join("cache"));
+        let (_job, mut rx) =
+            worker.download("stream:fffffffffff".into(), tmp.path().join("cache"), false);
         until_terminal(&mut rx).await;
         assert!(read_lines(&exits).is_empty());
 
@@ -840,7 +983,8 @@ note("exits", str(os.getpid()))
         let (tmp, worker) = setup(LONG, Duration::from_millis(300));
 
         let t0 = tokio::time::Instant::now();
-        let (job, mut rx) = worker.download("silent:ggggggggggg".into(), tmp.path().join("cache"));
+        let (job, mut rx) =
+            worker.download("silent:ggggggggggg".into(), tmp.path().join("cache"), false);
         let msg = recv(&mut rx).await;
         assert!(
             matches!(
@@ -862,6 +1006,62 @@ note("exits", str(os.getpid()))
     }
 
     #[tokio::test]
+    async fn queued_jobs_do_not_stall_before_running() {
+        let _env = ENV_LOCK.lock().await;
+        let (tmp, worker) = setup_args(LONG, Duration::from_millis(300), "1");
+        let cache = tmp.path().join("cache");
+
+        let mut rxs = Vec::new();
+        for i in 0..8 {
+            let (_job, rx) = worker.download(format!("tick:job{i:0>8}"), cache.clone(), false);
+            rxs.push(rx);
+        }
+        for (i, rx) in rxs.iter_mut().enumerate() {
+            let msgs = until_terminal(rx).await;
+            assert!(
+                matches!(msgs.last(), Some(WorkerMsg::Done { .. })),
+                "job {i}: {msgs:?}"
+            );
+        }
+        assert!(!worker.busy());
+    }
+
+    #[tokio::test]
+    async fn priority_job_starts_while_three_background_jobs_run() {
+        let _env = ENV_LOCK.lock().await;
+        let (tmp, worker) = setup(LONG, LONG);
+        let cache = tmp.path().join("cache");
+
+        let mut waits = Vec::new();
+        for i in 0..3 {
+            let (job, mut rx) = worker.download(format!("wait:bg{i:0>9}"), cache.clone(), false);
+            assert!(matches!(recv(&mut rx).await, WorkerMsg::Started { .. }));
+            waits.push((job, rx));
+        }
+        let (_job, mut queued) = worker.download("stream:qqqqqqqqqqq".into(), cache.clone(), false);
+        let (_job, mut prio) = worker.download("stream:ppppppppppp".into(), cache.clone(), true);
+        let msgs = until_terminal(&mut prio).await;
+        assert!(
+            matches!(msgs.last(), Some(WorkerMsg::Done { meta: m, .. }) if *m == meta("ppppppppppp"))
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(queued.try_recv().is_err());
+
+        let (job, rx) = &mut waits[0];
+        worker.cancel(*job);
+        until_terminal(rx).await;
+        let msgs = until_terminal(&mut queued).await;
+        assert!(
+            matches!(msgs.last(), Some(WorkerMsg::Done { meta: m, .. }) if *m == meta("qqqqqqqqqqq"))
+        );
+        for (job, rx) in &mut waits[1..] {
+            worker.cancel(*job);
+            until_terminal(rx).await;
+        }
+        assert!(!worker.busy());
+    }
+
+    #[tokio::test]
     async fn stderr_is_appended_to_log_across_spawns() {
         let _env = ENV_LOCK.lock().await;
         let (tmp, worker) = setup(LONG, LONG);
@@ -869,10 +1069,10 @@ note("exits", str(os.getpid()))
         let log = tmp.path().join("worker.log");
         std::fs::write(&log, "earlier line\n").unwrap();
 
-        let (_job, mut rx) = worker.download("stream:hhhhhhhhhhh".into(), cache.clone());
+        let (_job, mut rx) = worker.download("stream:hhhhhhhhhhh".into(), cache.clone(), false);
         until_terminal(&mut rx).await;
         worker.restart_when_idle();
-        let (_job, mut rx) = worker.download("stream:iiiiiiiiiii".into(), cache);
+        let (_job, mut rx) = worker.download("stream:iiiiiiiiiii".into(), cache, false);
         until_terminal(&mut rx).await;
 
         let spawns = read_lines(&tmp.path().join("spawns"));
@@ -896,7 +1096,8 @@ note("exits", str(os.getpid()))
         let _env = ENV_LOCK.lock().await;
         let (tmp, worker) = setup(LONG, LONG);
 
-        let (_job, mut rx) = worker.download("env:jjjjjjjjjjj".into(), tmp.path().join("cache"));
+        let (_job, mut rx) =
+            worker.download("env:jjjjjjjjjjj".into(), tmp.path().join("cache"), false);
         match recv(&mut rx).await {
             WorkerMsg::Started { meta, .. } => {
                 assert_eq!(meta.title, "秒針を噛む");

@@ -4,10 +4,32 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LATEST_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest";
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+const INSTALLED_VERSIONS: &str = "import importlib.metadata as m\nfor p in ('yt-dlp', 'yt-dlp-ejs'):\n    try:\n        print(p + '==' + m.version(p))\n    except m.PackageNotFoundError:\n        print(p + ' not installed')";
+
+/// `YYYY-MM-DDTHH:MM:SSZ` for `t` (UTC).
+fn rfc3339_utc(t: SystemTime) -> String {
+    let secs = t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
 
 /// Dotted integer version (`2026.06.09`, `2026.06.09.1`); `None` for anything else.
 pub fn parse_version(s: &str) -> Option<Vec<u64>> {
@@ -152,6 +174,8 @@ impl Updater {
         let Some(uv) = &self.uv else {
             return UpdateOutcome::Skipped("uv not found".to_string());
         };
+        let cutoff = rfc3339_utc(SystemTime::now() - CHECK_INTERVAL);
+        let requirement = format!("yt-dlp[default]=={latest}");
         match self.runner.run(
             uv,
             &[
@@ -159,12 +183,20 @@ impl Updater {
                 "install",
                 "--python",
                 &self.python,
-                "-U",
-                "yt-dlp[default]",
+                "--only-binary",
+                ":all:",
+                "--exclude-newer",
+                &cutoff,
+                "--upgrade-package",
+                "yt-dlp",
+                "--upgrade-package",
+                "yt-dlp-ejs",
+                &requirement,
             ],
             Duration::from_secs(180),
         ) {
             Ok(out) if out.status == 0 => {
+                self.log_installed();
                 self.touch();
                 UpdateOutcome::Upgraded {
                     from: current,
@@ -173,6 +205,20 @@ impl Updater {
             }
             Ok(out) => UpdateOutcome::Failed(format!("uv pip install: {}", out.stderr.trim())),
             Err(e) => UpdateOutcome::Failed(format!("uv pip install: {e:#}")),
+        }
+    }
+
+    fn log_installed(&self) {
+        match self.runner.run(
+            &self.python,
+            &["-c", INSTALLED_VERSIONS],
+            Duration::from_secs(30),
+        ) {
+            Ok(out) if out.status == 0 => {
+                eprintln!("yt-dlp update installed: {}", out.stdout.trim());
+            }
+            Ok(out) => eprintln!("yt-dlp update installed; versions: {}", out.stderr.trim()),
+            Err(e) => eprintln!("yt-dlp update installed; versions: {e:#}"),
         }
     }
 
@@ -320,9 +366,19 @@ mod tests {
     }
 
     #[test]
-    fn newer_version_runs_uv_and_upgrades() {
+    fn rfc3339_utc_formats_dates() {
+        let at = |secs| UNIX_EPOCH + Duration::from_secs(secs);
+        assert_eq!(rfc3339_utc(at(0)), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(at(951_868_799)), "2000-02-29T23:59:59Z");
+        assert_eq!(rfc3339_utc(at(1_790_000_000)), "2026-09-21T14:13:20Z");
+    }
+
+    #[test]
+    fn newer_version_installs_exact_tag_binary_only_a_day_old() {
         let dir = tempfile::tempdir().unwrap();
         let (up, runner) = updater(&dir, "2026.06.09", "2026.10.01", Some(UV), 0);
+        let day = Duration::from_secs(24 * 3600);
+        let before = rfc3339_utc(SystemTime::now() - day);
         assert_eq!(
             up.check_and_upgrade(),
             UpdateOutcome::Upgraded {
@@ -330,19 +386,39 @@ mod tests {
                 to: "2026.10.01".to_string()
             }
         );
+        let after = rfc3339_utc(SystemTime::now() - day);
         let calls = runner.calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].0, PY);
-        assert_eq!(
-            calls[1],
+        let argv = |cutoff: &str| {
             (
                 UV.to_string(),
-                ["pip", "install", "--python", PY, "-U", "yt-dlp[default]"]
-                    .iter()
-                    .map(|a| a.to_string())
-                    .collect()
+                [
+                    "pip",
+                    "install",
+                    "--python",
+                    PY,
+                    "--only-binary",
+                    ":all:",
+                    "--exclude-newer",
+                    cutoff,
+                    "--upgrade-package",
+                    "yt-dlp",
+                    "--upgrade-package",
+                    "yt-dlp-ejs",
+                    "yt-dlp[default]==2026.10.01",
+                ]
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>(),
             )
+        };
+        assert!(
+            calls[1] == argv(&before) || calls[1] == argv(&after),
+            "{:?}",
+            calls[1]
         );
+        assert_eq!(calls[2].0, PY);
         assert!(!up.due(SystemTime::now()));
     }
 

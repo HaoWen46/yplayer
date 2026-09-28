@@ -32,11 +32,19 @@ impl CurlHttp {
             "curl"
         };
         let mut cmd = Command::new(curl);
-        cmd.args(["-sS", "--max-time"])
-            .arg(timeout.as_secs().to_string())
-            .arg("-A")
-            .arg(&self.user_agent)
-            .args(["-w", "%{http_code}"]);
+        cmd.args([
+            "-q",
+            "--proto",
+            "=https",
+            "--max-filesize",
+            "5000000",
+            "-sS",
+            "--max-time",
+        ])
+        .arg(timeout.as_secs().to_string())
+        .arg("-A")
+        .arg(&self.user_agent)
+        .args(["-w", "%{http_code}"]);
         if head {
             cmd.arg("-I");
         }

@@ -315,21 +315,23 @@ pub(crate) fn worker_command(pinned_python: Option<&str>) -> Result<(String, Vec
         Some(p) => p.to_string(),
         None => find_python()?,
     };
-    Ok((python, vec!["-m".to_string(), "yplayer.worker".to_string()]))
+    Ok((
+        python,
+        vec![
+            "-P".to_string(),
+            "-m".to_string(),
+            "yplayer.worker".to_string(),
+        ],
+    ))
 }
 
 fn find_python() -> Result<String> {
-    // Try venv Python first (relative to executable or cwd)
+    // Try venv Python first (relative to the executable)
     let exe = std::env::current_exe().ok();
-    let cwd = std::env::current_dir().ok();
 
-    for base in [
-        exe.as_ref()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf())),
-        cwd,
-    ]
-    .into_iter()
-    .flatten()
+    if let Some(base) = exe
+        .as_ref()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
     {
         // Walk up to find .venv
         let mut dir = base.as_path();
