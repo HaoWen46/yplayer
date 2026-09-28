@@ -1,10 +1,6 @@
 import SwiftUI
 import YplayerKit
 
-/// `@State` is a macro in this SDK whose plugin the Command Line Tools lack; the alias applies
-/// the `State` property wrapper directly.
-private typealias ViewState = State
-
 /// Where a track list lives: the library (Songs, Search) or an album.
 enum TrackListContext {
     case library

@@ -21,6 +21,8 @@ final class AppModel {
     let client: ServiceClient
     /// The pending destructive action, shown by `ConfirmOverlay`.
     var confirm: ConfirmRequest?
+    /// Whether `LyricsView` replaces the library below the now-playing card.
+    var showsLyrics = false
 
     init(client: ServiceClient, store: LibraryStore) {
         self.client = client

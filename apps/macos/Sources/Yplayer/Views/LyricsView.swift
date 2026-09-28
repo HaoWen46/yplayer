@@ -1,10 +1,6 @@
 import SwiftUI
 import YplayerKit
 
-/// `@State` as the property wrapper: the macOS 27 SDK's `@State` macro needs the SwiftUIMacros
-/// plugin, which Command Line Tools lack.
-private typealias ViewState = SwiftUI.State
-
 /// The current track's lyrics, fetched when the track changes. Synced lines follow the local
 /// position clock through a `TimelineView` that exists only while this view is shown and the
 /// player is playing (two ticks per second); the list redraws only when the active line changes.

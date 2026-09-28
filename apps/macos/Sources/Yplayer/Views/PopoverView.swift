@@ -15,7 +15,13 @@ struct PopoverView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
             NowPlayingCard(model: model)
-            LibraryTabs(model: model)
+            if model.showsLyrics && model.store.currentTrack != nil {
+                LyricsView(model: model)
+                    .frame(maxHeight: .infinity)
+                    .transition(.opacity)
+            } else {
+                LibraryTabs(model: model)
+            }
         }
         .padding(12)
         .frame(width: 360, height: 560, alignment: .top)

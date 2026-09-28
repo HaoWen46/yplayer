@@ -1,10 +1,6 @@
 import ImageIO
 import SwiftUI
 
-/// `@State` as the property wrapper: the macOS 27 SDK's `@State` macro needs the SwiftUIMacros
-/// plugin, which Command Line Tools lack.
-private typealias ViewState = SwiftUI.State
-
 /// Decodes artwork off the main actor at display size (ImageIO thumbnails), cached by path and
 /// pixel size.
 actor ArtworkLoader {

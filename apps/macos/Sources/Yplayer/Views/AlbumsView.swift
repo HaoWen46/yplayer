@@ -1,10 +1,6 @@
 import SwiftUI
 import YplayerKit
 
-/// `@State` is a macro in this SDK whose plugin the Command Line Tools lack; the alias applies
-/// the `State` property wrapper directly.
-private typealias ViewState = State
-
 /// The albums by name. + adds an inline name field (`album.create`); double-clicking a name
 /// renames it inline; the context menu deletes an album (confirmed); clicking a row opens it.
 /// Esc cancels an inline name (`LibraryUI`'s key monitor clears `ui.albumEdit`).

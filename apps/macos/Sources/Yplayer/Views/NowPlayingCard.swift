@@ -1,35 +1,20 @@
 import SwiftUI
 import YplayerKit
 
-/// `@State` as the property wrapper: the macOS 27 SDK's `@State` macro needs the SwiftUIMacros
-/// plugin, which Command Line Tools lack.
-private typealias ViewState = SwiftUI.State
-
 /// The current track on a glass card: artwork, title, uploader, scrubber, transport, loop,
-/// volume, lyrics toggle and the ⋯ menu; "Not playing" with disabled controls when idle. With
-/// lyrics toggled on, `LyricsView` fills the height below the card.
+/// volume, lyrics toggle and the ⋯ menu; "Not playing" with disabled controls when idle. The
+/// lyrics toggle sets `model.showsLyrics`; `PopoverView` then shows `LyricsView` below the card.
 struct NowPlayingCard: View {
     let model: AppModel
     @Environment(\.lyricsFixture) private var lyricsFixture
-    @ViewState private var showsLyrics = false
     /// The volume while its slider is dragged; committed on release.
     @ViewState private var volumeDrag: Double? = nil
 
     var body: some View {
-        let track = model.store.currentTrack
-        let lyricsShown = showsLyrics && track != nil
-        VStack(spacing: 12) {
-            card(track)
-            if lyricsShown {
-                LyricsView(model: model)
-                    .transition(.opacity)
+        card(model.store.currentTrack)
+            .onAppear {
+                if lyricsFixture != nil { model.showsLyrics = true }
             }
-        }
-        .frame(maxHeight: lyricsShown ? .infinity : nil, alignment: .top)
-        .layoutPriority(lyricsShown ? 1 : 0)
-        .onAppear {
-            if lyricsFixture != nil { showsLyrics = true }
-        }
     }
 
     private func card(_ track: Track?) -> some View {
@@ -94,13 +79,15 @@ struct NowPlayingCard: View {
 
     private var lyricsButton: some View {
         Button {
-            withAnimation(.snappy(duration: 0.25)) { showsLyrics.toggle() }
+            withAnimation(.snappy(duration: 0.25)) { model.showsLyrics.toggle() }
         } label: {
             Label("Lyrics", systemImage: "quote.bubble")
                 .labelStyle(.iconOnly)
                 .font(.body.weight(.semibold))
                 .frame(width: 30, height: 30)
-                .foregroundStyle(showsLyrics ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                .foregroundStyle(
+                    model.showsLyrics ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary)
+                )
                 .contentShape(.rect)
         }
         .buttonStyle(.plain)
