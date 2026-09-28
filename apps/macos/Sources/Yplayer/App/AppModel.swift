@@ -141,17 +141,17 @@ final class AppModel {
         guard let path = store.tracks[trackID]?.audioPath,
             FileManager.default.fileExists(atPath: path)
         else {
-            store.toasts.append(ToastItem(severity: .warn, message: "The song's file is missing."))
+            store.appendToast(ToastItem(severity: .warn, message: "The song's file is missing."))
             return
         }
         NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: path)])
     }
 
     func copyLink(_ trackID: String) async {
-        guard let track = store.tracks[trackID] else { return }
-        let link = track.webpageURL ?? "https://www.youtube.com/watch?v=\(track.id)"
+        guard YouTubeURL.videoID(from: trackID) == .success(trackID) else { return }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(link, forType: .string)
+        NSPasteboard.general.setString(
+            "https://www.youtube.com/watch?v=\(trackID)", forType: .string)
     }
 
     func add(url: String, target: OrbTarget) async -> AddResult? {
@@ -174,7 +174,7 @@ final class AppModel {
             await send(.albumRemove(albumID: result.albumID, trackID: result.trackID))
         }
         if result.wasNew {
-            await send(.trackDelete(trackID: result.trackID, toTrash: false))
+            await send(.trackDelete(trackID: result.trackID, toTrash: true))
         }
     }
 
@@ -197,6 +197,6 @@ final class AppModel {
 
     private func report(_ error: any Error) {
         let message = (error as? ServiceError)?.message ?? error.localizedDescription
-        store.toasts.append(ToastItem(severity: .error, message: message))
+        store.appendToast(ToastItem(severity: .error, message: message))
     }
 }

@@ -1,13 +1,15 @@
 import SwiftUI
 import YplayerKit
 
-/// The oldest toast as a bottom banner; dismissed after 4 s (errors 6 s) by a one-shot sleep
-/// that exists only while the banner is visible.
+/// The oldest toast younger than `LibraryStore.toastLifetime` as a bottom banner; dismissed
+/// after 4 s (errors 6 s) by a one-shot sleep that exists only while the banner is visible.
 struct ToastBanner: View {
     let store: LibraryStore
 
     var body: some View {
-        if let toast = store.toasts.first {
+        if let toast = store.toasts.first(where: {
+            Date.now.timeIntervalSince($0.createdAt) < LibraryStore.toastLifetime
+        }) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Image(systemName: Self.symbol(toast.severity))
                     .foregroundStyle(Self.tint(toast.severity))

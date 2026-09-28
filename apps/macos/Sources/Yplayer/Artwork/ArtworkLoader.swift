@@ -6,7 +6,12 @@ import SwiftUI
 actor ArtworkLoader {
     static let shared = ArtworkLoader()
 
-    private let cache = NSCache<NSString, CGImage>()
+    private let cache: NSCache<NSString, CGImage> = {
+        let cache = NSCache<NSString, CGImage>()
+        cache.countLimit = 300
+        cache.totalCostLimit = 64 * 1024 * 1024
+        return cache
+    }()
 
     /// The image at `path` decoded to at most `pointSize × scale` pixels; nil when the file is
     /// missing or unreadable.
@@ -25,7 +30,7 @@ actor ArtworkLoader {
         ]
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
         else { return nil }
-        cache.setObject(image, forKey: key)
+        cache.setObject(image, forKey: key, cost: image.bytesPerRow * image.height)
         return image
     }
 

@@ -145,6 +145,21 @@ enum DebugFixtures {
         return model(store)
     }
 
+    /// Songs over a 5,000-track library: the fixture library plus numbered copies of its
+    /// complete tracks, older than the fixture tracks.
+    static func largeSongsModel() -> AppModel {
+        let store = store()
+        let complete = tracks.filter { $0.state == .complete }
+        let more = (0..<(5_000 - tracks.count)).map { i in
+            let base = complete[i % complete.count]
+            return track(
+                101 + i, "\(base.title) #\(i + 1)", base.uploader ?? "", base.duration ?? 0,
+                size: base.fileSize)
+        }
+        store.load(LibrarySnapshot(tracks: tracks + more, albums: albums, libraryVersion: 1))
+        return model(store)
+    }
+
     /// A katakana "ハム" title for the search state (query "はむ" folds to it).
     static let kanaTrack = track(
         9, "とっとこハム太郎 OP『ハム太郎とっとこうた』", "ハムちゃんず", 203, size: 3_874_210)

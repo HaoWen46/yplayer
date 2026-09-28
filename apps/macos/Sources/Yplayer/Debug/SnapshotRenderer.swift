@@ -48,6 +48,10 @@ enum SnapshotRenderer {
                 popover(DebugFixtures.songsModel(), route: LibraryRoute(tab: .songs))
             ),
             (
+                "popover-songs-5000",
+                popover(DebugFixtures.largeSongsModel(), route: LibraryRoute(tab: .songs))
+            ),
+            (
                 "popover-search",
                 popover(DebugFixtures.searchModel(), route: LibraryRoute(tab: .search, query: "はむ"))
             ),
