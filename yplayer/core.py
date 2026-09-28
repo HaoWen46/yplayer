@@ -144,14 +144,14 @@ def save_sidecar(cache_dir: str, info_obj: dict, *, track_dir: str | None = None
         "duration": info_obj.get("duration"),
         "webpage_url": info_obj.get("webpage_url"),
     }
-    # per-track
+    # per-track. meta.json is the download's completion marker, so write it
+    # atomically and let failures propagate instead of reporting success.
     if track_dir:
-        try:
-            os.makedirs(track_dir, exist_ok=True)
-            with open(os.path.join(track_dir, "meta.json"), "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        os.makedirs(track_dir, exist_ok=True)
+        tmp = os.path.join(track_dir, "meta.json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, os.path.join(track_dir, "meta.json"))
 
 def _sanitize_title(title: str | None) -> str:
     """Make a filesystem-safe-ish filename from a title (keeps unicode)."""
