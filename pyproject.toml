@@ -5,7 +5,7 @@ description = "CLI YouTube audio cache + player (audio-only via yt-dlp)."
 authors = [ { name = "You" } ]
 requires-python = ">=3.11"
 dependencies = [
-  "yt-dlp",
+  "yt-dlp[default]",
   "python-dotenv",
 ]
 readme = "README.md"
@@ -28,6 +28,11 @@ line-length = 100
 # of bug that broke HEAD), import sorting (I), and pyupgrade (UP). Skip the
 # noisy pycodestyle line-length lints.
 select = ["F", "I", "UP"]
+
+[tool.pytest.ini_options]
+# Network tests are opt-in: `pytest -m live`.
+markers = ["live: needs the network (real yt-dlp download)"]
+addopts = "-m 'not live'"
 
 [build-system]
 requires = ["setuptools>=77", "wheel"]

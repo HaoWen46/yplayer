@@ -10,60 +10,23 @@ Features:
     ~/.cache/yplayer/<SanitizedTitle> [<id8>]/meta.json
   (Legacy flat cache remains supported.)
 - Robust post-download discovery of actual filename.
-- Sidecar JSON: legacy <cache>/<id>.json still written; folder meta.json added.
+- Sidecar JSON: folder meta.json, written after the audio.
 - Cached library listing helpers for the browse UI (both layouts).
 """
 import json
 import os
 import re
-import subprocess
-import sys
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
 
 from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError
+from yt_dlp.utils import DownloadCancelled
 
-from .config import (
-    DEFAULT_AUDIO_FORMAT,
-    DEFAULT_CACHE_DIR,
-    EMBED_METADATA_DEFAULT,
-    KNOWN_EXTS,
-    SUPPORTED_FORMATS,
-)
+# DEFAULT_CACHE_DIR is re-exported for albums.py.
+from .config import DEFAULT_CACHE_DIR as DEFAULT_CACHE_DIR
+from .config import KNOWN_EXTS
 from .utils import die, info, normalize_ext, which
-
-# ----------- URL / ID helpers -----------
-
-YOUTUBE_URL_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/", re.I)
-YOUTUBE_ID_RE = re.compile(r"(?:v=|\/)([0-9A-Za-z_-]{11})(?:[^0-9A-Za-z_-]|$)")
-
-def is_url(s: str) -> bool:
-    return bool(YOUTUBE_URL_RE.search(s))
-
-def extract_video_id(url: str) -> str | None:
-    """Try to extract a YouTube video ID from common URL forms."""
-    if not url:
-        return None
-    m = YOUTUBE_ID_RE.search(url)
-    return m.group(1) if m else None
-
-# ----------- Options -----------
-
-@dataclass
-class Options:
-    cache_dir: str = DEFAULT_CACHE_DIR
-    fmt: str = DEFAULT_AUDIO_FORMAT
-    native: bool = False
-    embed_meta: bool = EMBED_METADATA_DEFAULT
-    audio_quality: str | None = None  # "0" best for VBR when converting
-    list_formats: bool = False
-    player: str | None = None
-    play_after: bool = True
-    volume: float | None = None
-    print_only: bool = False
 
 # ----------- FS / deps -----------
 
@@ -71,210 +34,13 @@ def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 def require_bins():
-    """Warn if ffmpeg missing and ensure yt-dlp is up to date."""
+    """Warn if ffmpeg missing."""
     if not which("ffmpeg") and not which("avconv"):
         info(
             "ffmpeg not found — native downloads will work, "
             "but conversion/metadata embedding won't.\n"
             "Install with: brew install ffmpeg"
         )
-    # Check and update yt-dlp if needed
-    ensure_ytdlp_uptodate()
-
-def _normalize_version(v: str) -> str:
-    """Normalize version string for comparison (e.g., 2026.01.29 -> 2026.1.29)."""
-    parts = v.split(".")
-    normalized = []
-    for part in parts:
-        try:
-            normalized.append(str(int(part)))
-        except ValueError:
-            normalized.append(part)
-    return ".".join(normalized)
-
-
-def _get_ytdlp_versions() -> tuple[str | None, str | None]:
-    """Get current and latest yt-dlp versions. Returns (current, latest) or (None, None) on error."""
-    try:
-        import yt_dlp
-        current = getattr(yt_dlp, 'version', None)
-        if current is None:
-            current = getattr(yt_dlp, '__version__', None)
-        if hasattr(current, '__version__'):
-            current = current.__version__
-        # yt_dlp.version is a module; get the string
-        if hasattr(current, '__name__') and current.__name__ == 'yt_dlp.version':
-            current = getattr(current, '__version__', None)
-    except Exception:
-        current = None
-
-    # Fallback: get version from pip
-    if not current or not isinstance(current, str):
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "show", "yt-dlp"],
-                capture_output=True, text=True, timeout=10
-            )
-            for line in result.stdout.splitlines():
-                if line.startswith("Version:"):
-                    current = line.split(":", 1)[1].strip()
-                    break
-        except Exception:
-            pass
-
-    # Get latest version from PyPI
-    latest = None
-    try:
-        req = urllib.request.Request(
-            "https://pypi.org/pypi/yt-dlp/json",
-            headers={"Accept": "application/json"}
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            latest = data.get("info", {}).get("version")
-    except Exception:
-        pass
-
-    return current, latest
-
-
-def _update_ytdlp_pip() -> bool:
-    """Update yt-dlp via pip. Returns True on success."""
-    try:
-        info("updating yt-dlp via pip…")
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"],
-            capture_output=True, text=True, timeout=120
-        )
-        if result.returncode == 0:
-            info("yt-dlp updated successfully.")
-            return True
-        else:
-            info(f"yt-dlp update failed: {result.stderr}")
-            return False
-    except Exception as e:
-        info(f"yt-dlp update failed: {e}")
-        return False
-
-
-def _version_tuple(v: str) -> tuple:
-    """Parse a version like '2026.06.09' into a comparable tuple of ints.
-    Non-numeric parts contribute their leading digits, or 0."""
-    out = []
-    for part in v.split("."):
-        digits = "".join(ch for ch in part if ch.isdigit())
-        out.append(int(digits) if digits else 0)
-    return tuple(out)
-
-
-def ensure_ytdlp_uptodate(cache_dir: str | None = None, *, max_age_hours: float = 24.0):
-    """Update yt-dlp only when PyPI has a strictly newer release.
-
-    Throttled: if a check ran within ``max_age_hours`` (tracked by a timestamp
-    file under ``cache_dir``), this returns immediately. Comparing by version
-    ordering — not ``!=`` — avoids pointlessly "downgrading" a locally newer
-    dev build on every start.
-    """
-    stamp = os.path.join(cache_dir, ".ytdlp_update_check") if cache_dir else None
-    if stamp:
-        try:
-            if os.path.exists(stamp) and (time.time() - os.path.getmtime(stamp)) < max_age_hours * 3600:
-                return
-        except OSError:
-            pass
-
-    current, latest = _get_ytdlp_versions()
-
-    # Record the attempt regardless of outcome, so a failed PyPI fetch doesn't
-    # re-hit the network on every launch.
-    if stamp:
-        try:
-            os.makedirs(cache_dir, exist_ok=True)
-            with open(stamp, "w", encoding="utf-8") as f:
-                f.write(str(int(time.time())))
-        except OSError:
-            pass
-
-    if not current or not latest:
-        return  # Can't determine versions, skip
-
-    try:
-        outdated = _version_tuple(latest) > _version_tuple(current)
-    except Exception:
-        outdated = _normalize_version(current) != _normalize_version(latest)
-    if outdated:
-        info(f"yt-dlp is outdated ({current} -> {latest})")
-        _update_ytdlp_pip()
-
-
-def _auto_update_ytdlp():
-    """Try to update yt-dlp via pip (used as fallback when DownloadError occurs)."""
-    _update_ytdlp_pip()
-
-# ----------- Lyrics (LRCLIB) ----------
-
-def _clean_track_title(title: str) -> str:
-    """Reduce a decorated YouTube title to the song name for lyrics matching.
-
-    jpop uploads are typically 'Artist『Song』MV (romaji ...)'. Prefer the text
-    inside Japanese quote brackets; otherwise strip bracketed decorations and
-    common tags (MV, Official Video, feat. ...).
-    """
-    m = re.search(r"[『「【]([^』」】]+)[』」】]", title or "")
-    if m:
-        return m.group(1).strip()
-    t = re.sub(r"[\(\[（【][^\)\]）】]*[\)\]）】]", "", title or "")
-    t = re.sub(r"\b(?:MV|M/V|Music Video|Official.*|Lyric.*|feat\..*)\b", "", t, flags=re.I)
-    return t.strip()
-
-
-def _lrclib_search(track_name: str, artist_name: str, duration: int | None) -> dict:
-    """One LRCLIB /api/search call; return the closest-duration synced hit."""
-    q = urllib.parse.urlencode({"track_name": track_name, "artist_name": artist_name})
-    url = f"https://lrclib.net/api/search?{q}"
-    try:
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "yplayer (https://github.com/HaoWen46/yplayer)"}
-        )
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            results = json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return {}
-    if not isinstance(results, list):
-        return {}
-    best, best_score = None, None
-    for r in results:
-        if not r.get("syncedLyrics"):
-            continue
-        rd = r.get("duration") or 0
-        score = abs((duration or rd) - rd)
-        if best_score is None or score < best_score:
-            best, best_score = r, score
-    if best is None:
-        return {}
-    return {"synced": best.get("syncedLyrics"), "plain": best.get("plainLyrics")}
-
-
-def fetch_lyrics(track_name: str, artist_name: str | None = None,
-                 duration: int | None = None) -> dict:
-    """Fetch synced lyrics from LRCLIB (free, keyless).
-
-    Tries the cleaned song title with the artist, then the cleaned title alone
-    (YouTube uploader names rarely match LRCLIB's artist field). Returns a dict
-    with 'synced'/'plain', or {} if nothing was found.
-    """
-    cleaned = _clean_track_title(track_name)
-    for track, artist in [
-        (cleaned, artist_name or ""),
-        (cleaned, ""),
-        (track_name or "", artist_name or ""),
-    ]:
-        if not track:
-            continue
-        hit = _lrclib_search(track, artist, duration)
-        if hit.get("synced"):
-            return hit
-    return {}
 
 # ----------- YouTube Data API (no descriptions) ----------
 
@@ -361,38 +127,11 @@ def yt_api_durations(ids: list[str], api_key: str) -> dict[str, int | None]:
             out.setdefault(vid, None)
     return out
 
-def yt_api_video_info(video_id: str, api_key: str) -> dict | None:
-    """Fetch minimal info for a single video: title, uploader, duration."""
-    qs = urllib.parse.urlencode({
-        "part": "snippet,contentDetails",
-        "id": video_id,
-        "key": api_key,
-    })
-    url = f"{API_BASE}/videos?{qs}"
-    data = _http_get_json(url)
-    items = data.get("items", [])
-    if not items:
-        return None
-    it = items[0]
-    sn = it.get("snippet", {}) or {}
-    cd = it.get("contentDetails", {}) or {}
-    return {
-        "id": video_id,
-        "title": sn.get("title") or video_id,
-        "uploader": sn.get("channelTitle"),
-        "duration": _parse_iso8601_duration(cd.get("duration")),
-        "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
-    }
-
 # ----------- Metadata sidecar & cache listing ----------
-
-def _meta_path(cache_dir: str, vid: str) -> str:
-    # legacy flat sidecar path
-    return os.path.join(cache_dir, f"{vid}.json")
 
 def save_sidecar(cache_dir: str, info_obj: dict, *, track_dir: str | None = None):
     """Write minimal metadata JSON next to the audio file.
-       Writes both the legacy <cache>/<id>.json and, if track_dir provided, <track_dir>/meta.json.
+       Writes <track_dir>/meta.json if track_dir provided.
     """
     ensure_dir(cache_dir)
     vid = info_obj.get("id")
@@ -405,12 +144,6 @@ def save_sidecar(cache_dir: str, info_obj: dict, *, track_dir: str | None = None
         "duration": info_obj.get("duration"),
         "webpage_url": info_obj.get("webpage_url"),
     }
-    # legacy
-    try:
-        with open(_meta_path(cache_dir, vid), "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
     # per-track
     if track_dir:
         try:
@@ -604,27 +337,10 @@ def _base_ydl_opts(cache_dir: str) -> dict:
         "socket_timeout": 10,
     }
 
-def _ydl_extract(url_or_query: str, ydl_opts: dict, *, download: bool):
-    """Wrapper around YoutubeDL.extract_info with optional auto-update and retry."""
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url_or_query, download=download)
-    except DownloadError:
-        _auto_update_ytdlp()
-        with YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url_or_query, download=download)
-
 # ----------- Download (per-track folder layout) ----------
 
 def path_for(cache_dir: str, vid: str, ext: str) -> str:
     return os.path.join(cache_dir, f"{vid}.{normalize_ext(ext)}")
-
-def _track_dir_name(title: str | None, vid: str | None) -> str:
-    san_title = _sanitize_title(title) if title else None
-    base = san_title or (vid or "track")
-    if vid:
-        base = f"{base} [{vid[:8]}]"
-    return base
 
 def _first_audio_created(before: set[str], after: set[str], directory: str) -> str | None:
     # Find new audio file created in directory
@@ -638,103 +354,121 @@ def _first_audio_created(before: set[str], after: set[str], directory: str) -> s
             return os.path.join(directory, fname)
     return None
 
-def download_audio(url: str, opts: Options, *, api_key: str | None = None) -> str:
-    """
-    Download audio and return the actual file path.
-    New behavior: per-track folder layout. Legacy flat-cache still compatible.
-    """
-    ensure_dir(opts.cache_dir)
+# Time source for progress throttling; tests swap it for a fake clock.
+_clock = time.monotonic
 
-    # 1) Minimal metadata via API if available
-    vid = None
-    title = None
-    uploader = None
-    duration = None
+def _track_meta(info_obj: dict) -> dict:
+    return {
+        "id": info_obj.get("id"),
+        "title": info_obj.get("title"),
+        "uploader": info_obj.get("uploader"),
+        "duration": info_obj.get("duration"),
+        "webpage_url": info_obj.get("webpage_url"),
+    }
+
+def _fetch_thumbnail(video_id: str, dest: str) -> bool:
+    """Save YouTube's hqdefault.jpg for video_id to dest; False on any failure."""
+    url = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
     try:
-        if api_key or os.environ.get("YT_API_KEY"):
-            try:
-                info_obj = video_info_from_url(url, api_key=api_key)
-                vid = info_obj.get("id")
-                title = info_obj.get("title")
-                uploader = info_obj.get("uploader")
-                duration = info_obj.get("duration")
-            except Exception:
-                vid = extract_video_id(url)
-        else:
-            vid = extract_video_id(url)
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "yplayer (https://github.com/HaoWen46/yplayer)"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = resp.read()
+        with open(dest, "wb") as f:
+            f.write(data)
     except Exception:
-    # be tolerant
-        vid = extract_video_id(url)
+        return False
+    return True
 
-    # 2) Prepare per-track directory and outtmpl
-    tdir_name = _track_dir_name(title, vid)
-    tdir = os.path.join(opts.cache_dir, tdir_name)
-    os.makedirs(tdir, exist_ok=True)
-    outtmpl = os.path.join(tdir, "audio.%(ext)s")
+def download_track(url: str, cache_dir: str, *, emit, cancel_event) -> dict:
+    """
+    Download the native best-audio stream into <cache>/<Title> [<id8>]/ with one
+    extract_info call. Streams {"event": "started", ...} through emit once audio
+    bytes are on disk, then {"event": "progress", ...} at most twice per second.
+    Setting cancel_event raises DownloadCancelled at the next progress callback.
+    meta.json is written last; returns {path, dir, meta, thumb, format, file_size}.
+    """
+    track_tmpl = os.path.join(cache_dir, "%(title).150B [%(id).8s]")
+    started = False
+    last = 0.0
+
+    def hook(d: dict):
+        nonlocal started, last
+        if cancel_event.is_set():
+            raise DownloadCancelled()
+        path = d.get("filename")
+        if not path:
+            return
+        if not started:
+            try:
+                on_disk = os.path.getsize(path)
+            except OSError:
+                return
+            if not on_disk:
+                return
+            started, last = True, _clock()
+            path = os.path.abspath(path)
+            emit({
+                "event": "started",
+                "path": path,
+                "dir": os.path.dirname(path),
+                "meta": _track_meta(d.get("info_dict") or {}),
+            })
+            return
+        now = _clock()
+        if now - last < 0.5:
+            return
+        last = now
+        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+        emit({
+            "event": "progress",
+            "bytes": d.get("downloaded_bytes") or 0,
+            "total": int(total) if total else None,
+        })
 
     ydl_opts = {
+        "format": "bestaudio",
+        "nopart": True,
+        "outtmpl": {
+            "default": os.path.join(track_tmpl, "audio.%(ext)s"),
+        },
+        # The direct https audio formats suffice; skip the HLS/DASH manifest fetches.
+        "extractor_args": {"youtube": {"skip": ["hls", "dash"]}},
         "quiet": True,
         "no_warnings": True,
-        # Keep stdout pure JSON for the worker protocol (yt-dlp otherwise writes
-        # its progress bar to stdout, which corrupts the JSON-line responses).
+        # Keep stdout pure JSON for the worker protocol.
         "logtostderr": True,
         "noprogress": True,
         "noplaylist": True,
-        "outtmpl": outtmpl,
-        "format": "bestaudio/best",
         "retries": 2,
         "socket_timeout": 10,
-        "restrictfilenames": True,
+        "progress_hooks": [hook],
     }
+    with YoutubeDL(ydl_opts) as ydl:
+        info_dict = ydl.extract_info(url, download=True)
 
-    if not opts.native:
-        fmt = normalize_ext(opts.fmt)
-        if fmt not in SUPPORTED_FORMATS:
-            die(f"unsupported format: {fmt} (supported: {', '.join(SUPPORTED_FORMATS)})")
-        ydl_opts["postprocessors"] = [
-            {"key": "FFmpegExtractAudio", "preferredcodec": fmt, "preferredquality": str(opts.audio_quality or "0")}
-        ]
-        if opts.embed_meta:
-            ydl_opts["writethumbnail"] = True
-            ydl_opts["postprocessors"].extend([{"key": "FFmpegMetadata"}, {"key": "EmbedThumbnail"}])
-
-    info("downloading audio-only…")
-
-    # snapshot files inside tdir before download
-    before: set[str] = set(os.listdir(tdir)) if os.path.isdir(tdir) else set()
-    info_dict = _ydl_extract(url, ydl_opts, download=True)
-    after: set[str] = set(os.listdir(tdir)) if os.path.isdir(tdir) else set()
-
-    # 3) Determine final path
-    final_path: str | None = None
-    # yt-dlp may populate requested_downloads
-    if isinstance(info_dict, dict) and info_dict.get("requested_downloads"):
-        rd = info_dict["requested_downloads"][0]
-        final_path = rd.get("filepath")
-    if not final_path:
-        # look for new audio in tdir
-        for fname in sorted(after - before):
-            ext = os.path.splitext(fname)[1].lstrip(".").lower()
-            if ext in KNOWN_EXTS:
-                final_path = os.path.join(tdir, fname)
-                break
-    if not final_path:
-        # fallback to expected template
-        ext = opts.fmt if not opts.native else (info_dict.get("ext") or "webm")
-        final_path = os.path.join(tdir, f"audio.{ext}")
-
-    # 4) Write sidecars (legacy + per-track)
-    vid_final = info_dict.get("id") or vid or extract_video_id(url)
-    meta = {
-        "id": vid_final,
-        "title": title or info_dict.get("title") or vid_final,
-        "uploader": uploader or info_dict.get("uploader"),
-        "duration": duration or info_dict.get("duration"),
-        "webpage_url": info_dict.get("webpage_url") or url,
+    # yt-dlp drops keys equal to the parent's from requested_downloads; merge back.
+    rd = {**info_dict, **info_dict["requested_downloads"][0]}
+    path = os.path.abspath(rd["filepath"])
+    track_dir = os.path.dirname(path)
+    # Cover after the audio (yt-dlp's writethumbnail probes thumbnails serially
+    # before the first audio byte); a missing cover is not an error.
+    cover = os.path.join(track_dir, "cover.jpg")
+    try:
+        thumb = cover if _fetch_thumbnail(rd["id"], cover) else None
+    except Exception:
+        thumb = None
+    meta = _track_meta(rd)
+    save_sidecar(cache_dir, meta, track_dir=track_dir)
+    return {
+        "path": path,
+        "dir": track_dir,
+        "meta": meta,
+        "thumb": thumb,
+        "format": os.path.splitext(path)[1].lstrip("."),
+        "file_size": os.path.getsize(path),
     }
-    save_sidecar(opts.cache_dir, meta, track_dir=tdir)
-
-    return final_path
 
 # ----------- Inspect / search (API-first) ----------
 
@@ -751,17 +485,6 @@ def search_results(query: str, limit: int = 10, *, api_key: str | None = None,
         for r in results:
             r["duration"] = durs.get(r["id"])
     return results
-
-def video_info_from_url(url: str, *, api_key: str | None = None) -> dict:
-    """Minimal info for a single URL using YouTube Data API. No descriptions."""
-    key = _require_api_key(api_key)
-    vid = extract_video_id(url)
-    if not vid:
-        die("could not extract video id from URL")
-    info_obj = yt_api_video_info(vid, key)
-    if not info_obj:
-        die("video not found via API")
-    return info_obj
 
 def video_info_from_query(query: str, *, api_key: str | None = None) -> dict:
     """Top-1 result via API (kept for completeness)."""
@@ -793,29 +516,3 @@ def list_audio_formats(url: str) -> list[dict]:
                 "format_note": f.get("format_note"),
             })
     return out
-
-# ----------- Orchestration ----------
-
-def resolve_and_maybe_download(query_or_url: str, opts: Options, *, api_key: str | None = None) -> str:
-    ensure_dir(opts.cache_dir)
-
-    if is_url(query_or_url):
-        info_obj = video_info_from_url(query_or_url, api_key=api_key)
-    else:
-        die("refusing to download from a search query. pass a YouTube URL.")
-
-    vid = info_obj["id"]
-
-    existing = find_existing(opts.cache_dir, vid, info_obj.get("title"))
-    if existing:
-        info(f"cached: {os.path.basename(existing)}")
-        return existing
-
-    # Save both sidecars before download (so browse shows it even during download)
-    try:
-        # we don't have the per-track dir yet; download_audio will add folder meta
-        save_sidecar(opts.cache_dir, info_obj)
-    except Exception:
-        pass
-
-    return download_audio(info_obj["webpage_url"], opts, api_key=api_key)

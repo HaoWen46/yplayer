@@ -41,6 +41,7 @@ def test_worker_protocol_roundtrip():
 
     # First line is the readiness handshake.
     assert lines[0].get("event") == "ready"
+    assert lines[0].get("protocol") == 2
 
     # Second line is the response, with the request id echoed back.
     resp = lines[1]

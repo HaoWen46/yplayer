@@ -1,15 +1,18 @@
 """
-JSON-line worker for the Rust yplay binary.
+JSON-line worker for the yplayer service (protocol v2).
 
 Protocol: reads one JSON object per line from stdin, writes one JSON object
-per line to stdout.  stderr is used for progress/logging (passed through to
-the terminal by the Rust side).
+per line to stdout.  stderr is used for logging (appended to the worker log
+by the Rust side).  The first line is {"event": "ready", "ok": true,
+"protocol": 2}; every later line carries the request id.  Requests run on a
+thread pool, so replies can interleave; each request ends with exactly one
+terminal line ({"ok": true, ...} or {"ok": false, "error", "cancelled"}).
 
 Commands:
-    download        – download audio, return file path + metadata
+    download        – download native audio; streams started/progress events
+    cancel          – cancel an in-flight download (handled inline)
     search          – search YouTube, return results
     playlist_entries – extract playlist entries (flat, no download)
-    video_info      – fetch metadata for a single URL
     list_formats    – list available audio formats for a URL
 """
 
@@ -17,159 +20,120 @@ import json
 import os
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
-from .core import (
-    Options,
-    download_audio,
-    ensure_ytdlp_uptodate,
-    list_audio_formats,
-    search_results,
-    video_info_from_url,
-)
+from yt_dlp.utils import DownloadCancelled
+
+from .core import download_track, list_audio_formats, search_results
 from .playlist import extract_playlist_entries
 
-# The id of the request currently being handled, echoed back on every response
-# so the host can correlate replies and detect protocol desync.
-_current_id = None
+# Serializes stdout writes from the reader thread and the pool threads.
+_out_lock = threading.Lock()
+
+# Cancel flags of in-flight requests, keyed by request id.
+_cancel_events: dict = {}
 
 
 def _respond(obj: dict):
-    """Write a JSON line to stdout and flush, echoing the current request id."""
-    if _current_id is not None and "id" not in obj:
-        obj = {"id": _current_id, **obj}
-    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    """Write a JSON line to stdout and flush."""
+    line = json.dumps(obj, ensure_ascii=False) + "\n"
+    with _out_lock:
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
 
-def _handle_download(req: dict):
+def _handle_download(req: dict, emit, cancel_event) -> dict:
     cache_dir = req.get("cache_dir") or os.path.expanduser("~/Music/yt-audio")
     url = req.get("url", "")
-    api_key = req.get("api_key")
-    fmt = req.get("format", "mp3")
-    native = req.get("native", False)
-    embed_meta = req.get("embed_meta", True)
-
-    opts = Options()
-    opts.cache_dir = cache_dir
-    opts.fmt = fmt
-    opts.native = native
-    opts.embed_meta = embed_meta
-    opts.play_after = False
-
-    path = download_audio(url, opts, api_key=api_key)
-
-    # Read the sidecar metadata if available
-    meta = {}
-    try:
-        meta_path = os.path.join(os.path.dirname(path), "meta.json")
-        if os.path.exists(meta_path):
-            with open(meta_path, encoding="utf-8") as f:
-                meta = json.load(f)
-    except Exception:
-        pass
-
-    if not meta:
-        from .core import extract_video_id
-        vid = extract_video_id(url) or ""
-        meta = {"id": vid, "title": vid, "webpage_url": url}
-
-    _respond({"ok": True, "path": path, "meta": meta})
+    return download_track(url, cache_dir, emit=emit, cancel_event=cancel_event)
 
 
-def _handle_search(req: dict):
+def _handle_search(req: dict, emit, cancel_event) -> dict:
     query = req.get("query", "")
     limit = req.get("limit", 10)
     api_key = req.get("api_key")
 
     results = search_results(query, limit, api_key=api_key)
-    _respond({"ok": True, "results": results})
+    return {"results": results}
 
 
-def _handle_video_info(req: dict):
-    url = req.get("url", "")
-    api_key = req.get("api_key")
-
-    info = video_info_from_url(url, api_key=api_key)
-    _respond({"ok": True, "meta": info})
-
-
-def _handle_playlist_entries(req: dict):
+def _handle_playlist_entries(req: dict, emit, cancel_event) -> dict:
     url = req.get("url", "")
     entries = extract_playlist_entries(url)
-    _respond({"ok": True, "entries": entries})
+    return {"entries": entries}
 
 
-def _handle_list_formats(req: dict):
+def _handle_list_formats(req: dict, emit, cancel_event) -> dict:
     url = req.get("url", "")
     formats = list_audio_formats(url)
-    _respond({"ok": True, "formats": formats})
+    return {"formats": formats}
 
 
-def _handle_lyrics(req: dict):
-    from .core import fetch_lyrics
-    result = fetch_lyrics(
-        req.get("track_name", ""),
-        req.get("artist_name"),
-        req.get("duration"),
-    )
-    if result.get("synced") or result.get("plain"):
-        _respond({"ok": True, "synced": result.get("synced"), "plain": result.get("plain")})
-    else:
-        _respond({"ok": False, "error": "no lyrics found"})
+def _run(handler, rid, req: dict, cancel_event: threading.Event):
+    """Run one request on a pool thread and write its terminal line."""
+
+    def emit(event: dict):
+        _respond({"id": rid, **event})
+
+    try:
+        result = handler(req, emit, cancel_event)
+        _respond({"id": rid, "ok": True, **result})
+    except SystemExit as e:
+        # A library may call sys.exit(); keep the worker alive and report it.
+        _respond({"id": rid, "ok": False, "error": f"worker aborted: {e}", "cancelled": False})
+    except Exception as e:
+        # Includes YplayerError from die(), which carries the real message.
+        cancelled = isinstance(e, DownloadCancelled)
+        _respond({"id": rid, "ok": False, "error": str(e), "cancelled": cancelled})
+    finally:
+        _cancel_events.pop(rid, None)
 
 
 def main():
-    global _current_id
-
-    # Check for a newer yt-dlp in the background so requests are served
-    # immediately; the check itself is throttled to once per day.
-    def _bg_update():
-        try:
-            ensure_ytdlp_uptodate(os.path.expanduser("~/Music/yt-audio"))
-        except Exception:
-            pass
-
-    threading.Thread(target=_bg_update, daemon=True).start()
-
     handlers = {
         "download": _handle_download,
         "search": _handle_search,
-        "video_info": _handle_video_info,
         "playlist_entries": _handle_playlist_entries,
         "list_formats": _handle_list_formats,
-        "lyrics": _handle_lyrics,
     }
 
     # Announce readiness so the host can tell a live worker from one that failed
     # to import/start, and can begin sending requests.
-    _respond({"event": "ready", "ok": True})
+    _respond({"event": "ready", "ok": True, "protocol": 2})
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        _current_id = None
-        try:
-            req = json.loads(line)
-        except json.JSONDecodeError as e:
-            _respond({"ok": False, "error": f"Invalid JSON: {e}"})
-            continue
+    # Leaving the block on stdin EOF waits for running jobs; then exit 0.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError as e:
+                _respond(
+                    {"id": None, "ok": False, "error": f"Invalid JSON: {e}", "cancelled": False}
+                )
+                continue
 
-        _current_id = req.get("id") if isinstance(req, dict) else None
-        cmd = req.get("cmd", "")
-        handler = handlers.get(cmd)
-        if handler is None:
-            _respond({"ok": False, "error": f"Unknown command: {cmd}"})
-            continue
+            rid = req.get("id")
+            cmd = req.get("cmd", "")
+            if cmd == "cancel":
+                event = _cancel_events.get(req.get("target"))
+                if event is not None:
+                    event.set()
+                _respond({"id": rid, "ok": True})
+                continue
 
-        try:
-            handler(req)
-        except SystemExit as e:
-            # A library may call sys.exit(); keep the worker alive and report it.
-            _respond({"ok": False, "error": f"worker aborted: {e}"})
-        except Exception as e:
-            # Includes YplayerError from die(), which carries the real message.
-            _respond({"ok": False, "error": str(e)})
+            handler = handlers.get(cmd)
+            if handler is None:
+                _respond(
+                    {"id": rid, "ok": False, "error": f"Unknown command: {cmd}", "cancelled": False}
+                )
+                continue
+
+            cancel_event = threading.Event()
+            _cancel_events[rid] = cancel_event
+            pool.submit(_run, handler, rid, req, cancel_event)
 
 
 if __name__ == "__main__":
