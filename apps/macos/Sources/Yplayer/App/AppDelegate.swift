@@ -1,27 +1,60 @@
 import AppKit
-import SwiftUI
+import YplayerKit
+
+/// Debug flags: `--snapshot-dir <dir>` renders the debug states to PNGs and exits;
+/// `--open-popover` opens the popover 1 s after launch.
+struct LaunchOptions {
+    var snapshotDir: URL?
+    var openPopover = false
+
+    init(arguments: [String]) {
+        var rest = arguments.dropFirst().makeIterator()
+        while let argument = rest.next() {
+            switch argument {
+            case "--snapshot-dir":
+                snapshotDir = rest.next().map { URL(filePath: $0) }
+            case "--open-popover":
+                openPopover = true
+            default:
+                break
+            }
+        }
+    }
+}
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var statusItem: NSStatusItem?
-    private let popover = NSPopover()
+    private let options: LaunchOptions
+    private var statusItem: StatusItemController?
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = NSImage(
-            systemSymbolName: "music.note", accessibilityDescription: "yplayer")
-        item.button?.target = self
-        item.button?.action = #selector(togglePopover(_:))
-        statusItem = item
-        popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: Text("yplayer").padding())
+    init(options: LaunchOptions) {
+        self.options = options
     }
 
-    @objc private func togglePopover(_ sender: NSStatusBarButton) {
-        if popover.isShown {
-            popover.performClose(sender)
-        } else {
-            popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        if let dir = options.snapshotDir {
+            Task {
+                do {
+                    try await SnapshotRenderer.render(to: dir)
+                    exit(0)
+                } catch {
+                    FileHandle.standardError.write(Data("snapshot failed: \(error)\n".utf8))
+                    exit(1)
+                }
+            }
+            return
+        }
+        let model = AppModel(
+            client: ServiceClient(socketPath: ServiceClient.defaultSocketPath()),
+            store: LibraryStore())
+        model.start()
+        let statusItem = StatusItemController(model: model)
+        self.statusItem = statusItem
+        if options.openPopover {
+            Task {
+                try? await Task.sleep(for: .seconds(1))
+                statusItem.show()
+            }
         }
     }
 }

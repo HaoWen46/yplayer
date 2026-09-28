@@ -1,0 +1,119 @@
+import Foundation
+import YplayerKit
+
+/// The fixture library, player and lyrics behind `--snapshot-dir` (no socket).
+@MainActor
+enum DebugFixtures {
+    static let zutomayo = "ずっと真夜中でいいのに。 ZUTOMAYO"
+
+    static let tracks: [Track] = [
+        track(1, "ずっと真夜中でいいのに。『秒針を噛む』MV", zutomayo, 231, size: 4_402_117),
+        track(2, "ずっと真夜中でいいのに。『お勉強しといてよ』MV", zutomayo, 229, size: 4_371_560),
+        track(3, "ずっと真夜中でいいのに。『正しくなれない』MV", zutomayo, 247, size: 4_712_004),
+        track(4, "ずっと真夜中でいいのに。『あいつら全員同窓会』MV", zutomayo, 246, size: 4_690_338),
+        track(5, "ヨルシカ - 言って。(Music Video)", "ヨルシカ / n-buna Official", 258, size: 4_925_871),
+        track(
+            6, "아이유 (IU) - 밤편지 (Through the Night) Live Clip", "이지금 [IU Official]", 254,
+            size: 4_848_902),
+        track(
+            7,
+            "Nujabes — Aruarian Dance (Samurai Champloo Original Soundtrack, Remastered Extended "
+                + "Edition with Bonus Interlude)",
+            "Hydeout Productions", 238, size: nil, state: .downloading),
+        track(
+            8, "YOASOBI「夜に駆ける」Official Music Video", "Ayase / YOASOBI", 261, size: nil,
+            state: .failed),
+    ]
+
+    static let albums: [Album] = [
+        Album(
+            id: 1, name: "ずとまよ",
+            trackIDs: ["fixture-001", "fixture-002", "fixture-003", "fixture-004"],
+            createdAt: 1_790_000_000, lastUsedAt: 1_790_600_000),
+        Album(
+            id: 2, name: "Night Drive",
+            trackIDs: ["fixture-005", "fixture-006", "fixture-001", "fixture-007"],
+            createdAt: 1_790_100_000, lastUsedAt: 1_790_500_000),
+    ]
+
+    /// Synced lyrics for the playing track; 1:02 falls on the third line.
+    static let lyrics = LyricsResult.lines(
+        synced: true,
+        [
+            LyricLine(tMs: 52_000, text: "夜更けの窓に 映る灯り"),
+            LyricLine(tMs: 57_500, text: "数えきれない 秒の欠片"),
+            LyricLine(tMs: 62_000, text: "まだ眠れない 針の音だけ"),
+            LyricLine(tMs: 67_000, text: "明日のことは 後でいいから"),
+            LyricLine(tMs: 72_500, text: "静かなままで 歌っていて"),
+        ])
+
+    /// Playing the first track in the first album at 1:02 of 3:51.
+    static func player(at now: Date = .now) -> PlayerState {
+        PlayerState(
+            state: .playing, trackID: "fixture-001", context: .album(1), position: 62,
+            atMs: Int64(now.timeIntervalSince1970 * 1000), duration: 231, volume: 70, loopMode: .all
+        )
+    }
+
+    /// The fixture library, connected and playing, with track 7 downloading at 40 %.
+    static func store() -> LibraryStore {
+        let store = LibraryStore()
+        store.apply(.connected(SubscribeResult(player: player(), libraryVersion: 1)))
+        store.load(LibrarySnapshot(tracks: tracks, albums: albums, libraryVersion: 1))
+        store.apply(
+            .event(
+                .download(
+                    DownloadEvent(
+                        trackID: "fixture-007", phase: .downloading, bytes: 4_000_000,
+                        total: 10_000_000, error: nil))))
+        return store
+    }
+
+    /// A model over `store` whose client is never started.
+    static func model(_ store: LibraryStore) -> AppModel {
+        AppModel(client: ServiceClient(socketPath: "/dev/null"), store: store)
+    }
+
+    /// The fixture library after the connection dropped, retrying in 5 s.
+    static func disconnectedModel() -> AppModel {
+        let store = store()
+        store.apply(.disconnected(retryIn: .seconds(5)))
+        return model(store)
+    }
+
+    /// The fixture library asking to delete the playing track.
+    static func confirmDeleteModel() -> AppModel {
+        let model = model(store())
+        let track = tracks[0]
+        let size = (track.fileSize ?? 0).formatted(.byteCount(style: .file))
+        model.confirm = ConfirmRequest(
+            title: "Delete “\(track.title)” from your library?",
+            message: "The \(size) file moves to the Trash.", actionTitle: "Delete", action: {})
+        return model
+    }
+
+    /// Connected, nothing playing, no songs.
+    static func emptyModel() -> AppModel {
+        let store = LibraryStore()
+        let stopped = PlayerState(
+            state: .stopped, trackID: nil, context: nil, position: 0, atMs: 0, duration: nil,
+            volume: 100, loopMode: .none)
+        store.apply(.connected(SubscribeResult(player: stopped, libraryVersion: 0)))
+        store.load(LibrarySnapshot(tracks: [], albums: [], libraryVersion: 0))
+        return model(store)
+    }
+
+    private static func track(
+        _ n: Int, _ title: String, _ uploader: String, _ duration: Int, size: Int64?,
+        state: TrackState = .complete
+    ) -> Track {
+        let id = String(format: "fixture-%03d", n)
+        return Track(
+            id: id, title: title, uploader: uploader, duration: duration,
+            webpageURL: "https://www.youtube.com/watch?v=\(id)",
+            audioPath: state == .complete ? "/tmp/yplayer-fixtures/\(id)/audio.opus" : nil,
+            format: state == .complete ? "opus" : nil, fileSize: size,
+            addedAt: 1_790_600_000 - Int64(n) * 3_600, lastPlayed: nil, state: state,
+            thumbPath: nil)
+    }
+}
