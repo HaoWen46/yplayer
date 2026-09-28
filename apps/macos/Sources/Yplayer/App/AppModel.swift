@@ -154,6 +154,30 @@ final class AppModel {
         NSPasteboard.general.setString(link, forType: .string)
     }
 
+    func add(url: String, target: OrbTarget) async -> AddResult? {
+        let album: AlbumRef? =
+            switch target {
+            case .album(let id, _): .id(id)
+            case .inbox, .newAlbum: nil
+            }
+        do {
+            return try await client.send(
+                .add(url: url, album: album, play: true), as: AddResult.self)
+        } catch {
+            report(error)
+            return nil
+        }
+    }
+
+    func undoAdd(_ result: AddResult) async {
+        if !result.wasInAlbum {
+            await send(.albumRemove(albumID: result.albumID, trackID: result.trackID))
+        }
+        if result.wasNew {
+            await send(.trackDelete(trackID: result.trackID, toTrash: false))
+        }
+    }
+
     /// Replaces the store's library with the service's.
     private func reload() async {
         do {
