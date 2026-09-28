@@ -331,6 +331,14 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_thumb_path(&self, id: &str, thumb_path: &str) -> Result<(), DbError> {
+        let n = self
+            .conn
+            .prepare_cached("UPDATE tracks SET thumb_path = ?1 WHERE id = ?2")?
+            .execute(params![thumb_path, id])?;
+        found(n)
+    }
+
     pub fn rename_track(&self, id: &str, title: &str) -> Result<(), DbError> {
         let n = self
             .conn

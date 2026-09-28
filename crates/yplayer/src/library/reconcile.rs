@@ -16,6 +16,8 @@ const COVER_EXTS: &[&str] = &["webp", "jpg", "jpeg", "png"];
 pub struct ReconcileReport {
     pub imported: Vec<String>,
     pub removed: Vec<String>,
+    /// Existing tracks whose `thumb_path` was filled in (see `attach_covers`).
+    pub updated: Vec<String>,
     pub skipped_dirs: Vec<PathBuf>,
     pub deleted_partials: Vec<PathBuf>,
 }
@@ -96,7 +98,72 @@ pub fn reconcile(
         }
     }
 
+    report.updated = attach_covers(db, &report.removed)?;
     Ok(report)
+}
+
+/// Complete per-track-folder tracks without a `thumb_path`: use an existing `cover.*` in the
+/// folder, else extract the cover embedded in an mp3's ID3 tag (the old pipeline embedded it
+/// instead of writing a sidecar) to `cover.<png|jpg>`. Never overwrites a file. Returns the ids
+/// whose `thumb_path` was set.
+fn attach_covers(db: &Db, removed: &[String]) -> Result<Vec<String>> {
+    let mut updated = Vec::new();
+    for t in db.list_tracks()? {
+        if t.state != TrackState::Complete || t.thumb_path.is_some() || removed.contains(&t.id) {
+            continue;
+        }
+        let Some(audio) = t.audio_path.as_deref().map(Path::new) else {
+            continue;
+        };
+        let Some(dir) = audio.parent().filter(|d| dir_id8(d) == Some(id8(&t.id))) else {
+            continue;
+        };
+        let cover = match find_cover(dir) {
+            Some(existing) => existing,
+            None => match extract_embedded_cover(audio, dir) {
+                Some(written) => written,
+                None => continue,
+            },
+        };
+        db.set_thumb_path(&t.id, &cover.to_string_lossy())?;
+        updated.push(t.id);
+    }
+    Ok(updated)
+}
+
+fn find_cover(dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .find_map(|e| {
+            let path = e.path();
+            let is_cover = path.file_stem().is_some_and(|s| s == "cover")
+                && lower_ext(&path).is_some_and(|x| COVER_EXTS.contains(&x.as_str()));
+            is_cover.then_some(path)
+        })
+}
+
+/// The front cover (else the first picture) of an mp3's ID3 tag, written atomically to
+/// `<dir>/cover.<png|jpg>`; None when there is no tag, picture, or known image type.
+fn extract_embedded_cover(audio: &Path, dir: &Path) -> Option<PathBuf> {
+    if lower_ext(audio).as_deref() != Some("mp3") {
+        return None;
+    }
+    let tag = id3::Tag::read_from_path(audio).ok()?;
+    let picture = tag
+        .pictures()
+        .find(|p| p.picture_type == id3::frame::PictureType::CoverFront)
+        .or_else(|| tag.pictures().next())?;
+    let ext = match picture.mime_type.to_ascii_lowercase().as_str() {
+        "image/png" | "png" => "png",
+        "image/jpeg" | "image/jpg" | "jpg" | "jpeg" => "jpg",
+        _ => return None,
+    };
+    let dest = dir.join(format!("cover.{ext}"));
+    let tmp = dir.join(format!("cover.{ext}.tmp"));
+    fs::write(&tmp, &picture.data).ok()?;
+    fs::rename(&tmp, &dest).ok()?;
+    Some(dest)
 }
 
 /// Rows left in state downloading by a previous run: delete their partial
@@ -209,6 +276,7 @@ fn track_from_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use id3::TagLike;
     use std::time::Instant;
 
     fn setup() -> (tempfile::TempDir, Db) {
@@ -250,6 +318,102 @@ mod tests {
 
     fn none() -> HashSet<String> {
         HashSet::new()
+    }
+
+    /// An mp3 that is only an ID3v2.4 tag (plus a few audio bytes) carrying `pictures`.
+    fn mp3_with_pictures(path: &Path, pictures: &[(&str, id3::frame::PictureType, &[u8])]) {
+        fs::write(path, b"\xff\xfb\x90\x00audio").unwrap();
+        let mut tag = id3::Tag::new();
+        for (mime, kind, data) in pictures {
+            tag.add_frame(id3::frame::Picture {
+                mime_type: mime.to_string(),
+                picture_type: *kind,
+                description: String::new(),
+                data: data.to_vec(),
+            });
+        }
+        tag.write_to_path(path, id3::Version::Id3v24).unwrap();
+    }
+
+    #[test]
+    fn extracts_embedded_mp3_cover_once() {
+        use id3::frame::PictureType;
+        let (dir, db) = setup();
+        let folder = dir.path().join("ハム [ouLndhBR]");
+        fs::create_dir(&folder).unwrap();
+        let audio = folder.join("audio.mp3");
+        mp3_with_pictures(
+            &audio,
+            &[
+                ("image/jpeg", PictureType::Other, b"other"),
+                ("image/png", PictureType::CoverFront, b"\x89PNGfront"),
+            ],
+        );
+        write_meta(&folder, "ouLndhBRL4w", "ハム");
+        db.upsert_track(&row("ouLndhBRL4w", Some(&audio), TrackState::Complete))
+            .unwrap();
+
+        let report = reconcile(dir.path(), &db, &none()).unwrap();
+        assert_eq!(report.updated, ["ouLndhBRL4w"]);
+        let cover = folder.join("cover.png");
+        assert_eq!(fs::read(&cover).unwrap(), b"\x89PNGfront");
+        let t = db.get_track("ouLndhBRL4w").unwrap().unwrap();
+        assert_eq!(t.thumb_path, path_str(&cover));
+        assert!(!folder.join("cover.png.tmp").exists());
+
+        // thumb_path is set now: a second pass does nothing.
+        assert!(
+            reconcile(dir.path(), &db, &none())
+                .unwrap()
+                .updated
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn uses_existing_cover_and_never_overwrites_it() {
+        use id3::frame::PictureType;
+        let (dir, db) = setup();
+        let folder = dir.path().join("Song [abcdefgh]");
+        fs::create_dir(&folder).unwrap();
+        let audio = folder.join("audio.mp3");
+        mp3_with_pictures(
+            &audio,
+            &[("image/png", PictureType::CoverFront, b"embedded")],
+        );
+        fs::write(folder.join("cover.jpg"), b"sidecar").unwrap();
+        db.upsert_track(&row("abcdefghijk", Some(&audio), TrackState::Complete))
+            .unwrap();
+
+        let report = reconcile(dir.path(), &db, &none()).unwrap();
+        assert_eq!(report.updated, ["abcdefghijk"]);
+        assert_eq!(fs::read(folder.join("cover.jpg")).unwrap(), b"sidecar");
+        assert!(!folder.join("cover.png").exists());
+        let t = db.get_track("abcdefghijk").unwrap().unwrap();
+        assert_eq!(t.thumb_path, path_str(&folder.join("cover.jpg")));
+    }
+
+    #[test]
+    fn skips_mp3_without_picture_and_flat_legacy_files() {
+        let (dir, db) = setup();
+        let folder = dir.path().join("Song [abcdefgh]");
+        fs::create_dir(&folder).unwrap();
+        let bare = folder.join("audio.mp3");
+        mp3_with_pictures(&bare, &[]);
+        db.upsert_track(&row("abcdefghijk", Some(&bare), TrackState::Complete))
+            .unwrap();
+        let flat = dir.path().join("zyxwvutsrqp.mp3");
+        mp3_with_pictures(
+            &flat,
+            &[("image/png", id3::frame::PictureType::CoverFront, b"x")],
+        );
+        db.upsert_track(&row("zyxwvutsrqp", Some(&flat), TrackState::Complete))
+            .unwrap();
+
+        let report = reconcile(dir.path(), &db, &none()).unwrap();
+        assert!(report.updated.is_empty());
+        assert!(!folder.join("cover.png").exists());
+        assert!(!dir.path().join("cover.png").exists());
     }
 
     #[test]

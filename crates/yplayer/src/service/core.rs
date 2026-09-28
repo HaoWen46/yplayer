@@ -846,7 +846,12 @@ impl<S: MpvSpawner> Core<S> {
                 track_id: track_id.clone(),
             });
         }
-        if !report.imported.is_empty() || !report.removed.is_empty() {
+        for id in &report.updated {
+            if let Ok(Some(track)) = self.db.get_track(id) {
+                self.emit(Event::TrackUpsert { track });
+            }
+        }
+        if !report.imported.is_empty() || !report.removed.is_empty() || !report.updated.is_empty() {
             self.library_version += 1;
         }
     }
