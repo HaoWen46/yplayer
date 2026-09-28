@@ -138,7 +138,7 @@ While watching YouTube in Safari (or Chrome), the user drags the page URL onto a
 - Drop on "+ New…": activate the app and show a small name field (default "New Album"), then `album.create` + `add`.
 - Drop registration types: `.URL`, `.string`; read with `readObjects(forClasses: [NSURL.self])`, falling back to string parsing.
 - After a successful drop: Undo toast (6 s) anchored near the orb/status item.
-- Supported drag sources (research): Safari address field and page links, Chrome location icon and page links. Not supported: Chrome tabs (never produce an external drag). Safari tab drags: unknown until manually tested.
+- Supported drag sources (research): Safari address field and page links, Chrome location icon and page links. Not supported: Chrome tabs (never produce an external drag). Safari tab drags carry `public.url` and work like links (verified).
 
 ## Performance budget (acceptance criteria)
 
@@ -211,6 +211,14 @@ Each sub-project gets its own implementation plan and is completed and verified 
 - User-confirmed: the play/pause media key toggles playback; Control Center's Now Playing shows the current song from the app; the popover opens from the menu bar, Space toggles, Esc closes; search `はむ` finds `Ham`.
 - Toolchain notes: Swift tests need `-plugin-path …/plugins/testing`; the SwiftUI macros plugin is Xcode-only, so views use `@ViewState` (`typealias ViewState = SwiftUI.State`); `ImageRenderer` cannot draw glass, so snapshots render in an offscreen window captured with `screencapture -l`.
 - Fixed after verification: tracks from the old mp3 pipeline carried their cover only inside the ID3 tag; reconcile now writes it once to `cover.<png|jpg>` and sets `thumb_path` (all 8 legacy tracks show artwork in the app and Now Playing).
+
+## SP3 verification results (2026-09-29, installed app, real drags by the user)
+
+- Worked: Safari address-bar drag onto the core (played, "Added to Inbox" toast); Safari video-thumbnail link; Chrome site icon onto an album bubble; drag over full-screen Safari; Undo within 6 s removed the song; a non-YouTube link made the orb shake.
+- Not tried by the user: the "+ New…" name prompt (code-reviewed only).
+- Drag pasteboard types (logged with `--log-drags`): Safari address bar/links carry `public.url` + `public.utf8-plain-text` + `com.apple.linkpresentation.metadata`; Chrome carries `public.url` + `org.chromium.*`; a Safari tab carries `public.url` + `WebURLsWithTitlesPboardType` + `com.apple.Safari.bookmarkDictionaryList`, so tabs show the orb and drop like links.
+- Idle cost with the drag watcher running: 0.15 wakeups/s while a song plays, 43 MB (budget rows pass).
+- The center album is not repeated as a bubble (fixed after the first snapshots).
 
 ## Out of scope (v1)
 
