@@ -3,13 +3,13 @@ import Observation
 import SwiftUI
 import YplayerKit
 
-/// The menu-bar item and its popover. The popover's SwiftUI tree exists only while it is shown:
-/// the hosting controller is created in `show()` and released in `popoverDidClose`.
+/// The menu-bar item and its popover. The popover (window, layers and SwiftUI tree) exists only
+/// while it is shown: it is created in `show()` and released in `popoverDidClose`.
 @MainActor
 final class StatusItemController: NSObject, NSPopoverDelegate {
     private let model: AppModel
     private let item: NSStatusItem
-    private let popover = NSPopover()
+    private var popover: NSPopover?
     /// Whether the glyph currently shows `waveform`.
     private var showsPlaying = false
 
@@ -17,10 +17,6 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         self.model = model
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
-        popover.behavior = .transient
-        popover.animates = true
-        popover.contentSize = NSSize(width: 360, height: 560)
-        popover.delegate = self
         item.button?.image = Self.glyph(playing: false)
         item.button?.target = self
         item.button?.action = #selector(toggle(_:))
@@ -28,22 +24,39 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
     }
 
     func show() {
-        guard !popover.isShown, let button = item.button else { return }
+        guard popover == nil, let button = item.button else { return }
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentSize = NSSize(width: 360, height: 560)
+        popover.delegate = self
         let root = PopoverView(model: model)
-            .environment(\.closePopover) { [weak self] in self?.popover.performClose(nil) }
+            .environment(\.closePopover) { [weak self] in self?.close() }
         let content = NSHostingController(rootView: root)
         content.sizingOptions = .preferredContentSize
         popover.contentViewController = content
+        self.popover = popover
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         NSApp.activate()
     }
 
+    func close() {
+        popover?.performClose(nil)
+    }
+
+    /// Drops the popover and the artwork cache, then hands freed pages back to the system so the
+    /// closed app returns to its idle footprint.
     func popoverDidClose(_ notification: Notification) {
-        popover.contentViewController = nil
+        popover?.contentViewController = nil
+        popover = nil
+        Task {
+            await ArtworkLoader.shared.purge()
+            malloc_zone_pressure_relief(nil, 0)
+        }
     }
 
     @objc private func toggle(_ sender: NSStatusBarButton) {
-        if popover.isShown {
+        if let popover {
             popover.performClose(sender)
         } else {
             show()

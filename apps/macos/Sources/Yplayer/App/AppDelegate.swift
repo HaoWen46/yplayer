@@ -2,10 +2,12 @@ import AppKit
 import YplayerKit
 
 /// Debug flags: `--snapshot-dir <dir>` renders the debug states to PNGs and exits;
-/// `--open-popover` opens the popover 1 s after launch.
+/// `--open-popover` opens the popover 1 s after launch; `--cycle-popover <n>` opens and closes
+/// it `n` times and logs the memory footprint after each close (memory verification).
 struct LaunchOptions {
     var snapshotDir: URL?
     var openPopover = false
+    var cyclePopover = 0
 
     init(arguments: [String]) {
         var rest = arguments.dropFirst().makeIterator()
@@ -15,6 +17,8 @@ struct LaunchOptions {
                 snapshotDir = rest.next().map { URL(filePath: $0) }
             case "--open-popover":
                 openPopover = true
+            case "--cycle-popover":
+                cyclePopover = rest.next().flatMap { Int($0) } ?? 0
             default:
                 break
             }
@@ -56,6 +60,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task {
                 try? await Task.sleep(for: .seconds(1))
                 statusItem.show()
+            }
+        }
+        if options.cyclePopover > 0 {
+            let cycles = options.cyclePopover
+            Task {
+                for cycle in 1...cycles {
+                    try? await Task.sleep(for: .seconds(1))
+                    statusItem.show()
+                    try? await Task.sleep(for: .seconds(2))
+                    statusItem.close()
+                    try? await Task.sleep(for: .seconds(1))
+                    let megabytes = Double(Footprint.bytes()) / 1_048_576
+                    FileHandle.standardError.write(
+                        Data("cycle \(cycle): footprint \(Int(megabytes)) MB\n".utf8))
+                }
             }
         }
     }

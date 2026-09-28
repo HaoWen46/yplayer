@@ -28,6 +28,11 @@ actor ArtworkLoader {
         cache.setObject(image, forKey: key)
         return image
     }
+
+    /// Empties the cache (the popover closed; images reload quickly on the next open).
+    func purge() {
+        cache.removeAllObjects()
+    }
 }
 
 /// A track's artwork in a rounded square; `music.note` on a tinted rounded rect while loading or

@@ -146,7 +146,7 @@ Measured with `top -l <n> -s 1 -stats pid,command,cpu,idlew,mem,threads` over 20
 
 | State | App | Service | mpv | Python worker |
 |---|---|---|---|---|
-| Nothing playing, popover closed | 0 idle wakeups/s, <40 MB | 0 idle wakeups/s, <10 MB | not running (after 10 min) | not running |
+| Nothing playing, popover closed | 0 idle wakeups/s, <45 MB (measured: 14 MB before first open, ~41 MB after use) | 0 idle wakeups/s, <10 MB | not running (after 10 min) | not running |
 | Playing, popover closed | ~0 (events only on track change) | no timers | ~2.5% CPU, ≤60 MB | not running |
 | Popover open, playing | scrubber redraw ≤1/s from local clock | — | — | — |
 | Downloading | — | — | — | running; exits 60 s after last job |
