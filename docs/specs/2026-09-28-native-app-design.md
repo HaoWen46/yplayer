@@ -186,11 +186,21 @@ Each sub-project gets its own implementation plan and is completed and verified 
 ## Verification items (resolve during implementation, not assumptions)
 
 - `MPNowPlayingInfoCenter` accepts the app as Now Playing while audio comes from mpv in another process; fallback: enable mpv's own media-key/Now Playing integration and mirror metadata.
-- The audit's inferred end-of-track cut-off (mpv process exiting ~1.4 s before audio end under the avfoundation fallback) is gone with the persistent mpv; verify by recording output.
-- coreaudio `-50` init failure cause and the right `--ao`.
+- RESOLVED (SP1 T16): coreaudio rejects mpv's default planar-float format on macOS 27, so mpv fell back to avfoundation (2 s device + 2 s soft buffer): playlist handoffs fired ~3.5 s before the audio and a final track could lose its tail. Fix: mpv runs with `--audio-format=float` → coreaudio, 13 ms device latency, 0.2 s buffer; a 19.02 s clip now hands off at 18.89 s and plays in full standalone.
 - `appending://` end-of-file wait (~0.4–0.7 s measured) does not break gapless preload for a just-downloaded current track.
 - Safari tab drag types; global drag monitor behavior during Safari drags.
 - `swift test` availability with Command Line Tools.
+
+## SP1 verification results (2026-09-28, installed LaunchAgent, real library)
+
+- Idle (nothing loaded): service 0.00 % CPU, 0.00 idle wakeups/s, 3.1 MB; no mpv, no worker (TUI baseline: 2.35 wakeups/s).
+- Playing: service 0.00 wakeups/s, 3.5 MB; mpv 2.9 % CPU, 46 MB.
+- New URL (`yplay add --wait`, worker cold start included): first audio 3.7 s, downloaded 4.9 s; cache hit: `cached — playing` in 0.009 s with no worker request.
+- Handoff: one mpv process across tracks; natural handoff 0.13 s before end of file (coreaudio buffer).
+- Unavailable video: fails in 2.1 s with yt-dlp's message; no pip run. Undo mid-download: cancelled in 10 ms, partial folder removed. Delete: folder moved to Trash.
+- Lyrics: synced lines fetched in 3.8 s, cached reads instant; LRCLIB latency is erratic (see Lyrics).
+- Migration: 8 existing tracks preserved, DB backed up to `.yplayer.db.pre-service.bak`; a folder with `meta.json` but no audio was left untouched.
+- Known gaps: VBR mp3s from the old pipeline seek inaccurately (mpv estimates positions; a seek near the end can land at the end); a single player change emits 3–4 near-identical `player` events (clients should coalesce).
 
 ## Out of scope (v1)
 
