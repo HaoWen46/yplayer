@@ -1,12 +1,12 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::process::{Child, Command};
@@ -49,10 +49,25 @@ pub enum MpvEvent {
     Exited,
 }
 
+/// A command got no reply within `COMMAND_TIMEOUT`; carries the command name.
+#[derive(Debug)]
+pub struct CommandTimeout(pub String);
+
+impl std::fmt::Display for CommandTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mpv {} timed out", self.0)
+    }
+}
+
+impl std::error::Error for CommandTimeout {}
+
 #[allow(async_fn_in_trait)]
 pub trait MpvApi {
+    /// Errors with `CommandTimeout` when mpv does not answer in time.
     async fn command(&mut self, args: Vec<Value>) -> Result<Value>;
     async fn quit(&mut self);
+    /// SIGKILL, for a process that stopped answering.
+    async fn kill(&mut self);
     fn alive(&self) -> bool;
 }
 
@@ -135,10 +150,13 @@ impl MpvProcess {
         generation: u64,
         events: mpsc::UnboundedSender<(u64, MpvEvent)>,
     ) -> Result<MpvProcess> {
-        let _ = std::fs::remove_file(&opts.socket_path);
+        quit_orphan(&opts.socket_path).await;
 
         let mut cmd = Command::new("mpv");
-        cmd.arg("--idle=yes")
+        cmd.arg("--no-config")
+            .arg("--load-scripts=no")
+            .arg("--ytdl=no")
+            .arg("--idle=yes")
             .arg("--no-video")
             .arg("--no-terminal")
             .arg(format!("--input-ipc-server={}", opts.socket_path.display()))
@@ -231,6 +249,25 @@ impl MpvProcess {
     }
 }
 
+/// An mpv still serving `socket_path` was left behind by a killed service:
+/// ask it to quit and wait up to 1 s for it to close the connection. Then
+/// remove the socket file.
+async fn quit_orphan(socket_path: &Path) {
+    if let Ok(mut stream) = UnixStream::connect(socket_path).await
+        && stream
+            .write_all(b"{\"command\":[\"quit\"]}\n")
+            .await
+            .is_ok()
+    {
+        let mut buf = [0u8; 4096];
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+        })
+        .await;
+    }
+    let _ = std::fs::remove_file(socket_path);
+}
+
 impl MpvApi for MpvProcess {
     async fn command(&mut self, args: Vec<Value>) -> Result<Value> {
         if !self.alive() {
@@ -260,7 +297,7 @@ impl MpvApi for MpvProcess {
             Ok(Err(_)) => bail!("mpv exited during {name}"),
             Err(_) => {
                 self.pending.lock().unwrap().remove(&id);
-                bail!("mpv {name} timed out")
+                Err(CommandTimeout(name).into())
             }
         }
     }
@@ -276,6 +313,12 @@ impl MpvApi for MpvProcess {
         {
             let _ = self.child.kill().await;
         }
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+
+    async fn kill(&mut self) {
+        self.alive.store(false, Ordering::SeqCst);
+        let _ = self.child.kill().await;
         let _ = std::fs::remove_file(&self.socket_path);
     }
 
@@ -517,6 +560,53 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs real mpv"]
+    async fn real_mpv_spawn_quits_an_orphan_on_the_socket() {
+        let dir = tempfile::Builder::new()
+            .prefix("yphB")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let opts = test_opts(&dir);
+        // An mpv left behind by a killed service, still serving the socket.
+        let mut orphan = std::process::Command::new("mpv")
+            .args(["--no-config", "--idle=yes", "--no-video", "--no-terminal"])
+            .arg("--ao=null")
+            .arg(format!("--input-ipc-server={}", opts.socket_path.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::os::unix::net::UnixStream::connect(&opts.socket_path).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "orphan never listened"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut mpv = MpvProcess::spawn(&opts, 1, tx).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while orphan.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = orphan.kill();
+                let _ = orphan.wait();
+                mpv.quit().await;
+                panic!("the orphan mpv is still running");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let idle = mpv
+            .command(vec![json!("get_property"), json!("idle-active")])
+            .await
+            .unwrap();
+        assert_eq!(idle, json!(true));
+        mpv.quit().await;
     }
 
     #[tokio::test]

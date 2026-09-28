@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::player::mpv::{MpvApi, MpvEvent, MpvSpawner};
+use crate::player::mpv::{CommandTimeout, MpvApi, MpvEvent, MpvSpawner};
 use crate::player::queue::Queue;
 use crate::protocol::{ContextRef, PlayState, PlayerState};
 use crate::types::LoopMode;
@@ -15,6 +15,8 @@ use crate::types::LoopMode;
 const IDLE_SHUTDOWN: Duration = Duration::from_secs(600);
 /// `prev` restarts the current track instead when past this many seconds.
 const PREV_RESTARTS_AFTER: f64 = 3.0;
+/// Consecutive command timeouts after which mpv is killed.
+const MAX_TIMEOUTS: u32 = 2;
 
 pub trait TrackResolver {
     fn playable_path(&self, track_id: &str) -> Option<String>;
@@ -74,6 +76,12 @@ pub struct Engine<S: MpvSpawner> {
     mpv_paused: bool,
     idle_deadline: Option<Instant>,
     resume_point: Option<(String, f64)>,
+    /// Commands in a row that got no reply from the current process.
+    timeouts: u32,
+    /// The last spawn attempt failed.
+    spawn_failed: bool,
+    /// For the user: mpv died or hung.
+    warning: Option<String>,
 }
 
 impl<S: MpvSpawner> Engine<S> {
@@ -102,6 +110,9 @@ impl<S: MpvSpawner> Engine<S> {
             mpv_paused: false,
             idle_deadline: None,
             resume_point: None,
+            timeouts: 0,
+            spawn_failed: false,
+            warning: None,
         }
     }
 
@@ -115,8 +126,13 @@ impl<S: MpvSpawner> Engine<S> {
         let path = r
             .playable_path(start_id)
             .ok_or_else(|| EngineError::Unplayable(start_id.to_string()))?;
+        let saved = self.queue.clone();
         self.queue.start(context, order, start_id);
-        self.load(path, 0.0).await
+        let result = self.load(path, 0.0).await;
+        if result.is_err() {
+            self.queue = saved;
+        }
+        result
     }
 
     pub async fn pause(&mut self) -> Result<(), EngineError> {
@@ -139,15 +155,15 @@ impl<S: MpvSpawner> Engine<S> {
                 Ok(())
             }
             state => {
-                // mpv was quit while idle, or playback stopped: reload.
+                // mpv was quit while idle, died, or playback stopped: reload.
                 let (Some(id), Some(path)) = (
                     self.queue.current().map(str::to_string),
                     self.current_path.clone(),
                 ) else {
-                    return Ok(());
+                    return self.check_player().await;
                 };
-                let start = match self.resume_point.take() {
-                    Some((rid, pos)) if rid == id && state == PlayState::Paused => pos,
+                let start = match &self.resume_point {
+                    Some((rid, pos)) if *rid == id => *pos,
                     _ if state == PlayState::Paused => self.position,
                     _ => 0.0,
                 };
@@ -169,26 +185,43 @@ impl<S: MpvSpawner> Engine<S> {
             self.cmd(vec![json!("stop")]).await?;
         }
         self.mark_stopped();
+        self.resume_point = None;
         Ok(())
     }
 
     pub async fn next(&mut self, r: &impl TrackResolver) -> Result<(), EngineError> {
-        match self.step(Step::Next, r) {
-            Some(path) => self.load(path, 0.0).await,
-            None => self.stop().await,
+        if self.step_and_load(Step::Next, r).await? {
+            return Ok(());
         }
+        self.check_player().await?;
+        self.stop().await
     }
 
     pub async fn prev(&mut self, r: &impl TrackResolver) -> Result<(), EngineError> {
         if self.current_position() > PREV_RESTARTS_AFTER {
             return self.seek(0.0).await;
         }
-        match self.step(Step::Prev, r) {
-            Some(path) => self.load(path, 0.0).await,
-            None => self.seek(0.0).await,
+        if self.step_and_load(Step::Prev, r).await? {
+            return Ok(());
         }
+        self.check_player().await?;
+        self.seek(0.0).await
     }
 
+    /// The download of `id` failed: if it is the current track, move on to
+    /// the next one (or stop) instead of playing a failed track.
+    pub async fn track_failed(
+        &mut self,
+        id: &str,
+        r: &impl TrackResolver,
+    ) -> Result<(), EngineError> {
+        if self.queue.current() != Some(id) || self.state == PlayState::Stopped {
+            return Ok(());
+        }
+        self.next(r).await
+    }
+
+    /// `position` must be finite and ≥ 0 (the service checks).
     pub async fn seek(&mut self, position: f64) -> Result<(), EngineError> {
         if self.mpv_alive() {
             self.cmd(vec![json!("seek"), json!(position), json!("absolute")])
@@ -202,12 +235,15 @@ impl<S: MpvSpawner> Engine<S> {
         Ok(())
     }
 
+    /// `v` must be finite (the service checks); it is clamped to 0..=100
+    /// and kept only once mpv accepted it.
     pub async fn set_volume(&mut self, v: f64) -> Result<(), EngineError> {
-        self.volume = v;
+        let v = v.clamp(0.0, 100.0);
         if self.mpv_alive() {
             self.cmd(vec![json!("set_property"), json!("volume"), json!(v)])
                 .await?;
         }
+        self.volume = v;
         Ok(())
     }
 
@@ -291,8 +327,7 @@ impl<S: MpvSpawner> Engine<S> {
                     }
                     // The playlist ran out: nothing resolvable was preloaded.
                     self.preloaded = None;
-                    let next = self.step(Step::Auto, r);
-                    self.load_or_stop(next).await;
+                    self.advance_or_stop(Step::Auto, r).await;
                     true
                 }
                 "path" => match self.preloaded.take() {
@@ -317,8 +352,7 @@ impl<S: MpvSpawner> Engine<S> {
                 if reason != "error" || self.state == PlayState::Stopped {
                     return false;
                 }
-                let next = self.step(Step::Next, r);
-                self.load_or_stop(next).await;
+                self.advance_or_stop(Step::Next, r).await;
                 true
             }
             MpvEvent::FileLoaded => {
@@ -333,8 +367,13 @@ impl<S: MpvSpawner> Engine<S> {
                 true
             }
             MpvEvent::Exited => {
+                // Quits take `mpv` first, so this exit was unexpected:
+                // `resume` continues where it stopped.
+                let position = self.current_position();
                 self.mpv = None;
+                self.resume_point = self.queue.current().map(|id| (id.to_string(), position));
                 self.mark_stopped();
+                self.warning = Some("The player quit unexpectedly".into());
                 true
             }
         }
@@ -342,6 +381,11 @@ impl<S: MpvSpawner> Engine<S> {
 
     pub fn idle_deadline(&self) -> Option<Instant> {
         self.idle_deadline
+    }
+
+    /// A warning for the user, set when mpv died or hung.
+    pub fn take_warning(&mut self) -> Option<String> {
+        self.warning.take()
     }
 
     /// Quit the idle mpv, remembering where to resume.
@@ -384,7 +428,39 @@ impl<S: MpvSpawner> Engine<S> {
             .mpv
             .as_mut()
             .ok_or_else(|| EngineError::Mpv(anyhow!("mpv is not running")))?;
-        Ok(mpv.command(args).await?)
+        let result = mpv.command(args).await;
+        match &result {
+            Err(e) if e.is::<CommandTimeout>() => {
+                self.timeouts += 1;
+                if self.timeouts >= MAX_TIMEOUTS {
+                    self.kill_unresponsive().await;
+                }
+            }
+            _ => self.timeouts = 0,
+        }
+        Ok(result?)
+    }
+
+    /// mpv stopped answering: SIGKILL it and stop; the next command that
+    /// plays spawns a new one.
+    async fn kill_unresponsive(&mut self) {
+        if let Some(mut mpv) = self.mpv.take() {
+            mpv.kill().await;
+        }
+        self.mark_stopped();
+        self.warning = Some("The player stopped responding and was restarted".into());
+    }
+
+    /// When mpv is not running and the last spawn failed, try again, so a
+    /// command with nothing to load reports `player_unavailable` instead of
+    /// succeeding silently.
+    async fn check_player(&mut self) -> Result<(), EngineError> {
+        if !self.spawn_failed || self.mpv_alive() {
+            return Ok(());
+        }
+        self.ensure_mpv().await?;
+        self.arm_idle();
+        Ok(())
     }
 
     async fn ensure_mpv(&mut self) -> Result<(), EngineError> {
@@ -393,11 +469,13 @@ impl<S: MpvSpawner> Engine<S> {
         }
         self.mpv = None;
         self.generation += 1;
-        let mpv = self
+        self.timeouts = 0;
+        let spawned = self
             .spawner
             .spawn(self.volume, self.generation, self.events.clone())
-            .await?;
-        self.mpv = Some(mpv);
+            .await;
+        self.spawn_failed = spawned.is_err();
+        self.mpv = Some(spawned?);
         self.mpv_paused = false;
         self.preloaded = None;
         if self.queue.loop_mode() == LoopMode::Single {
@@ -430,12 +508,26 @@ impl<S: MpvSpawner> Engine<S> {
         Ok(())
     }
 
-    async fn load_or_stop(&mut self, path: Option<String>) {
-        let loaded = match path {
-            Some(path) => self.load(path, 0.0).await.is_ok(),
-            None => false,
+    /// Move the queue with `step` and load the track reached; `Ok(false)`
+    /// when there is none. The queue only moves when the load succeeds.
+    async fn step_and_load(
+        &mut self,
+        step: Step,
+        r: &impl TrackResolver,
+    ) -> Result<bool, EngineError> {
+        let saved = self.queue.clone();
+        let result = match self.step(step, r) {
+            Some(path) => self.load(path, 0.0).await.map(|()| true),
+            None => Ok(false),
         };
-        if !loaded {
+        if !matches!(result, Ok(true)) {
+            self.queue = saved;
+        }
+        result
+    }
+
+    async fn advance_or_stop(&mut self, step: Step, r: &impl TrackResolver) {
+        if !matches!(self.step_and_load(step, r).await, Ok(true)) {
             self.mark_stopped();
         }
     }
@@ -556,7 +648,7 @@ pub mod testing {
     use serde_json::{Value, json};
     use tokio::sync::mpsc;
 
-    use crate::player::mpv::{MpvApi, MpvEvent, MpvSpawner};
+    use crate::player::mpv::{CommandTimeout, MpvApi, MpvEvent, MpvSpawner};
 
     /// Shared by the spawner and every fake process it made.
     #[derive(Debug, Default)]
@@ -564,14 +656,18 @@ pub mod testing {
         pub commands: Vec<Vec<Value>>,
         pub spawns: u64,
         pub quits: u64,
+        pub kills: u64,
         pub generation: u64,
         pub alive: bool,
+        /// Every command times out, as if mpv stopped answering.
+        pub hung: bool,
         pub time_pos: f64,
         pub events: Option<mpsc::UnboundedSender<(u64, MpvEvent)>>,
     }
 
     /// Records every command; answers `get_property time-pos` from
-    /// `time_pos` and everything else with `null`. Emits nothing by itself.
+    /// `time_pos` and everything else with `null` (or times out while
+    /// `hung`). Emits nothing by itself.
     #[derive(Debug, Clone, Default)]
     pub struct FakeSpawner(pub Arc<Mutex<FakeLog>>);
 
@@ -590,6 +686,14 @@ pub mod testing {
 
         pub fn quits(&self) -> u64 {
             self.0.lock().unwrap().quits
+        }
+
+        pub fn kills(&self) -> u64 {
+            self.0.lock().unwrap().kills
+        }
+
+        pub fn set_hung(&self, hung: bool) {
+            self.0.lock().unwrap().hung = hung;
         }
 
         /// Generation of the latest spawn.
@@ -621,6 +725,10 @@ pub mod testing {
                 bail!("fake mpv is not running");
             }
             let mut log = self.log.lock().unwrap();
+            if log.hung {
+                let name = args.first().and_then(Value::as_str).unwrap_or("");
+                return Err(CommandTimeout(name.to_string()).into());
+            }
             let reply = if args == [json!("get_property"), json!("time-pos")] {
                 json!(log.time_pos)
             } else {
@@ -633,6 +741,14 @@ pub mod testing {
         async fn quit(&mut self) {
             let mut log = self.log.lock().unwrap();
             log.quits += 1;
+            if log.generation == self.generation {
+                log.alive = false;
+            }
+        }
+
+        async fn kill(&mut self) {
+            let mut log = self.log.lock().unwrap();
+            log.kills += 1;
             if log.generation == self.generation {
                 log.alive = false;
             }
@@ -1102,6 +1218,42 @@ mod tests {
             .unwrap();
         assert_eq!(fake.spawns(), 2);
         assert_eq!(fake.generation(), 2);
+        assert_eq!(e.state().state, PlayState::Playing);
+    }
+
+    #[tokio::test]
+    async fn two_consecutive_timeouts_kill_mpv_and_the_next_command_respawns() {
+        let fake = FakeSpawner::default();
+        let r = paths(&["a", "b"]);
+        let mut e = playing(&fake, LoopMode::None, &["a", "b"], "a", &r).await;
+
+        // A reply in between resets the count.
+        fake.set_hung(true);
+        assert!(e.pause().await.is_err());
+        fake.set_hung(false);
+        e.set_volume(40.0).await.unwrap();
+        fake.set_hung(true);
+        assert!(e.pause().await.is_err());
+        assert_eq!(fake.kills(), 0);
+        assert_eq!(e.state().state, PlayState::Playing);
+        assert_eq!(e.take_warning(), None);
+
+        // The second timeout in a row kills it; the queue stays on `a`.
+        assert!(e.next(&r).await.is_err());
+        assert_eq!(fake.kills(), 1);
+        let st = e.state();
+        assert_eq!(st.state, PlayState::Stopped);
+        assert_eq!(st.track_id.as_deref(), Some("a"));
+        assert_eq!(
+            e.take_warning().as_deref(),
+            Some("The player stopped responding and was restarted")
+        );
+
+        fake.set_hung(false);
+        fake.clear_commands();
+        e.toggle().await.unwrap();
+        assert_eq!(fake.spawns(), 2);
+        assert_eq!(fake.commands(), vec![loadfile(&p("a"), "replace")]);
         assert_eq!(e.state().state, PlayState::Playing);
     }
 

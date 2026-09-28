@@ -283,7 +283,17 @@ impl<S: MpvSpawner> Core<S> {
             Command::Stop => ok(self.engine.stop().await),
             Command::Next => ok(self.engine.next(&r).await),
             Command::Prev => ok(self.engine.prev(&r).await),
+            Command::Seek { position } if !(position.is_finite() && position >= 0.0) => {
+                Err(CmdError(
+                    ErrorCode::BadRequest,
+                    "position must be finite and ≥ 0".into(),
+                ))
+            }
             Command::Seek { position } => ok(self.engine.seek(position).await),
+            Command::Volume { value } if !value.is_finite() => Err(CmdError(
+                ErrorCode::BadRequest,
+                "volume must be finite".into(),
+            )),
             Command::Volume { value } => ok(self.engine.set_volume(value).await),
             Command::Loop { mode } => ok(self.engine.set_loop(mode, &r).await),
             Command::QueuePlayNext { track_id } => self.play_next(&track_id).await,
@@ -353,6 +363,9 @@ impl<S: MpvSpawner> Core<S> {
     /// Emit `player` when forced or the state differs from `prev`; save the
     /// session on a track change, pause or stop.
     fn player_changed(&mut self, prev: &PlayerState, force: bool) {
+        if let Some(message) = self.engine.take_warning() {
+            self.toast(Severity::Warn, message);
+        }
         let state = self.engine.state();
         if force || state != *prev {
             self.emit(Event::Player(state.clone()));
@@ -738,6 +751,11 @@ impl<S: MpvSpawner> Core<S> {
                     self.emit_download(&track_id, DownloadPhase::Cancelled, None, None, None);
                 } else {
                     let _ = self.db.mark_failed(&track_id);
+                    let r = Resolver {
+                        db: &self.db,
+                        downloads: &self.downloads,
+                    };
+                    let _ = self.engine.track_failed(&track_id, &r).await;
                     let _ = self.track_changed(&track_id);
                     self.emit_download(
                         &track_id,
