@@ -86,6 +86,7 @@ class FakeYDL:
 
     def extract_info(self, url: str, download: bool = True) -> dict:
         s = self.scripts[url]
+        s["params"] = self.params
         if s.get("error"):
             raise DownloadError(s["error"])
         info = {
@@ -97,20 +98,14 @@ class FakeYDL:
             "ext": "webm",
         }
 
-        def fill(tmpl: str, ext: str) -> str:
-            return (
-                tmpl.replace("%(title).150B", info["title"])
-                .replace("%(id).8s", info["id"][:8])
-                .replace("%(ext)s", ext)
-            )
-
-        path = fill(self.params["outtmpl"]["default"], "webm")
-        cover = fill(self.params["outtmpl"]["thumbnail"], "jpg")
+        path = (
+            self.params["outtmpl"]["default"]
+            .replace("%(title).150B", info["title"])
+            .replace("%(id).8s", info["id"][:8])
+            .replace("%(ext)s", "webm")
+        )
         track_dir = os.path.dirname(path)
         os.makedirs(track_dir, exist_ok=True)
-        if self.params.get("writethumbnail"):
-            with open(cover, "wb") as f:
-                f.write(b"jpg")
 
         chunks = s.get("chunks", 3)
         with open(path, "wb") as f:
@@ -139,12 +134,14 @@ class FakeYDL:
         })
         # meta.json must not exist until the audio is complete.
         s["meta_during_download"] = os.path.exists(os.path.join(track_dir, "meta.json"))
-        # Like yt-dlp: thumbnails stay on the parent; requested_downloads carries filepath.
-        return {
-            **info,
-            "thumbnails": [{"url": "https://i.ytimg.com/x.jpg", "filepath": cover}],
-            "requested_downloads": [{"filepath": path, "format_id": "251"}],
-        }
+        # Like yt-dlp: requested_downloads carries filepath, not keys equal to the parent's.
+        return {**info, "requested_downloads": [{"filepath": path, "format_id": "251"}]}
+
+
+def _fake_fetch_thumbnail(video_id: str, dest: str) -> bool:
+    with open(dest, "wb") as f:
+        f.write(b"jpg")
+    return True
 
 
 @pytest.fixture
@@ -155,7 +152,8 @@ def harness(monkeypatch, tmp_path):
     monkeypatch.setattr(worker, "sys", SimpleNamespace(stdin=stdin, stdout=stdout))
     monkeypatch.setattr(core, "YoutubeDL", FakeYDL)
     monkeypatch.setattr(FakeYDL, "scripts", {})
-    thread = threading.Thread(target=worker.main, daemon=True)
+    monkeypatch.setattr(core, "_fetch_thumbnail", _fake_fetch_thumbnail)
+    thread =threading.Thread(target=worker.main, daemon=True)
     thread.start()
     yield SimpleNamespace(
         stdin=stdin, stdout=stdout, thread=thread, cache=str(tmp_path), scripts=FakeYDL.scripts
@@ -218,7 +216,43 @@ def test_download_streams_started_then_throttled_progress_then_ok(harness, monke
     with open(meta_path, encoding="utf-8") as f:
         assert json.load(f) == meta
     assert harness.scripts[url]["meta_during_download"] is False
+    cover = os.path.join(track_dir, "cover.jpg")
+    assert os.path.isfile(cover)
+    assert os.stat(meta_path).st_mtime_ns >= os.stat(cover).st_mtime_ns
     assert os.stat(meta_path).st_mtime_ns >= os.stat(audio).st_mtime_ns
+
+
+def test_download_ydl_options_skip_manifests_and_thumbnails(harness):
+    url = "https://www.youtube.com/watch?v=HHHHHHHHHHH"
+    harness.scripts[url] = {"vid": "HHHHHHHHHHH", "title": "Opts"}
+    _download(harness, 1, url)
+    assert harness.stdout.terminal(1)["ok"] is True
+
+    params = harness.scripts[url]["params"]
+    assert params["extractor_args"] == {"youtube": {"skip": ["hls", "dash"]}}
+    assert "writethumbnail" not in params
+    assert set(params["outtmpl"]) == {"default"}
+
+
+def _thumb_fails(video_id: str, dest: str) -> bool:
+    return False
+
+
+def _thumb_raises(video_id: str, dest: str) -> bool:
+    raise OSError("no network")
+
+
+@pytest.mark.parametrize("fetch", [_thumb_fails, _thumb_raises])
+def test_thumbnail_failure_is_not_fatal(harness, monkeypatch, fetch):
+    monkeypatch.setattr(core, "_fetch_thumbnail", fetch)
+    url = "https://www.youtube.com/watch?v=IIIIIIIIIII"
+    harness.scripts[url] = {"vid": "IIIIIIIIIII", "title": "No cover"}
+    _download(harness, 1, url)
+
+    done = harness.stdout.terminal(1)
+    assert done["ok"] is True
+    assert done["thumb"] is None
+    assert os.path.isfile(os.path.join(done["dir"], "meta.json"))
 
 
 def test_cancel_during_progress(harness):
@@ -336,6 +370,7 @@ def test_live_download(tmp_path):
     assert [m.get("event") for m in msgs].index("started") < len(msgs) - 1
     names = os.listdir(done["dir"])
     assert {"audio.webm", "audio.m4a"} & set(names)
-    assert any(n.startswith("cover.") for n in names)
+    assert "cover.jpg" in names
+    assert done["thumb"] == os.path.join(done["dir"], "cover.jpg")
     assert "meta.json" in names
     print(f"\nlive download: started after {started_at:.2f}s, done after {total:.2f}s")

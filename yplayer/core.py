@@ -366,6 +366,21 @@ def _track_meta(info_obj: dict) -> dict:
         "webpage_url": info_obj.get("webpage_url"),
     }
 
+def _fetch_thumbnail(video_id: str, dest: str) -> bool:
+    """Save YouTube's hqdefault.jpg for video_id to dest; False on any failure."""
+    url = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "yplayer (https://github.com/HaoWen46/yplayer)"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = resp.read()
+        with open(dest, "wb") as f:
+            f.write(data)
+    except Exception:
+        return False
+    return True
+
 def download_track(url: str, cache_dir: str, *, emit, cancel_event) -> dict:
     """
     Download the native best-audio stream into <cache>/<Title> [<id8>]/ with one
@@ -415,11 +430,11 @@ def download_track(url: str, cache_dir: str, *, emit, cancel_event) -> dict:
     ydl_opts = {
         "format": "bestaudio",
         "nopart": True,
-        "writethumbnail": True,
         "outtmpl": {
             "default": os.path.join(track_tmpl, "audio.%(ext)s"),
-            "thumbnail": os.path.join(track_tmpl, "cover.%(ext)s"),
         },
+        # The direct https audio formats suffice; skip the HLS/DASH manifest fetches.
+        "extractor_args": {"youtube": {"skip": ["hls", "dash"]}},
         "quiet": True,
         "no_warnings": True,
         # Keep stdout pure JSON for the worker protocol.
@@ -437,14 +452,20 @@ def download_track(url: str, cache_dir: str, *, emit, cancel_event) -> dict:
     rd = {**info_dict, **info_dict["requested_downloads"][0]}
     path = os.path.abspath(rd["filepath"])
     track_dir = os.path.dirname(path)
-    thumb = next((t["filepath"] for t in rd.get("thumbnails") or [] if t.get("filepath")), None)
+    # Cover after the audio (yt-dlp's writethumbnail probes thumbnails serially
+    # before the first audio byte); a missing cover is not an error.
+    cover = os.path.join(track_dir, "cover.jpg")
+    try:
+        thumb = cover if _fetch_thumbnail(rd["id"], cover) else None
+    except Exception:
+        thumb = None
     meta = _track_meta(rd)
     save_sidecar(cache_dir, meta, track_dir=track_dir)
     return {
         "path": path,
         "dir": track_dir,
         "meta": meta,
-        "thumb": os.path.abspath(thumb) if thumb else None,
+        "thumb": thumb,
         "format": os.path.splitext(path)[1].lstrip("."),
         "file_size": os.path.getsize(path),
     }
