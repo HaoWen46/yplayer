@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
+
 use crate::download::worker::{JobId, WorkerMsg};
+use crate::library::safe_fs::{self, RemoveError, RemoveMode};
 use crate::protocol::ErrorCode;
 use crate::types::Track;
 use crate::ytid::UrlError;
@@ -148,52 +151,103 @@ pub fn url_error(e: UrlError) -> (ErrorCode, &'static str) {
     }
 }
 
-/// Existing files of a track: its per-track folder (parent of `audio_path`
-/// named `… [<id8>]`), else a legacy flat audio file plus `<id>.json`.
-pub fn track_files(track: &Track) -> Vec<PathBuf> {
+/// Remove a track's existing files: its per-track folder (parent of
+/// `audio_path` named `… [<id8>]`) through `safe_fs`, else a legacy flat
+/// audio file plus its `<audio stem>.json`, each only if it is a file inside
+/// `cache_dir`. Refused paths are logged and left alone.
+pub fn remove_track_files(cache_dir: &Path, track: &Track, to_trash: bool) -> anyhow::Result<()> {
     let Some(audio) = track.audio_path.as_deref().map(Path::new) else {
-        return Vec::new();
+        return Ok(());
     };
     let id8: String = track.id.chars().take(8).collect();
     let suffix = format!("[{id8}]");
-    let files = match audio.parent() {
+    match audio.parent() {
         Some(dir)
             if dir
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.ends_with(&suffix)) =>
         {
-            vec![dir.to_path_buf()]
+            if std::fs::symlink_metadata(dir).is_err() {
+                return Ok(());
+            }
+            let mode = RemoveMode::Delete { to_trash };
+            match safe_fs::remove_track_dir(cache_dir, dir, &track.id, mode) {
+                Err(RemoveError::Refused(why)) => {
+                    eprintln!("not removing {}: {why}", dir.display());
+                }
+                r => r.with_context(|| format!("removing {}", dir.display()))?,
+            }
         }
-        _ => vec![
-            audio.to_path_buf(),
-            audio.with_file_name(format!("{}.json", track.id)),
-        ],
-    };
-    files.into_iter().filter(|p| p.exists()).collect()
-}
-
-/// Move `path` to the Trash, or delete it permanently.
-pub fn remove_path(path: &Path, to_trash: bool) -> anyhow::Result<()> {
-    if to_trash {
-        trash_context().delete(path)?;
-    } else if path.is_dir() {
-        std::fs::remove_dir_all(path)?;
-    } else {
-        std::fs::remove_file(path)?;
+        _ => {
+            for path in [audio.to_path_buf(), audio.with_extension("json")] {
+                if std::fs::symlink_metadata(&path).is_err() {
+                    continue;
+                }
+                if !safe_fs::file_in_cache(cache_dir, &path) {
+                    eprintln!(
+                        "not removing {}: not a file inside the cache",
+                        path.display()
+                    );
+                    continue;
+                }
+                safe_fs::remove_path(&path, to_trash)
+                    .with_context(|| format!("removing {}", path.display()))?;
+            }
+        }
     }
     Ok(())
 }
 
-/// On macOS: NSFileManager, never the Finder/AppleScript method.
-fn trash_context() -> trash::TrashContext {
-    #[cfg(target_os = "macos")]
-    {
-        use trash::macos::{DeleteMethod, TrashContextExtMacos};
-        let mut ctx = trash::TrashContext::default();
-        ctx.set_delete_method(DeleteMethod::NsFileManager);
-        ctx
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::TrackState;
+    use std::fs;
+
+    fn flat(id: &str, audio: &Path) -> Track {
+        Track {
+            id: id.to_string(),
+            title: id.to_string(),
+            uploader: None,
+            duration: None,
+            webpage_url: None,
+            audio_path: Some(audio.to_string_lossy().into_owned()),
+            format: Some("mp3".into()),
+            file_size: None,
+            added_at: None,
+            last_played: None,
+            state: TrackState::Complete,
+            thumb_path: None,
+        }
     }
-    #[cfg(not(target_os = "macos"))]
-    trash::TrashContext::default()
+
+    #[test]
+    fn deleting_a_legacy_track_never_touches_files_outside_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let outside = root.path().join("outside");
+        fs::create_dir(&cache).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let keep = outside.join("keep.json");
+        fs::write(&keep, b"keep").unwrap();
+
+        // The sidecar is `<audio stem>.json`, whatever the id says.
+        let audio = cache.join("flat0000001.mp3");
+        fs::write(&audio, b"x").unwrap();
+        fs::write(cache.join("flat0000001.json"), b"{}").unwrap();
+        remove_track_files(&cache, &flat("../outside/keep", &audio), false).unwrap();
+        assert!(!audio.exists());
+        assert!(!cache.join("flat0000001.json").exists());
+        assert!(keep.exists());
+
+        // A flat file outside the cache is left alone, sidecar included.
+        let far = outside.join("song.mp3");
+        fs::write(&far, b"x").unwrap();
+        fs::write(outside.join("song.json"), b"{}").unwrap();
+        remove_track_files(&cache, &flat("song0000001", &far), false).unwrap();
+        assert!(far.exists());
+        assert!(outside.join("song.json").exists());
+        assert!(keep.exists());
+    }
 }

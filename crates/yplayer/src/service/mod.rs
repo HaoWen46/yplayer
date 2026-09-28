@@ -39,11 +39,12 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         socket_path,
         state_dir,
     } = opts;
+    owner_only_umask();
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("creating {}", state_dir.display()))?;
     std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))?;
+    let (db, rebuilt) = open_db(&config)?;
     let listener = bind_socket(&socket_path).await?;
-    let db = Db::open(&config.db_path(), &config.cache_dir)?;
     recover_interrupted(&config.cache_dir, &db)?;
 
     let spawner = ProcessSpawner {
@@ -87,6 +88,9 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         http,
         updater,
     });
+    if rebuilt {
+        core.warn_after_startup(DB_REBUILT);
+    }
     core.start();
 
     let mut term = signal(SignalKind::terminate())?;
@@ -99,6 +103,50 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     };
     run(core, inbox, listener, socket_path, stop).await;
     Ok(())
+}
+
+const DB_REBUILT: &str = "Your library database was damaged and has been rebuilt from your music folder; albums could not be recovered.";
+
+/// Files the service creates (DB, session file, logs, mpv socket) are
+/// owner-only.
+fn owner_only_umask() {
+    #[cfg(target_os = "macos")]
+    type Mode = u16;
+    #[cfg(not(target_os = "macos"))]
+    type Mode = u32;
+    unsafe extern "C" {
+        fn umask(mask: Mode) -> Mode;
+    }
+    // SAFETY: umask only swaps the process's file-mode creation mask.
+    unsafe {
+        umask(0o077);
+    }
+}
+
+/// Open the library DB. One that is not a valid database is moved (with its
+/// `-wal`/`-shm`) to `.yplayer.db.corrupt-<unix time>` and replaced by a
+/// fresh one, which reconcile fills from the folders; `true` says so.
+fn open_db(config: &Config) -> Result<(Db, bool)> {
+    let path = config.db_path();
+    match Db::open(&path, &config.cache_dir) {
+        Err(e) if e.is_corrupt() => {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let aside = format!("{}.corrupt-{secs}", path.display());
+            eprintln!("{}: {e}; moving it to {aside}", path.display());
+            std::fs::rename(&path, &aside).with_context(|| format!("moving {}", path.display()))?;
+            for suffix in ["-wal", "-shm"] {
+                let side = format!("{}{suffix}", path.display());
+                if Path::new(&side).exists() {
+                    std::fs::rename(&side, format!("{aside}{suffix}"))
+                        .with_context(|| format!("moving {side}"))?;
+                }
+            }
+            Ok((Db::open(&path, &config.cache_dir)?, true))
+        }
+        other => Ok((other?, false)),
+    }
 }
 
 /// `YPLAY_MPV_EXTRA_ARGS`, whitespace-split, appended to mpv's arguments.
@@ -650,9 +698,10 @@ mod tests {
                 let mut sub = Client::connect(&svc.sock).await;
                 sub.call(json!({"id": 1, "cmd": "subscribe"})).await;
 
-                // `sub` reads nothing while ~1.6 MB of events are produced.
+                // `sub` reads nothing while ~120 KB of events are produced
+                // (names are capped at 200 characters).
                 let mut c = Client::connect(&svc.sock).await;
-                let pad = "x".repeat(4000);
+                let pad = "x".repeat(196);
                 for i in 0..400 {
                     let resp = c
                         .call(
@@ -709,9 +758,10 @@ mod tests {
 
     // Speaks worker protocol v2. The video id's first four characters pick
     // the behaviour: `okay` completes at once; `hold` waits for a
-    // `release-<id>` file (or a cancel); `fail` fails after `started`;
-    // `flak` fails the first time and completes afterwards. Spawns and
-    // cancels are appended to files next to the script.
+    // `release-<id>` file (or a cancel); `lagc` is `hold` whose cancel only
+    // ends once released; `fail` fails after `started`; `flak` fails the
+    // first time and completes afterwards. Spawns and cancels are appended
+    // to files next to the script.
     const FAKE_WORKER: &str = r#"
 import json, os, sys, threading, time
 
@@ -765,9 +815,13 @@ def download(req):
         send({"id": n, "ok": False, "error": "ERROR: [youtube] " + vid + ": Video unavailable",
               "cancelled": False})
         return
-    if kind == "hold":
+    if kind in ("hold", "lagc"):
         outcome = held(n, vid)
         if outcome == "cancelled":
+            deadline = time.time() + 30
+            while kind == "lagc" and time.time() < deadline and not os.path.exists(
+                    os.path.join(HERE, "release-" + vid)):
+                time.sleep(0.02)
             send({"id": n, "ok": False, "error": "cancelled", "cancelled": True})
             return
         if outcome == "timeout":
@@ -1166,6 +1220,140 @@ while True:
                 );
                 assert!(!a_dir.exists());
                 assert!(Path::new(&seeded_path(&svc, B)).exists());
+                svc.stop().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn readd_after_undo_while_old_job_ends_completes_new_download() {
+        const V: &str = "lagcaaaaaaa";
+        let started = |ev: &Value| is_download(ev, V, "downloading") && ev["bytes"].is_null();
+        LocalSet::new()
+            .run_until(async {
+                let mut svc = start_with_worker().await;
+                let mut sub = Client::subscribed(&svc.sock).await;
+                let mut c = Client::connect(&svc.sock).await;
+                let add = json!({"id": 1, "cmd": "add", "url": format!("https://youtu.be/{V}"),
+                    "album": null, "play": false});
+
+                c.call(add.clone()).await;
+                sub.until(started).await;
+                let resp = c
+                    .call(json!({"id": 2, "cmd": "track.delete", "track_id": V, "to_trash": false}))
+                    .await;
+                assert_eq!(resp["ok"], json!(true), "{resp}");
+                // The old job ends only once released: re-add while it is still ending.
+                c.call(add).await;
+                sub.until(started).await;
+                svc.release(V);
+                let (mut done, mut cancelled) = (false, false);
+                while !(done && cancelled) {
+                    let ev = sub.recv().await;
+                    done |= is_download(&ev, V, "done");
+                    cancelled |= is_download(&ev, V, "cancelled");
+                }
+
+                let dir = svc.track_dir(V);
+                assert!(dir.join("audio.webm").is_file());
+                assert!(dir.join("meta.json").is_file());
+                let lib = c.call(json!({"id": 3, "cmd": "library.get"})).await;
+                let t = track(&lib, V).unwrap();
+                assert_eq!(t["state"], json!("complete"));
+                assert_eq!(t["audio_path"], json!(dir.join("audio.webm")));
+                svc.stop().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn garbage_db_is_moved_aside_and_library_rebuilt() {
+        LocalSet::new()
+            .run_until(async {
+                let dir = tempfile::tempdir().unwrap();
+                let config = config(dir.path());
+                std::fs::create_dir_all(&config.cache_dir).unwrap();
+                let garbage: Vec<u8> = (0..8192u32).map(|i| (i * 7 % 251) as u8).collect();
+                std::fs::write(config.db_path(), &garbage).unwrap();
+                let folder = config.cache_dir.join(format!("Song {A} [aaaaaaaa]"));
+                std::fs::create_dir(&folder).unwrap();
+                std::fs::write(folder.join("audio.opus"), b"x").unwrap();
+                std::fs::write(
+                    folder.join("meta.json"),
+                    format!(r#"{{"id": "{A}", "title": "Rebuilt"}}"#),
+                )
+                .unwrap();
+
+                let (db, rebuilt) = open_db(&config).unwrap();
+                assert!(rebuilt);
+                let aside: Vec<PathBuf> = std::fs::read_dir(&config.cache_dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .filter(|p| {
+                        p.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".yplayer.db.corrupt-")
+                    })
+                    .collect();
+                assert_eq!(aside.len(), 1, "{aside:?}");
+                assert_eq!(std::fs::read(&aside[0]).unwrap(), garbage);
+
+                let sock = PathBuf::from(format!(
+                    "/tmp/yphA-{}-{}.sock",
+                    std::process::id(),
+                    SOCK_SEQ.fetch_add(1, Ordering::SeqCst)
+                ));
+                let listener = bind_socket(&sock).await.unwrap();
+                let fake = FakeSpawner::default();
+                let worker = WorkerHandle::spawn(WorkerOptions {
+                    worker_python: None,
+                    worker_cmd: None,
+                    log_path: dir.path().join("worker.log"),
+                    idle_timeout: WORKER_IDLE,
+                    inactivity_timeout: WORKER_INACTIVITY,
+                });
+                let http: Arc<dyn HttpGet> = Arc::new(CurlHttp {
+                    user_agent: USER_AGENT.to_string(),
+                });
+                let (mut core, inbox) = Core::new(CoreDeps {
+                    config,
+                    db,
+                    spawner: fake.clone(),
+                    worker,
+                    http,
+                    updater: None,
+                });
+                core.warn_after_startup(DB_REBUILT);
+                core.start();
+                let (stop, stopped) = oneshot::channel::<()>();
+                let task = tokio::task::spawn_local(run(
+                    core,
+                    inbox,
+                    listener,
+                    sock.clone(),
+                    async move {
+                        let _ = stopped.await;
+                    },
+                ));
+                let mut svc = Svc {
+                    dir,
+                    sock,
+                    fake,
+                    stop: Some(stop),
+                    task: Some(task),
+                };
+
+                let mut sub = Client::subscribed(&svc.sock).await;
+                let evs = sub.until(|ev| ev["event"] == "toast").await;
+                assert_eq!(
+                    evs.last().unwrap(),
+                    &json!({"event": "toast", "severity": "warn", "message": DB_REBUILT})
+                );
+                let mut c = Client::connect(&svc.sock).await;
+                let lib = c.call(json!({"id": 1, "cmd": "library.get"})).await;
+                assert_eq!(track(&lib, A).unwrap()["title"], json!("Rebuilt"));
+                assert!(aside[0].exists());
                 svc.stop().await;
             })
             .await;

@@ -1,10 +1,12 @@
 use anyhow::Result;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::db::Db;
+use super::safe_fs::{self, RemoveMode};
 use crate::types::{Track, TrackState};
 
 const AUDIO_EXTS: &[&str] = &[
@@ -15,6 +17,8 @@ const COVER_EXTS: &[&str] = &["webp", "jpg", "jpeg", "png"];
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReconcileReport {
     pub imported: Vec<String>,
+    /// Rows whose audio file was gone, pointed at their renamed folder.
+    pub relinked: Vec<String>,
     pub removed: Vec<String>,
     /// Existing tracks whose `thumb_path` was filled in (see `attach_covers`).
     pub updated: Vec<String>,
@@ -23,8 +27,9 @@ pub struct ReconcileReport {
 }
 
 /// Bring the DB in line with the cache dir: import entries no row references,
-/// drop partial download dirs, and delete complete rows whose file is gone.
-/// Never deletes a directory that has a `meta.json`.
+/// relink rows whose folder was renamed, drop partial download dirs, and
+/// delete complete rows whose file is gone. Never deletes a directory that
+/// has a `meta.json`; an error on one folder is logged and the scan goes on.
 pub fn reconcile(
     cache_dir: &Path,
     db: &Db,
@@ -34,7 +39,10 @@ pub fn reconcile(
     let mut ids: HashSet<String> = HashSet::with_capacity(tracks.len());
     // Per-track rows make their folder known, flat rows their file.
     let mut known: HashSet<PathBuf> = HashSet::with_capacity(tracks.len() * 2);
-    let mut partial_id8s: HashSet<&str> = HashSet::new();
+    // id8 → id of rows whose leftover folder is a partial download.
+    let mut partials: HashMap<&str, &str> = HashMap::new();
+    // Complete rows whose audio file is gone: relinked or deleted.
+    let mut missing: HashSet<&str> = HashSet::new();
     for t in &tracks {
         ids.insert(t.id.clone());
         if let Some(p) = &t.audio_path {
@@ -43,11 +51,14 @@ pub fn reconcile(
                 known.insert(parent.to_path_buf());
             }
             known.insert(p.to_path_buf());
+            if t.state == TrackState::Complete && !p.exists() {
+                missing.insert(&t.id);
+            }
         }
         if matches!(t.state, TrackState::Downloading | TrackState::Failed)
             && !in_flight.contains(&t.id)
         {
-            partial_id8s.insert(id8(&t.id));
+            partials.insert(id8(&t.id), &t.id);
         }
     }
 
@@ -65,6 +76,14 @@ pub fn reconcile(
             let meta_path = path.join("meta.json");
             if meta_path.exists() {
                 match import_folder(&path, &meta_path) {
+                    Some(track) if missing.remove(track.id.as_str()) => {
+                        db.relink_track(
+                            &track.id,
+                            track.audio_path.as_deref().unwrap_or(""),
+                            track.thumb_path.as_deref(),
+                        )?;
+                        report.relinked.push(track.id);
+                    }
                     Some(track) => {
                         if ids.insert(track.id.clone()) {
                             db.upsert_track(&track)?;
@@ -73,9 +92,14 @@ pub fn reconcile(
                     }
                     None => report.skipped_dirs.push(path),
                 }
-            } else if dir_id8(&path).is_some_and(|s| partial_id8s.contains(s)) {
-                fs::remove_dir_all(&path)?;
-                report.deleted_partials.push(path);
+            } else if let Some(id) = dir_id8(&path).and_then(|s| partials.get(s)) {
+                match safe_fs::remove_track_dir(cache_dir, &path, id, RemoveMode::Cleanup) {
+                    Ok(()) => report.deleted_partials.push(path),
+                    Err(e) => {
+                        eprintln!("reconcile: not removing {}: {e}", path.display());
+                        report.skipped_dirs.push(path);
+                    }
+                }
             } else {
                 report.skipped_dirs.push(path);
             }
@@ -89,10 +113,7 @@ pub fn reconcile(
     }
 
     for t in &tracks {
-        if t.state == TrackState::Complete
-            && let Some(p) = &t.audio_path
-            && !Path::new(p).exists()
-        {
+        if missing.contains(t.id.as_str()) {
             db.delete_track(&t.id)?;
             report.removed.push(t.id.clone());
         }
@@ -102,14 +123,15 @@ pub fn reconcile(
     Ok(report)
 }
 
-/// Complete per-track-folder tracks without a `thumb_path`: use an existing `cover.*` in the
-/// folder, else extract the cover embedded in an mp3's ID3 tag (the old pipeline embedded it
-/// instead of writing a sidecar) to `cover.<png|jpg>`. Never overwrites a file. Returns the ids
-/// whose `thumb_path` was set.
+/// Complete per-track-folder tracks whose `thumb_path` is unset: use an existing `cover.*` in
+/// the folder, else extract the cover embedded in an mp3's ID3 tag (the old pipeline embedded
+/// it instead of writing a sidecar) to `cover.<png|jpg>`, else store `''` (checked, no cover)
+/// so later passes skip it. Never overwrites a file. Returns the ids whose `thumb_path` was set
+/// to a cover.
 fn attach_covers(db: &Db, removed: &[String]) -> Result<Vec<String>> {
     let mut updated = Vec::new();
-    for t in db.list_tracks()? {
-        if t.state != TrackState::Complete || t.thumb_path.is_some() || removed.contains(&t.id) {
+    for t in db.tracks_without_thumb_check()? {
+        if removed.contains(&t.id) {
             continue;
         }
         let Some(audio) = t.audio_path.as_deref().map(Path::new) else {
@@ -122,7 +144,10 @@ fn attach_covers(db: &Db, removed: &[String]) -> Result<Vec<String>> {
             Some(existing) => existing,
             None => match extract_embedded_cover(audio, dir) {
                 Some(written) => written,
-                None => continue,
+                None => {
+                    db.set_thumb_path(&t.id, "")?;
+                    continue;
+                }
             },
         };
         db.set_thumb_path(&t.id, &cover.to_string_lossy())?;
@@ -161,13 +186,20 @@ fn extract_embedded_cover(audio: &Path, dir: &Path) -> Option<PathBuf> {
     };
     let dest = dir.join(format!("cover.{ext}"));
     let tmp = dir.join(format!("cover.{ext}.tmp"));
-    fs::write(&tmp, &picture.data).ok()?;
+    // create_new: an existing file or symlink at `tmp` is never followed.
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(&picture.data))
+        .ok()?;
     fs::rename(&tmp, &dest).ok()?;
     Some(dest)
 }
 
 /// Rows left in state downloading by a previous run: delete their partial
-/// `[<id8>]` folder and mark them failed. Returns the affected ids.
+/// `[<id8>]` folder and mark them failed. Returns the affected ids. A folder
+/// that cannot be removed is logged and left.
 pub fn recover_interrupted(cache_dir: &Path, db: &Db) -> Result<Vec<String>> {
     let mut ids = Vec::new();
     for t in db.tracks_in_state(TrackState::Downloading)? {
@@ -176,8 +208,9 @@ pub fn recover_interrupted(cache_dir: &Path, db: &Db) -> Result<Vec<String>> {
             && dir_id8(dir) == Some(id8(&t.id))
             && dir.is_dir()
             && !dir.join("meta.json").exists()
+            && let Err(e) = safe_fs::remove_track_dir(cache_dir, dir, &t.id, RemoveMode::Cleanup)
         {
-            fs::remove_dir_all(dir)?;
+            eprintln!("recover: not removing {}: {e}", dir.display());
         }
         db.mark_failed(&t.id)?;
         ids.push(t.id);
@@ -209,6 +242,25 @@ fn lower_ext(path: &Path) -> Option<String> {
         .map(|e| e.to_lowercase())
 }
 
+/// `track` if its id is a YouTube video id (`[A-Za-z0-9_-]{11}`); otherwise
+/// logged and dropped.
+fn valid_id(track: Track, path: &Path) -> Option<Track> {
+    let id = track.id.as_bytes();
+    if id.len() == 11
+        && id
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+    {
+        return Some(track);
+    }
+    eprintln!(
+        "reconcile: skipping {}: {:?} is not a video id",
+        path.display(),
+        track.id
+    );
+    None
+}
+
 /// A per-track folder: `meta.json` + audio file + optional `cover.*`.
 fn import_folder(dir: &Path, meta_path: &Path) -> Option<Track> {
     let meta = read_json(meta_path)?;
@@ -233,7 +285,7 @@ fn import_folder(dir: &Path, meta_path: &Path) -> Option<Track> {
         }
     }
     let (audio, ext) = audio?;
-    Some(track_from_meta(Some(&meta), &id, &audio, ext, cover))
+    valid_id(track_from_meta(Some(&meta), &id, &audio, ext, cover), dir)
 }
 
 /// A legacy flat `<id>.<ext>` audio file with an optional `<id>.json` sidecar.
@@ -244,7 +296,7 @@ fn import_flat(path: &Path) -> Option<Track> {
     }
     let stem = path.file_stem()?.to_str()?;
     let meta = read_json(&path.with_extension("json"));
-    Some(track_from_meta(meta.as_ref(), stem, path, ext, None))
+    valid_id(track_from_meta(meta.as_ref(), stem, path, ext, None), path)
 }
 
 fn track_from_meta(
@@ -637,6 +689,130 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(db.tracks_in_state(TrackState::Failed).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn skips_ids_that_are_not_video_ids() {
+        let (dir, db) = setup();
+        let folder = dir.path().join("Evil [abcdefgh]");
+        fs::create_dir(&folder).unwrap();
+        write_meta(&folder, "../../x", "Evil");
+        fs::write(folder.join("audio.webm"), b"x").unwrap();
+        fs::write(dir.path().join("evil.mp3"), b"x").unwrap();
+        fs::write(
+            dir.path().join("evil.json"),
+            r#"{"id": "/abs/x", "title": "Evil"}"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("notes.mp3"), b"x").unwrap();
+        fs::write(dir.path().join("good0000001.mp3"), b"x").unwrap();
+
+        let report = reconcile(dir.path(), &db, &none()).unwrap();
+        assert_eq!(report.imported, ["good0000001"]);
+        assert_eq!(report.skipped_dirs, [folder]);
+        assert_eq!(db.list_tracks().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn planted_cover_tmp_symlink_is_not_followed() {
+        use id3::frame::PictureType;
+        let (dir, db) = setup();
+        let victim = tempfile::tempdir().unwrap();
+        let secret = victim.path().join("dotfile");
+        fs::write(&secret, b"keep me").unwrap();
+        let folder = dir.path().join("Song [abcdefgh]");
+        fs::create_dir(&folder).unwrap();
+        let audio = folder.join("audio.mp3");
+        mp3_with_pictures(&audio, &[("image/png", PictureType::CoverFront, b"png")]);
+        std::os::unix::fs::symlink(&secret, folder.join("cover.png.tmp")).unwrap();
+        db.upsert_track(&row("abcdefghijk", Some(&audio), TrackState::Complete))
+            .unwrap();
+
+        reconcile(dir.path(), &db, &none()).unwrap();
+        assert_eq!(fs::read(&secret).unwrap(), b"keep me");
+        assert!(!folder.join("cover.png").exists());
+    }
+
+    #[test]
+    fn undeletable_partial_does_not_stop_reconcile_or_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, db) = setup();
+        let mode =
+            |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+        db.upsert_track(&row("abcdefghijk", None, TrackState::Failed))
+            .unwrap();
+        let stuck = dir.path().join("Stuck [abcdefgh]");
+        fs::create_dir(&stuck).unwrap();
+        fs::write(stuck.join("audio.webm"), b"x").unwrap();
+        mode(&stuck, 0o555);
+        let other = dir.path().join("New [GJI4Gv7N]");
+        fs::create_dir(&other).unwrap();
+        write_meta(&other, "GJI4Gv7NbmE", "New");
+        fs::write(other.join("audio.webm"), b"x").unwrap();
+
+        let report = reconcile(dir.path(), &db, &none());
+        let stuck_dl = dir.path().join("Stuck dl [stuckdlx]");
+        fs::create_dir(&stuck_dl).unwrap();
+        fs::write(stuck_dl.join("audio.webm"), b"x").unwrap();
+        db.upsert_track(&row(
+            "stuckdlxxxx",
+            Some(&stuck_dl.join("audio.webm")),
+            TrackState::Downloading,
+        ))
+        .unwrap();
+        mode(&stuck_dl, 0o555);
+        let recovered = recover_interrupted(dir.path(), &db);
+        mode(&stuck, 0o755);
+        mode(&stuck_dl, 0o755);
+
+        let report = report.unwrap();
+        assert_eq!(report.imported, ["GJI4Gv7NbmE"]);
+        assert!(report.skipped_dirs.contains(&stuck));
+        assert!(stuck.join("audio.webm").exists());
+        assert_eq!(recovered.unwrap(), ["stuckdlxxxx"]);
+        assert_eq!(
+            db.get_track("stuckdlxxxx").unwrap().unwrap().state,
+            TrackState::Failed
+        );
+    }
+
+    #[test]
+    fn renamed_folder_is_relinked_keeping_row_and_albums() {
+        let (dir, db) = setup();
+        let old = dir.path().join("秒針を噛む [GJI4Gv7N]");
+        fs::create_dir(&old).unwrap();
+        write_meta(&old, "GJI4Gv7NbmE", "秒針を噛む");
+        fs::write(old.join("audio.webm"), b"x").unwrap();
+        fs::write(old.join("cover.jpg"), b"img").unwrap();
+        let mut t = row(
+            "GJI4Gv7NbmE",
+            Some(&old.join("audio.webm")),
+            TrackState::Complete,
+        );
+        t.added_at = Some(100);
+        t.thumb_path = path_str(&old.join("cover.jpg"));
+        db.upsert_track(&t).unwrap();
+        let album = db.create_album("Mix").unwrap();
+        db.album_add(album, "GJI4Gv7NbmE").unwrap();
+
+        let new = dir.path().join("Renamed [GJI4Gv7N]");
+        fs::rename(&old, &new).unwrap();
+        let report = reconcile(dir.path(), &db, &none()).unwrap();
+        assert_eq!(report.relinked, ["GJI4Gv7NbmE"]);
+        assert!(report.imported.is_empty());
+        assert!(report.removed.is_empty());
+        let got = db.get_track("GJI4Gv7NbmE").unwrap().unwrap();
+        assert_eq!(got.audio_path, path_str(&new.join("audio.webm")));
+        assert_eq!(got.thumb_path, path_str(&new.join("cover.jpg")));
+        assert_eq!(got.added_at, Some(100));
+        assert_eq!(
+            db.get_album(album).unwrap().unwrap().track_ids,
+            ["GJI4Gv7NbmE"]
+        );
+        assert_eq!(
+            reconcile(dir.path(), &db, &none()).unwrap(),
+            ReconcileReport::default()
+        );
     }
 
     #[test]

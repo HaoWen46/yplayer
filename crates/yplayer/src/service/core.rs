@@ -13,6 +13,7 @@ use crate::download::worker::{JobId, WorkerHandle, WorkerMsg};
 use crate::http::HttpGet;
 use crate::library::db::{Db, DbError, LyricsRow};
 use crate::library::reconcile::{ReconcileReport, reconcile};
+use crate::library::safe_fs::{self, RemoveMode};
 use crate::lyrics::{self, LyricsOutcome};
 use crate::player::engine::{Engine, EngineError, TrackResolver};
 use crate::player::mpv::{MpvEvent, MpvSpawner};
@@ -28,6 +29,9 @@ pub const EVENT_CAPACITY: usize = 1024;
 /// Cached lyrics misses are retried after this long.
 const LYRICS_MISS_TTL: i64 = 7 * 24 * 3600;
 const UPDATE_RECHECK: Duration = Duration::from_secs(24 * 3600);
+/// A reconcile importing or relinking more tracks than this emits one
+/// `resync` instead of an event per track.
+const RESYNC_ABOVE: usize = 200;
 
 /// One socket request; the core answers on `reply`.
 pub struct Request {
@@ -152,6 +156,7 @@ pub struct Core<S: MpvSpawner> {
     downloads: Downloads,
     /// Track to play as soon as its download's `Started` arrives.
     pending_play: Option<String>,
+    startup_toast: Option<String>,
 }
 
 impl<S: MpvSpawner> Core<S> {
@@ -188,6 +193,7 @@ impl<S: MpvSpawner> Core<S> {
             update_at: None,
             downloads: Downloads::default(),
             pending_play: None,
+            startup_toast: None,
         };
         let inbox = Inbox {
             requests: requests_rx,
@@ -199,6 +205,21 @@ impl<S: MpvSpawner> Core<S> {
 
     pub fn requests(&self) -> mpsc::UnboundedSender<Request> {
         self.requests.clone()
+    }
+
+    /// A warn toast shown once the startup reconcile finished: to the
+    /// subscribers then, or else to the first one.
+    pub fn warn_after_startup(&mut self, message: &str) {
+        self.startup_toast = Some(message.to_string());
+    }
+
+    fn flush_startup_toast(&mut self) {
+        if !self.reconciling
+            && self.events.receiver_count() > 0
+            && let Some(message) = self.startup_toast.take()
+        {
+            self.toast(Severity::Warn, message);
+        }
     }
 
     /// Background reconcile and the first update check.
@@ -250,6 +271,7 @@ impl<S: MpvSpawner> Core<S> {
             })),
             Command::Subscribe => {
                 events = Some(self.events.subscribe());
+                self.flush_startup_toast();
                 Ok(json!({"player": prev, "library_version": self.library_version}))
             }
             Command::LibraryGet => self.library_get(),
@@ -441,7 +463,7 @@ impl<S: MpvSpawner> Core<S> {
     }
 
     fn album_create(&mut self, name: &str) -> Result<Value, CmdError> {
-        let album_id = self.db.create_album(name)?;
+        let album_id = self.db.create_album(trimmed(name, "name", 200)?)?;
         let album = self.require_album(album_id)?;
         self.emit(Event::AlbumUpsert {
             album: album.clone(),
@@ -451,7 +473,8 @@ impl<S: MpvSpawner> Core<S> {
     }
 
     fn album_rename(&mut self, album_id: i64, name: &str) -> Result<Value, CmdError> {
-        self.db.rename_album(album_id, name)?;
+        self.db
+            .rename_album(album_id, trimmed(name, "name", 200)?)?;
         self.album_changed(album_id)?;
         Ok(json!({}))
     }
@@ -494,7 +517,8 @@ impl<S: MpvSpawner> Core<S> {
     }
 
     fn track_rename(&mut self, track_id: &str, title: &str) -> Result<Value, CmdError> {
-        self.db.rename_track(track_id, title)?;
+        self.db
+            .rename_track(track_id, trimmed(title, "title", 500)?)?;
         let track = self.require_track(track_id)?;
         self.emit(Event::TrackUpsert { track });
         self.library_version += 1;
@@ -705,8 +729,15 @@ impl<S: MpvSpawner> Core<S> {
                 if self.pending_play.as_deref() == Some(track_id.as_str()) {
                     self.pending_play = None;
                 }
-                if let Some(dir) = download.and_then(|d| d.dir) {
-                    let _ = std::fs::remove_dir_all(dir);
+                if let Some(dir) = download.and_then(|d| d.dir)
+                    && let Err(e) = safe_fs::remove_track_dir(
+                        &self.config.cache_dir,
+                        Path::new(&dir),
+                        &track_id,
+                        RemoveMode::Cleanup,
+                    )
+                {
+                    eprintln!("not removing {dir}: {e}");
                 }
                 if cancelled {
                     self.emit_download(&track_id, DownloadPhase::Cancelled, None, None, None);
@@ -732,7 +763,8 @@ impl<S: MpvSpawner> Core<S> {
         self.player_changed(&prev, false);
     }
 
-    /// A job of a deleted track: remove its folder after the terminal message.
+    /// A job of a deleted track: remove its folder after the terminal message,
+    /// unless the track is downloading again or back in the library.
     fn on_doomed_job(&mut self, track_id: &str, job: JobId, msg: WorkerMsg) {
         let done_dir = match msg {
             WorkerMsg::Started { dir, .. } => {
@@ -746,8 +778,18 @@ impl<S: MpvSpawner> Core<S> {
         let Some((dir, to_trash)) = self.downloads.take_doomed(job) else {
             return;
         };
-        if let Some(dir) = dir.or(done_dir) {
-            let _ = downloads::remove_path(Path::new(&dir), to_trash);
+        let revived = self.downloads.get(track_id).is_some()
+            || !matches!(self.db.get_track(track_id), Ok(None));
+        if let Some(dir) = dir.or(done_dir)
+            && !revived
+            && let Err(e) = safe_fs::remove_track_dir(
+                &self.config.cache_dir,
+                Path::new(&dir),
+                track_id,
+                RemoveMode::Delete { to_trash },
+            )
+        {
+            eprintln!("not removing {dir}: {e}");
         }
         self.emit_download(track_id, DownloadPhase::Cancelled, None, None, None);
     }
@@ -781,14 +823,8 @@ impl<S: MpvSpawner> Core<S> {
             self.album_changed(album_id)?;
         }
         if !in_flight {
-            for path in downloads::track_files(&track) {
-                downloads::remove_path(&path, to_trash).map_err(|e| {
-                    CmdError(
-                        ErrorCode::Internal,
-                        format!("removing {}: {e:#}", path.display()),
-                    )
-                })?;
-            }
+            downloads::remove_track_files(&self.config.cache_dir, &track, to_trash)
+                .map_err(|e| CmdError(ErrorCode::Internal, format!("{e:#}")))?;
         }
         Ok(json!({}))
     }
@@ -836,24 +872,33 @@ impl<S: MpvSpawner> Core<S> {
                 return;
             }
         };
-        for id in &report.imported {
-            if let Ok(Some(track)) = self.db.get_track(id) {
-                self.emit(Event::TrackUpsert { track });
+        if report.imported.len() + report.relinked.len() > RESYNC_ABOVE {
+            self.emit(Event::Resync);
+        } else {
+            for id in report.imported.iter().chain(&report.relinked) {
+                if let Ok(Some(track)) = self.db.get_track(id) {
+                    self.emit(Event::TrackUpsert { track });
+                }
+            }
+            for track_id in &report.removed {
+                self.emit(Event::TrackRemoved {
+                    track_id: track_id.clone(),
+                });
+            }
+            for id in &report.updated {
+                if let Ok(Some(track)) = self.db.get_track(id) {
+                    self.emit(Event::TrackUpsert { track });
+                }
             }
         }
-        for track_id in &report.removed {
-            self.emit(Event::TrackRemoved {
-                track_id: track_id.clone(),
-            });
-        }
-        for id in &report.updated {
-            if let Ok(Some(track)) = self.db.get_track(id) {
-                self.emit(Event::TrackUpsert { track });
-            }
-        }
-        if !report.imported.is_empty() || !report.removed.is_empty() || !report.updated.is_empty() {
+        if !report.imported.is_empty()
+            || !report.relinked.is_empty()
+            || !report.removed.is_empty()
+            || !report.updated.is_empty()
+        {
             self.library_version += 1;
         }
+        self.flush_startup_toast();
     }
 
     /// Run the updater on a blocking thread when it is due and no download
@@ -933,6 +978,19 @@ impl<S: MpvSpawner> Core<S> {
                 events: None,
             });
         }
+    }
+}
+
+/// `text` trimmed; `bad_request` unless that is 1..=`max` characters.
+fn trimmed<'a>(text: &'a str, what: &str, max: usize) -> Result<&'a str, CmdError> {
+    let text = text.trim();
+    if (1..=max).contains(&text.chars().count()) {
+        Ok(text)
+    } else {
+        Err(CmdError(
+            ErrorCode::BadRequest,
+            format!("{what} must be 1 to {max} characters"),
+        ))
     }
 }
 

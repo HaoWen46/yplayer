@@ -113,9 +113,25 @@ impl SessionState {
         }
     }
 
+    /// Written to `<path>.tmp` (created new, never followed) and renamed over
+    /// `path`.
     pub fn save(&self, path: &std::path::Path) {
-        if let Ok(text) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, text);
+        use std::io::Write;
+        let Ok(text) = serde_json::to_string_pretty(self) else {
+            return;
+        };
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        // A leftover from a crash is unlinked (unlink never follows a symlink).
+        let _ = std::fs::remove_file(&tmp);
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .and_then(|mut f| f.write_all(text.as_bytes()));
+        if written.is_err() || std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 }

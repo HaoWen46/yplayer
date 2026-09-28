@@ -24,6 +24,17 @@ impl fmt::Display for DbError {
     }
 }
 
+impl DbError {
+    /// The file is not a valid database (not a lock or I/O problem).
+    pub fn is_corrupt(&self) -> bool {
+        matches!(
+            self,
+            DbError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(e.code, ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt)
+        )
+    }
+}
+
 impl std::error::Error for DbError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -331,6 +342,34 @@ impl Db {
         Ok(())
     }
 
+    /// Point a row at its moved files; album links and the rest stay.
+    pub fn relink_track(
+        &self,
+        id: &str,
+        audio_path: &str,
+        thumb_path: Option<&str>,
+    ) -> Result<(), DbError> {
+        let n = self
+            .conn
+            .prepare_cached("UPDATE tracks SET audio_path = ?2, thumb_path = ?3 WHERE id = ?1")?
+            .execute(params![id, audio_path, thumb_path])?;
+        found(n)
+    }
+
+    /// Complete tracks never checked for a cover (`thumb_path` NULL; `''` means
+    /// checked, none found).
+    pub fn tracks_without_thumb_check(&self) -> Result<Vec<Track>, DbError> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {TRACK_COLS} FROM tracks WHERE state = 'complete' AND thumb_path IS NULL
+             ORDER BY added_at DESC, title COLLATE NOCASE"
+        ))?;
+        let tracks = stmt
+            .query_map([], track_from_row)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(tracks)
+    }
+
     pub fn set_thumb_path(&self, id: &str, thumb_path: &str) -> Result<(), DbError> {
         let n = self
             .conn
@@ -609,7 +648,8 @@ fn track_from_row(row: &Row) -> rusqlite::Result<Track> {
         added_at: row.get(8)?,
         last_played: row.get(9)?,
         state: parse_state(&state),
-        thumb_path: row.get(11)?,
+        // '' = checked, no cover; exposed as None like audio_path.
+        thumb_path: row.get::<_, Option<String>>(11)?.filter(|p| !p.is_empty()),
     })
 }
 
