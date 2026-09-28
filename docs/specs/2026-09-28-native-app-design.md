@@ -220,6 +220,13 @@ Each sub-project gets its own implementation plan and is completed and verified 
 - Idle cost with the drag watcher running: 0.15 wakeups/s while a song plays, 43 MB (budget rows pass).
 - The center album is not repeated as a bubble (fixed after the first snapshots).
 
+## Hardening results (2026-09-29, after safety, robustness and performance reviews)
+
+Plan: `docs/plans/2026-09-29-hardening-plan.md`. Every finding below was reproduced before the fix and re-run after it by the reviewer that found it.
+- Safety: folder deletes are confined to one track's own folder inside the cache (never a symlink, never a folder with foreign files for automatic cleanup); hostile ids/paths from meta.json are skipped; temp files never follow symlinks; worker runs as `python -P` from the state dir; DB, WAL, session and backup files are owner-only; mpv runs with `--no-config --load-scripts=no --ytdl=no`; curl is https-only with a size cap; yt-dlp updates install the exact GitHub release tag, binary-only, at least a day old (dependencies still come from PyPI without hash pinning).
+- Robustness: orphan mpv quit at service start; hung mpv killed after two timeouts; resume after an mpv crash continues at the right position; a failed stream skips on; a damaged DB is moved aside and rebuilt from the folders; one bad folder no longer stops startup; renamed folders keep their album links; queued downloads never time out while waiting; a job the worker never starts times out; the newest drop never waits for a slot; volume/seek validated; per-connection request backpressure; oversized worker lines dropped. A second `serve` exits before touching the DB. Known and accepted: another process holding a SQLite write lock stalls the service ~5 s per write.
+- Performance: 20k-track libraries load in the app (was a reconnect loop); a song-list update costs 17 ms at 20k (was 5 s); first search keystroke 6 ms and typed keystrokes 2.4 ms at 20k; library load 122 ms (219 ms when many tracks share an added time); at most 3 toasts kept; artwork cache bounded. Known: at 20k tracks the idle service shows ~28 MB footprint of freed-but-counted small allocations (live heap ~0.5 MB; 3 MB with the real 9-track library); `next` costs ~4 ms at 20k (queue copy for safe rollback).
+
 ## Out of scope (v1)
 
 - Full library window; YouTube search/browse in the app; playlist import; browser extensions; bookmarklets; `yplay://` URL scheme and Shortcuts/share-sheet integration; Safari tab drags; lyrics editing; cross-platform; notarization/distribution beyond this machine; homebrew `yt-dlp` (it is outdated and broken — the app always uses its own venv copy).
