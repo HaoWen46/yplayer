@@ -1,19 +1,66 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
+use yplayer::client::{self, AddOptions};
 use yplayer::config::{self, Config};
 use yplayer::download::bridge::Bridge;
+use yplayer::protocol::Command;
 use yplayer::service::{self, ServeOptions};
 use yplayer::types::Track;
 
 #[derive(Parser, Debug)]
 #[command(name = "yplay", about = "Fast YouTube audio player with local cache")]
 struct Cli {
+    /// Service socket (default: $YPLAY_SOCKET, else <state dir>/yplay.sock)
+    #[arg(long, global = true)]
+    socket: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Run the background service
+    Serve {
+        /// Cache directory (default: config file, else ~/Music/yt-audio)
+        #[arg(long)]
+        dir: Option<String>,
+    },
+    /// Add a YouTube URL to an album and play it
+    Add {
+        url: String,
+        /// Album name (default: the last used album, else Inbox)
+        #[arg(long)]
+        album: Option<String>,
+        /// Do not start playback
+        #[arg(long)]
+        no_play: bool,
+        /// Wait for the download and report timings
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Play a track from the library or an album
+    Play {
+        track_id: String,
+        /// Album name to play from (default: the whole library)
+        #[arg(long)]
+        album: Option<String>,
+    },
+    /// Pause playback
+    Pause,
+    /// Resume playback
+    Resume,
+    /// Toggle pause
+    Toggle,
+    /// Stop playback
+    Stop,
+    /// Next track
+    Next,
+    /// Previous track
+    Prev,
+    /// Show the current track
+    Now,
+    /// List albums
+    Albums,
     /// Search YouTube
     Search {
         query: String,
@@ -23,15 +70,6 @@ enum Commands {
     },
     /// List audio formats for a URL
     Formats { url: String },
-    /// Run the background service
-    Serve {
-        /// Cache directory (default: config file, else ~/Music/yt-audio)
-        #[arg(long)]
-        dir: Option<String>,
-        /// Socket path (default: $YPLAY_SOCKET, else <state dir>/yplay.sock)
-        #[arg(long)]
-        socket: Option<PathBuf>,
-    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -42,43 +80,78 @@ async fn main() -> anyhow::Result<()> {
         Cli::command().print_help()?;
         return Ok(());
     };
+    let socket = cli.socket.unwrap_or_else(Config::socket_path);
 
-    let file = config::FileConfig::load();
-    let dir = match &command {
-        Commands::Serve { dir, .. } => dir.clone(),
-        _ => None,
+    let result = match command {
+        Commands::Serve { dir } => {
+            let cfg = load_config(dir)?;
+            return service::serve(ServeOptions {
+                config: cfg,
+                socket_path: socket,
+                state_dir: Config::state_dir(),
+            })
+            .await;
+        }
+        Commands::Search { query, limit } => {
+            let cfg = load_config(None)?;
+            let mut bridge = Bridge::new(&cfg).await?;
+            let results = bridge.search(&query, limit, &cfg).await?;
+            print_search_results(&results);
+            return Ok(());
+        }
+        Commands::Formats { url } => {
+            let cfg = load_config(None)?;
+            let mut bridge = Bridge::new(&cfg).await?;
+            let formats = bridge.list_formats(&url).await?;
+            for f in formats {
+                println!("{}", f);
+            }
+            return Ok(());
+        }
+        Commands::Add {
+            url,
+            album,
+            no_play,
+            wait,
+        } => {
+            client::add(
+                &socket,
+                AddOptions {
+                    url,
+                    album,
+                    play: !no_play,
+                    wait,
+                },
+            )
+            .await
+        }
+        Commands::Play { track_id, album } => client::play(&socket, track_id, album).await,
+        Commands::Pause => client::send(&socket, Command::Pause).await,
+        Commands::Resume => client::send(&socket, Command::Resume).await,
+        Commands::Toggle => client::send(&socket, Command::Toggle).await,
+        Commands::Stop => client::send(&socket, Command::Stop).await,
+        Commands::Next => client::send(&socket, Command::Next).await,
+        Commands::Prev => client::send(&socket, Command::Prev).await,
+        Commands::Now => client::now(&socket).await,
+        Commands::Albums => client::albums(&socket).await,
     };
+    if let Err(e) = result {
+        eprintln!("{e}");
+        std::process::exit(e.exit_code());
+    }
+    Ok(())
+}
+
+/// Config file values, with `dir` overriding the cache directory (created).
+fn load_config(dir: Option<String>) -> anyhow::Result<Config> {
+    let file = config::FileConfig::load();
     let mut cfg = Config::new(dir.or(file.cache_dir), file.api_key);
     cfg.volume = file.volume;
     cfg.worker_python = file.worker_python;
 
     // Ensure cache directory exists
     std::fs::create_dir_all(&cfg.cache_dir)?;
-
-    match command {
-        Commands::Search { query, limit } => {
-            let mut bridge = Bridge::new(&cfg).await?;
-            let results = bridge.search(&query, limit, &cfg).await?;
-            print_search_results(&results);
-        }
-        Commands::Formats { url } => {
-            let mut bridge = Bridge::new(&cfg).await?;
-            let formats = bridge.list_formats(&url).await?;
-            for f in formats {
-                println!("{}", f);
-            }
-        }
-        Commands::Serve { socket, .. } => {
-            service::serve(ServeOptions {
-                config: cfg,
-                socket_path: socket.unwrap_or_else(Config::socket_path),
-                state_dir: Config::state_dir(),
-            })
-            .await?;
-        }
-    }
-
-    Ok(())
+    Ok(cfg)
 }
 
 fn print_search_results(results: &[Track]) {
