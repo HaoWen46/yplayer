@@ -3,4 +3,6 @@ pub mod download;
 pub mod library;
 pub mod lyrics;
 pub mod player;
+pub mod protocol;
 pub mod types;
+pub mod ytid;
