@@ -26,6 +26,7 @@ struct LaunchOptions {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let options: LaunchOptions
     private var statusItem: StatusItemController?
+    private var nowPlaying: NowPlayingController?
 
     init(options: LaunchOptions) {
         self.options = options
@@ -48,6 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             client: ServiceClient(socketPath: ServiceClient.defaultSocketPath()),
             store: LibraryStore())
         model.start()
+        nowPlaying = NowPlayingController(model: model)
         let statusItem = StatusItemController(model: model)
         self.statusItem = statusItem
         if options.openPopover {

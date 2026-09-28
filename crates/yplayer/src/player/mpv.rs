@@ -143,6 +143,8 @@ impl MpvProcess {
             .arg("--no-terminal")
             .arg(format!("--input-ipc-server={}", opts.socket_path.display()))
             .arg("--input-media-keys=no")
+            // the menu-bar app owns Now Playing; mpv's own entry would steal the media keys.
+            .arg("--media-controls=no")
             .arg("--demuxer-max-bytes=32MiB")
             .arg("--demuxer-max-back-bytes=8MiB")
             .arg("--prefetch-playlist=yes")
