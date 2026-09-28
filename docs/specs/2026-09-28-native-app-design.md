@@ -56,7 +56,10 @@ While watching YouTube in Safari (or Chrome), the user drags the page URL onto a
 - Playback: `play {track_id, context: {album_id} | {library: true}}`, `pause`, `resume`, `toggle`, `stop`, `next`, `prev`, `seek {position}`, `volume {value 0..100}`, `loop {mode: none|single|all|shuffle}`, `queue.play_next {track_id}`.
 - Library edits: `album.create {name}`, `album.rename {album_id, name}`, `album.delete {album_id}` (tracks stay in library), `album.add {album_id, track_id}`, `album.remove {album_id, track_id}`, `album.reorder {album_id, track_ids}`, `track.delete {track_id, to_trash: bool (default true)}`, `track.rename {track_id, title}`, `track.retry {track_id}`, `rescan`.
 - `lyrics {track_id}` → `{synced: bool, lines: [{t_ms, text}] } | {missing: true}`.
-- Events: `player {state: playing|paused|stopped, track_id, context, position, at_ms, duration, volume, loop}` (emitted only on change: play/pause/seek/track change/volume/loop; `at_ms` = wall-clock ms when `position` was sampled); `track.upsert {track}`; `track.removed {track_id}`; `album.upsert {album}`; `album.removed {album_id}`; `download {track_id, phase: fetching|downloading|done|failed|cancelled, bytes, total, error?}` (≤2/s per track); `toast {severity: info|warn|error, message}`.
+- `now` → `{player, track}` (CLI convenience).
+- Events: `player {state: playing|paused|stopped, track_id, context, position, at_ms, duration, volume, loop}` (emitted only on change: play/pause/seek/track change/volume/loop; `at_ms` = wall-clock ms when `position` was sampled); `track.upsert {track}`; `track.removed {track_id}`; `album.upsert {album}`; `album.removed {album_id}`; `download {track_id, phase: fetching|downloading|done|failed|cancelled, bytes, total, error?}` (≤2/s per track); `toast {severity: info|warn|error, message}`; `resync` (the connection lagged behind the event stream; the client must call `library.get` again).
+- `library_version` (u64) increments on every library mutation and is returned by `subscribe` and `library.get`.
+- Library context order (Songs view and `context: {library: true}`): `added_at DESC, title COLLATE NOCASE`.
 
 ## Drop flow
 
@@ -64,7 +67,7 @@ While watching YouTube in Safari (or Chrome), the user drags the page URL onto a
 2. App sends `add {url, album, play: true}`.
 3. Service: if the track row exists with `state=complete` and its audio file exists → link to album (if not already), bump `albums.last_used_at`, play the local file. No network.
 4. Else: insert/refresh the row with `state=downloading` (title = video id placeholder, `audio_path=''`), link to album, emit `track.upsert` + `album.upsert`, then send a download job to the worker.
-5. Worker: one `extract_info(download=False)` → emits `info {meta, dir}` (service updates title/uploader/duration) → `process_ie_result(download=True)` with `format=bestaudio`, `nopart=True`, `outtmpl=<dir>/audio.%(ext)s`, thumbnail written as-is to `<dir>/cover.<ext>` → emits `started {path}` on the first progress callback with bytes on disk → throttled `progress` → writes `meta.json` LAST → final `ok` response.
+5. Worker: one `extract_info(url, download=True)` call (a single metadata fetch) with `format=bestaudio`, `nopart=True`, `outtmpl={'default': '<cache>/%(title).150B [%(id).8s]/audio.%(ext)s', 'thumbnail': '<cache>/%(title).150B [%(id).8s]/cover.%(ext)s'}`, `writethumbnail=True` (thumbnail kept as-is) → the first progress callback with bytes on disk emits `started {path, dir, meta}` (service sets title/uploader/duration/audio_path) → throttled `progress` → writes `meta.json` LAST → final `ok` response.
 6. On `started`: service tells mpv `loadfile appending://<abs path>` (plays the growing file; measured ~3.2 s to first audio vs 11.6–12.5 s today).
 7. On final `ok`: row → `state=complete`, `audio_path`, `thumb_path`, `file_size`; emit `track.upsert` + `download done`.
 8. Play context after a drop-play: queue = [dropped track] + the album's other tracks in album order.
@@ -80,6 +83,7 @@ While watching YouTube in Safari (or Chrome), the user drags the page URL onto a
 - Cached files load by plain path; in-progress downloads load via `appending://`.
 - Idle shutdown: after 10 minutes stopped or paused, the service records `{track_id, position}` and quits mpv (frees ~45 MB); resume respawns mpv and loads with `start=<position>` (~0.35 s measured spawn-to-audio).
 - mpv crash/exit: supervisor marks the player stopped, emits a warn toast, respawns lazily on the next playback command.
+- Runtime: tokio `current_thread`; blocking work (reconcile, lyrics HTTP, update check) on `spawn_blocking`; one core actor owns the DB connection, engine and download table (no locks).
 - No periodic timers in the service. The only timers are one-shot: mpv idle shutdown, worker idle shutdown, daily yt-dlp update check.
 
 ## Downloader (Python worker)
@@ -87,7 +91,7 @@ While watching YouTube in Safari (or Chrome), the user drags the page URL onto a
 - Spawned on demand; the service closes its stdin after 60 s with no in-flight jobs (worker exits on EOF). Respawn cost ~0.2 s (measured).
 - Concurrent: worker runs jobs on a thread pool (max 3); stdout writes guarded by a lock; every message carries the request id. The Rust `WorkerHandle` supports streamed multi-message responses (interim `event` messages, then one terminal `ok`/error).
 - Cancel: `{"cmd": "cancel", "target": <id>}` sets a flag checked in the yt-dlp progress hook, which raises `yt_dlp.utils.DownloadCancelled`; terminal response has `cancelled: true`; the service deletes the folder.
-- Folder naming: existing `<SanitizedTitle> [<id8>]` scheme, derived from yt-dlp's `info` (never from the Data API — fixes duplicate folders when a key is/isn't present).
+- Folder naming: `<Title> [<id8>]` via the yt-dlp output template (yt-dlp's filename sanitization, unicode kept, no `restrictfilenames`); never derived from the Data API (fixes duplicate folders when a key is/isn't present).
 - Removed from the request path: `_auto_update_ytdlp` pip upgrade on any `DownloadError` (audit F1), `ensure_ytdlp_uptodate` at worker start, Data API metadata lookup in download, FFmpegExtractAudio / FFmpegMetadata / EmbedThumbnail, second `meta.json` read-back, legacy flat `<id>.json` sidecar writes, lyrics code.
 - yt-dlp updates: owned by the service; at most once per 24 h, and only when no job is in flight; check latest version via the GitHub `releases/latest` redirect (HEAD request, not the 1.2 MB PyPI JSON); upgrade with `uv pip install --python <worker_python> -U "yt-dlp[default]"`; then restart the idle worker. Throttle stamp lives in the state dir, not a hard-coded path.
 - Dependency: `yt-dlp[default]` (brings yt-dlp-ejs for YouTube JS challenges; `deno` is installed). `python-dotenv` stays only for CLI search convenience.
@@ -98,6 +102,7 @@ While watching YouTube in Safari (or Chrome), the user drags the page URL onto a
 - Startup trusts SQLite; no blocking scan (audit: full meta.json scan cost 0.37 s at 5k tracks, 2.3 s at 20k).
 - Background reconcile at startup and on `rescan`: one `read_dir` of the cache root; import only directories not referenced by any row's `audio_path` (parse their `meta.json`; skip dirs without `meta.json` and log them — never auto-delete unknown user files); delete rows whose audio file is gone; legacy flat `<id>.<ext>` files still supported.
 - Startup recovery: rows left in `state=downloading` (service died mid-download) → delete their folder, set `state=failed`.
+- Legacy `<cache>/albums/*.album.json` files are imported exactly once, inside the 0 → 1 migration (the old scanner re-imported them on every launch, which would undo album edits).
 - Schema migration via `PRAGMA user_version` 0 → 1: `tracks.state TEXT NOT NULL DEFAULT 'complete'`; `tracks.thumb_path TEXT`; `albums.last_used_at INTEGER`; `CREATE INDEX idx_album_tracks_track ON album_tracks(track_id)`; `CREATE TABLE lyrics (track_id TEXT PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, synced INTEGER, body TEXT, fetched_at INTEGER NOT NULL)` (`body NULL` = confirmed miss).
 - Use `prepare_cached` for hot statements. Existing WAL/NORMAL pragmas stay.
 - `track.delete`: cancel in-flight download, if current track then advance to next (or stop), remove row (cascades album links + lyrics), move the track folder to the macOS Trash via the `trash` crate (NSFileManager path, no Finder/AppleScript) or delete permanently when `to_trash: false`.
@@ -109,7 +114,7 @@ While watching YouTube in Safari (or Chrome), the user drags the page URL onto a
 - Order: exact `/api/get` first, then `/api/search` with de-duplicated candidates.
 - Cached in the `lyrics` table, including misses; misses retried after 7 days; transient errors are not cached.
 - Fetched only when the app requests lyrics for a track (lyrics view open); stale requests for tracks no longer displayed are dropped.
-- HTTP client: `ureq` with platform TLS (`native-tls` → Security.framework, no rustls/ring), run on a blocking thread.
+- HTTP client: `/usr/bin/curl` subprocess behind an `HttpGet` trait (no TLS stack compiled into the binary; calls are rare), run on a blocking thread; the same client serves the yt-dlp update check.
 
 ## Menu-bar app (sub-project 2)
 
