@@ -111,7 +111,7 @@ While watching YouTube in Safari (or Chrome), the user drags the page URL onto a
 ## Lyrics
 
 - Fetched by the service in Rust from LRCLIB (port `_clean_track_title` from `yplayer/core.py` with its existing behavior and test cases — it strips `Artist『Song』MV(...)` decorations and is required for matches).
-- Order: exact `/api/get` first, then `/api/search` with de-duplicated candidates.
+- Order: exact `/api/get` first, then `/api/search` with de-duplicated candidates; 10 s per call; a 429 stops the lookup; a transport error or 5xx only skips that call (LRCLIB latency is erratic — `/api/get` measured 1 s to >6 s, `/api/get-cached` 17 s); a lookup with any failed call and no hit is an error, never a cached miss.
 - Cached in the `lyrics` table, including misses; misses retried after 7 days; transient errors are not cached.
 - Fetched only when the app requests lyrics for a track (lyrics view open); stale requests for tracks no longer displayed are dropped.
 - HTTP client: `/usr/bin/curl` subprocess behind an `HttpGet` trait (no TLS stack compiled into the binary; calls are rare), run on a blocking thread; the same client serves the yt-dlp update check.

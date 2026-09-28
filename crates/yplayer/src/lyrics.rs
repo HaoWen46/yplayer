@@ -38,7 +38,7 @@ fn parse_lrc_time(tag: &str) -> Option<f64> {
 
 pub const USER_AGENT: &str = "yplayer (https://github.com/HaoWen46/yplayer)";
 const LRCLIB: &str = "https://lrclib.net";
-const TIMEOUT: Duration = Duration::from_secs(6);
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reduce a decorated YouTube title to the song name for lyrics matching
 /// (port of `yplayer/core.py::_clean_track_title`).
@@ -71,7 +71,9 @@ pub enum LyricsOutcome {
 }
 
 /// Look up lyrics on LRCLIB: exact `/api/get`, then `/api/search` candidates.
-/// A transport error, 429 or 5xx on any call stops with `Error`.
+/// A 429 stops with `Error`; a transport error or 5xx only skips that call,
+/// and makes the result `Error` instead of `Missing` when nothing was found
+/// (so a transient failure is never cached as a miss).
 pub fn fetch(
     http: &dyn HttpGet,
     title: &str,
@@ -80,6 +82,7 @@ pub fn fetch(
 ) -> LyricsOutcome {
     let cleaned = clean_track_title(title);
     let mut plain: Option<String> = None;
+    let mut failed: Option<String> = None;
 
     if let (Some(artist), Some(d)) = (artist, duration) {
         let d = d.to_string();
@@ -91,7 +94,11 @@ pub fn fetch(
         let body = match lrclib_get(http, &format!("{LRCLIB}/api/get?{query}")) {
             Ok(Some(body)) => body,
             Ok(None) => serde_json::Value::Null,
-            Err(e) => return LyricsOutcome::Error(e),
+            Err(CallError::RateLimited(e)) => return LyricsOutcome::Error(e),
+            Err(CallError::Failed(e)) => {
+                failed = Some(e);
+                serde_json::Value::Null
+            }
         };
         if let Some(synced) = non_empty(&body, "syncedLyrics") {
             return LyricsOutcome::Found {
@@ -117,7 +124,11 @@ pub fn fetch(
         let hits = match lrclib_get(http, &format!("{LRCLIB}/api/search?{query}")) {
             Ok(Some(serde_json::Value::Array(hits))) => hits,
             Ok(_) => continue,
-            Err(e) => return LyricsOutcome::Error(e),
+            Err(CallError::RateLimited(e)) => return LyricsOutcome::Error(e),
+            Err(CallError::Failed(e)) => {
+                failed = Some(e);
+                continue;
+            }
         };
         let mut best: Option<(f64, String)> = None;
         for hit in &hits {
@@ -141,23 +152,39 @@ pub fn fetch(
         }
     }
 
-    match plain {
-        Some(body) => LyricsOutcome::Found {
+    match (plain, failed) {
+        (Some(body), _) => LyricsOutcome::Found {
             synced: false,
             body,
         },
-        None => LyricsOutcome::Missing,
+        (None, Some(e)) => LyricsOutcome::Error(e),
+        (None, None) => LyricsOutcome::Missing,
     }
+}
+
+enum CallError {
+    /// HTTP 429: stop the whole lookup.
+    RateLimited(String),
+    /// Transport error or 5xx: skip this call.
+    Failed(String),
 }
 
 /// One LRCLIB call. `Err` on transport error, 429 or 5xx; `Ok(None)` on any
 /// other non-200 status or an unparsable body.
-fn lrclib_get(http: &dyn HttpGet, url: &str) -> Result<Option<serde_json::Value>, String> {
+fn lrclib_get(http: &dyn HttpGet, url: &str) -> Result<Option<serde_json::Value>, CallError> {
     let resp = http
         .get(url, TIMEOUT)
-        .map_err(|e| format!("LRCLIB request failed: {e:#}"))?;
-    if resp.status == 429 || resp.status >= 500 {
-        return Err(format!("LRCLIB returned HTTP {}", resp.status));
+        .map_err(|e| CallError::Failed(format!("LRCLIB request failed: {e:#}")))?;
+    if resp.status == 429 {
+        return Err(CallError::RateLimited(
+            "LRCLIB returned HTTP 429".to_string(),
+        ));
+    }
+    if resp.status >= 500 {
+        return Err(CallError::Failed(format!(
+            "LRCLIB returned HTTP {}",
+            resp.status
+        )));
     }
     if resp.status != 200 {
         return Ok(None);
@@ -352,16 +379,41 @@ mod tests {
         let out = fetch(&http, MIRABO, Some("ZUTOMAYO"), Some(200));
         assert!(matches!(out, LyricsOutcome::Error(_)), "{out:?}");
         assert_eq!(http.calls().len(), 1);
+    }
 
+    #[test]
+    fn transient_failures_skip_calls_and_are_never_a_miss() {
+        // Every call fails: all candidates are tried, and the result is an
+        // Error (not cached), never Missing.
         let http = FakeHttp::new(|_| resp(503, ""));
         let out = fetch(&http, MIRABO, None, None);
         assert!(matches!(out, LyricsOutcome::Error(_)), "{out:?}");
-        assert_eq!(http.calls().len(), 1);
+        assert!(http.calls().len() > 1);
 
         let http = FakeHttp::new(|_| Err(anyhow::anyhow!("connection refused")));
         let out = fetch(&http, MIRABO, None, None);
         assert!(matches!(out, LyricsOutcome::Error(_)), "{out:?}");
-        assert_eq!(http.calls().len(), 1);
+    }
+
+    #[test]
+    fn get_timeout_then_search_hit_is_found() {
+        let http = FakeHttp::new(|url| {
+            if is_get(url) {
+                return Err(anyhow::anyhow!("curl: (28) Operation timed out"));
+            }
+            resp(
+                200,
+                r#"[{"duration": 200, "syncedLyrics": "[00:01.00] la"}]"#,
+            )
+        });
+        let out = fetch(&http, MIRABO, Some("ZUTOMAYO"), Some(200));
+        assert_eq!(
+            out,
+            LyricsOutcome::Found {
+                synced: true,
+                body: "[00:01.00] la".to_string()
+            }
+        );
     }
 
     #[test]
