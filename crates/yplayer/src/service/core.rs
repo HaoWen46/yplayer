@@ -639,6 +639,7 @@ impl<S: MpvSpawner> Core<S> {
         let (job, mut rx) = self.worker.download(
             downloads::canonical_url(track_id),
             self.config.cache_dir.clone(),
+            album_id.is_some(),
         );
         let tx = self.internal.clone();
         let id = track_id.to_string();
@@ -724,20 +725,14 @@ impl<S: MpvSpawner> Core<S> {
                 error,
                 cancelled,
                 transport,
+                dir,
             } => {
                 let download = self.downloads.finish(&track_id);
                 if self.pending_play.as_deref() == Some(track_id.as_str()) {
                     self.pending_play = None;
                 }
-                if let Some(dir) = download.and_then(|d| d.dir)
-                    && let Err(e) = safe_fs::remove_track_dir(
-                        &self.config.cache_dir,
-                        Path::new(&dir),
-                        &track_id,
-                        RemoveMode::Cleanup,
-                    )
-                {
-                    eprintln!("not removing {dir}: {e}");
+                if let Some(dir) = download.and_then(|d| d.dir).or(dir) {
+                    self.remove_job_dir(&track_id, &dir);
                 }
                 if cancelled {
                     self.emit_download(&track_id, DownloadPhase::Cancelled, None, None, None);
@@ -763,6 +758,19 @@ impl<S: MpvSpawner> Core<S> {
         self.player_changed(&prev, false);
     }
 
+    /// Remove a failed or cancelled job's folder (automatic cleanup: refused
+    /// unless it is that track's own folder holding only pipeline files).
+    fn remove_job_dir(&self, track_id: &str, dir: &str) {
+        if let Err(e) = safe_fs::remove_track_dir(
+            &self.config.cache_dir,
+            Path::new(dir),
+            track_id,
+            RemoveMode::Cleanup,
+        ) {
+            eprintln!("not removing {dir}: {e}");
+        }
+    }
+
     /// A job of a deleted track: remove its folder after the terminal message,
     /// unless the track is downloading again or back in the library.
     fn on_doomed_job(&mut self, track_id: &str, job: JobId, msg: WorkerMsg) {
@@ -773,7 +781,7 @@ impl<S: MpvSpawner> Core<S> {
             }
             WorkerMsg::Progress { .. } => return,
             WorkerMsg::Done { dir, .. } => Some(dir),
-            WorkerMsg::Failed { .. } => None,
+            WorkerMsg::Failed { dir, .. } => dir,
         };
         let Some((dir, to_trash)) = self.downloads.take_doomed(job) else {
             return;

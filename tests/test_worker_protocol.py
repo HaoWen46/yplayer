@@ -21,6 +21,8 @@ from yplayer import core, worker
 TIMEOUT = 5
 CHUNK = 1024
 
+_real_fetch_thumbnail = core._fetch_thumbnail
+
 
 class FakeStdin:
     def __init__(self):
@@ -186,8 +188,9 @@ def test_download_streams_started_then_throttled_progress_then_ok(harness, monke
     done = harness.stdout.terminal(1)
 
     msgs = harness.stdout.for_id(1)
-    assert [m.get("event") for m in msgs] == ["started"] + ["progress"] * 4 + [None]
-    started = msgs[0]
+    assert [m.get("event") for m in msgs] == ["running", "started"] + ["progress"] * 4 + [None]
+    assert msgs[0] == {"id": 1, "event": "running"}
+    started = msgs[1]
     track_dir = os.path.join(harness.cache, "Song [AAAAAAAA]")
     audio = os.path.join(track_dir, "audio.webm")
     meta = {
@@ -199,7 +202,7 @@ def test_download_streams_started_then_throttled_progress_then_ok(harness, monke
     }
     assert started == {"id": 1, "event": "started", "path": audio, "dir": track_dir, "meta": meta}
     # At most one progress line per 0.5 s of (fake) time: chunks 3, 5, 7, 9.
-    assert [(m["bytes"], m["total"]) for m in msgs[1:5]] == [
+    assert [(m["bytes"], m["total"]) for m in msgs[2:6]] == [
         (k * CHUNK, 10 * CHUNK) for k in (3, 5, 7, 9)
     ]
     assert done == {
@@ -232,6 +235,54 @@ def test_download_ydl_options_skip_manifests_and_thumbnails(harness):
     assert params["extractor_args"] == {"youtube": {"skip": ["hls", "dash"]}}
     assert "writethumbnail" not in params
     assert set(params["outtmpl"]) == {"default"}
+
+
+def test_download_ydl_options_fail_fast(harness):
+    url = "https://www.youtube.com/watch?v=JJJJJJJJJJJ"
+    harness.scripts[url] = {"vid": "JJJJJJJJJJJ", "title": "Fast fail"}
+    _download(harness, 1, url)
+    assert harness.stdout.terminal(1)["ok"] is True
+
+    params = harness.scripts[url]["params"]
+    assert params["retries"] == 1
+    assert params["extractor_retries"] == 1
+    assert params["socket_timeout"] == 8
+
+
+class _FakeResponse:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return b"jpg"
+
+
+@pytest.mark.parametrize("name", ["meta.json.tmp", "cover.jpg"])
+def test_planted_symlink_is_not_followed(harness, monkeypatch, tmp_path, name):
+    monkeypatch.setattr(core, "_fetch_thumbnail", _real_fetch_thumbnail)
+    monkeypatch.setattr(core.urllib.request, "urlopen", lambda *a, **k: _FakeResponse())
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim"
+    victim.write_text("keep")
+    track_dir = os.path.join(harness.cache, "Planted [KKKKKKKK]")
+    os.makedirs(track_dir)
+    os.symlink(victim, os.path.join(track_dir, name))
+    url = "https://www.youtube.com/watch?v=KKKKKKKKKKK"
+    harness.scripts[url] = {"vid": "KKKKKKKKKKK", "title": "Planted"}
+    _download(harness, 1, url)
+
+    done = harness.stdout.terminal(1)
+    assert victim.read_text() == "keep"
+    assert os.path.islink(os.path.join(track_dir, name))
+    if name == "cover.jpg":
+        assert done["ok"] is True
+        assert done["thumb"] is None
+    else:
+        assert done["ok"] is False
 
 
 def _thumb_fails(video_id: str, dest: str) -> bool:

@@ -16,6 +16,7 @@ Features:
 import json
 import os
 import re
+import stat
 import time
 import urllib.parse
 import urllib.request
@@ -129,6 +130,10 @@ def yt_api_durations(ids: list[str], api_key: str) -> dict[str, int | None]:
 
 # ----------- Metadata sidecar & cache listing ----------
 
+def _create_new(path: str) -> int:
+    """Create path for writing; fails on an existing file or symlink."""
+    return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+
 def save_sidecar(cache_dir: str, info_obj: dict, *, track_dir: str | None = None):
     """Write minimal metadata JSON next to the audio file.
        Writes <track_dir>/meta.json if track_dir provided.
@@ -149,7 +154,12 @@ def save_sidecar(cache_dir: str, info_obj: dict, *, track_dir: str | None = None
     if track_dir:
         os.makedirs(track_dir, exist_ok=True)
         tmp = os.path.join(track_dir, "meta.json.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
+        try:
+            if stat.S_ISREG(os.lstat(tmp).st_mode):
+                os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        with os.fdopen(_create_new(tmp), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
         os.replace(tmp, os.path.join(track_dir, "meta.json"))
 
@@ -375,7 +385,7 @@ def _fetch_thumbnail(video_id: str, dest: str) -> bool:
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = resp.read()
-        with open(dest, "wb") as f:
+        with os.fdopen(_create_new(dest), "wb") as f:
             f.write(data)
     except Exception:
         return False
@@ -392,12 +402,15 @@ def download_track(url: str, cache_dir: str, *, emit, cancel_event) -> dict:
     track_tmpl = os.path.join(cache_dir, "%(title).150B [%(id).8s]")
     started = False
     last = 0.0
+    job_dir = None
 
     def hook(d: dict):
-        nonlocal started, last
+        nonlocal started, last, job_dir
+        path = d.get("filename")
+        if path:
+            job_dir = os.path.dirname(os.path.abspath(path))
         if cancel_event.is_set():
             raise DownloadCancelled()
-        path = d.get("filename")
         if not path:
             return
         if not started:
@@ -441,26 +454,32 @@ def download_track(url: str, cache_dir: str, *, emit, cancel_event) -> dict:
         "logtostderr": True,
         "noprogress": True,
         "noplaylist": True,
-        "retries": 2,
-        "socket_timeout": 10,
+        "retries": 1,
+        "extractor_retries": 1,
+        "socket_timeout": 8,
         "progress_hooks": [hook],
     }
-    with YoutubeDL(ydl_opts) as ydl:
-        info_dict = ydl.extract_info(url, download=True)
-
-    # yt-dlp drops keys equal to the parent's from requested_downloads; merge back.
-    rd = {**info_dict, **info_dict["requested_downloads"][0]}
-    path = os.path.abspath(rd["filepath"])
-    track_dir = os.path.dirname(path)
-    # Cover after the audio (yt-dlp's writethumbnail probes thumbnails serially
-    # before the first audio byte); a missing cover is not an error.
-    cover = os.path.join(track_dir, "cover.jpg")
     try:
-        thumb = cover if _fetch_thumbnail(rd["id"], cover) else None
-    except Exception:
-        thumb = None
-    meta = _track_meta(rd)
-    save_sidecar(cache_dir, meta, track_dir=track_dir)
+        with YoutubeDL(ydl_opts) as ydl:
+            info_dict = ydl.extract_info(url, download=True)
+
+        # yt-dlp drops keys equal to the parent's from requested_downloads; merge back.
+        rd = {**info_dict, **info_dict["requested_downloads"][0]}
+        path = os.path.abspath(rd["filepath"])
+        track_dir = os.path.dirname(path)
+        # Cover after the audio (yt-dlp's writethumbnail probes thumbnails serially
+        # before the first audio byte); a missing cover is not an error.
+        cover = os.path.join(track_dir, "cover.jpg")
+        try:
+            thumb = cover if _fetch_thumbnail(rd["id"], cover) else None
+        except Exception:
+            thumb = None
+        meta = _track_meta(rd)
+        save_sidecar(cache_dir, meta, track_dir=track_dir)
+    except BaseException as e:
+        if job_dir:
+            e.job_dir = job_dir
+        raise
     return {
         "path": path,
         "dir": track_dir,

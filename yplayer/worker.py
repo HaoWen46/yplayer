@@ -75,16 +75,23 @@ def _run(handler, rid, req: dict, cancel_event: threading.Event):
     def emit(event: dict):
         _respond({"id": rid, **event})
 
+    def failed(error: str, cancelled: bool, e: BaseException):
+        reply = {"id": rid, "ok": False, "error": error, "cancelled": cancelled}
+        job_dir = getattr(e, "job_dir", None)
+        if job_dir:
+            reply["dir"] = job_dir
+        _respond(reply)
+
     try:
+        emit({"event": "running"})
         result = handler(req, emit, cancel_event)
         _respond({"id": rid, "ok": True, **result})
     except SystemExit as e:
         # A library may call sys.exit(); keep the worker alive and report it.
-        _respond({"id": rid, "ok": False, "error": f"worker aborted: {e}", "cancelled": False})
+        failed(f"worker aborted: {e}", False, e)
     except Exception as e:
         # Includes YplayerError from die(), which carries the real message.
-        cancelled = isinstance(e, DownloadCancelled)
-        _respond({"id": rid, "ok": False, "error": str(e), "cancelled": cancelled})
+        failed(str(e), isinstance(e, DownloadCancelled), e)
     finally:
         _cancel_events.pop(rid, None)
 
@@ -102,7 +109,7 @@ def main():
     _respond({"event": "ready", "ok": True, "protocol": 2})
 
     # Leaving the block on stdin EOF waits for running jobs; then exit 0.
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         for line in sys.stdin:
             line = line.strip()
             if not line:
