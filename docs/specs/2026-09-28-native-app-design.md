@@ -210,7 +210,7 @@ Each sub-project gets its own implementation plan and is completed and verified 
 - Open/close cycles: footprint flat across 6 cycles (no leak).
 - User-confirmed: the play/pause media key toggles playback; Control Center's Now Playing shows the current song from the app; the popover opens from the menu bar, Space toggles, Esc closes; search `はむ` finds `Ham`.
 - Toolchain notes: Swift tests need `-plugin-path …/plugins/testing`; the SwiftUI macros plugin is Xcode-only, so views use `@ViewState` (`typealias ViewState = SwiftUI.State`); `ImageRenderer` cannot draw glass, so snapshots render in an offscreen window captured with `screencapture -l`.
-- Known gap: tracks from the old mp3 pipeline have their cover embedded in the mp3 (no `cover.jpg`), so they show placeholder art in the app and in Now Playing.
+- Fixed after verification: tracks from the old mp3 pipeline carried their cover only inside the ID3 tag; reconcile now writes it once to `cover.<png|jpg>` and sets `thumb_path` (all 8 legacy tracks show artwork in the app and Now Playing).
 
 ## Out of scope (v1)
 
