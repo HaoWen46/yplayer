@@ -1,25 +1,70 @@
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::process::{Child, Command};
+use tokio::sync::{mpsc, oneshot};
 
-#[derive(Debug)]
-pub struct MpvPlayer {
-    process: Option<Child>,
-    socket_path: PathBuf,
-    reader: Option<BufReader<OwnedReadHalf>>,
-    writer: Option<OwnedWriteHalf>,
-    next_id: u64,
-    pub is_playing: bool,
-    pub is_paused: bool,
-    pub position: f64,
-    pub duration: f64,
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Properties observed on every process; `time-pos` is deliberately absent.
+const OBSERVED: [&str; 6] = [
+    "pause",
+    "duration",
+    "volume",
+    "idle-active",
+    "path",
+    "playlist-pos",
+];
+
+#[derive(Debug, Clone)]
+pub struct MpvOptions {
+    pub socket_path: PathBuf,
+    pub ao: Option<String>,
     pub volume: f64,
+    pub extra_args: Vec<String>,
+}
+
+/// An mpv event, delivered with the generation of the process that sent it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MpvEvent {
+    PropertyChange {
+        name: String,
+        data: Value,
+    },
+    EndFile {
+        reason: String,
+    },
+    FileLoaded,
+    PlaybackRestart,
+    Seek,
+    /// The IPC connection closed: the process quit or died.
+    Exited,
+}
+
+#[allow(async_fn_in_trait)]
+pub trait MpvApi {
+    async fn command(&mut self, args: Vec<Value>) -> Result<Value>;
+    async fn quit(&mut self);
+    fn alive(&self) -> bool;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait MpvSpawner {
+    type Mpv: MpvApi;
+    async fn spawn(
+        &self,
+        volume: f64,
+        generation: u64,
+        events: mpsc::UnboundedSender<(u64, MpvEvent)>,
+    ) -> Result<Self::Mpv>;
 }
 
 /// One newline-delimited message from mpv's JSON IPC.
@@ -30,10 +75,8 @@ pub enum MpvLine {
         error: String,
         data: Value,
     },
-    Event {
-        name: String,
-        reason: Option<String>,
-    },
+    Event(MpvEvent),
+    /// Unparseable, or an event nothing consumes.
     Other,
 }
 
@@ -56,255 +99,213 @@ pub fn classify_mpv_line(line: &str) -> MpvLine {
             data: v.get("data").cloned().unwrap_or(Value::Null),
         };
     }
-    if let Some(name) = v.get("event").and_then(|e| e.as_str()) {
-        return MpvLine::Event {
-            name: name.to_string(),
-            reason: v.get("reason").and_then(|r| r.as_str()).map(String::from),
-        };
-    }
-    MpvLine::Other
+    let str_field = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let event = match v.get("event").and_then(|e| e.as_str()) {
+        Some("property-change") => MpvEvent::PropertyChange {
+            name: str_field("name"),
+            data: v.get("data").cloned().unwrap_or(Value::Null),
+        },
+        Some("end-file") => MpvEvent::EndFile {
+            reason: str_field("reason"),
+        },
+        Some("file-loaded") => MpvEvent::FileLoaded,
+        Some("playback-restart") => MpvEvent::PlaybackRestart,
+        Some("seek") => MpvEvent::Seek,
+        _ => return MpvLine::Other,
+    };
+    MpvLine::Event(event)
 }
 
-impl Default for MpvPlayer {
-    fn default() -> Self {
-        Self::new()
-    }
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+
+/// A persistent `mpv --idle` process driven over its JSON IPC socket.
+#[derive(Debug)]
+pub struct MpvProcess {
+    child: Child,
+    writer: OwnedWriteHalf,
+    pending: Pending,
+    alive: Arc<AtomicBool>,
+    next_id: u64,
+    socket_path: PathBuf,
 }
 
-impl MpvPlayer {
-    pub fn new() -> Self {
-        let socket_path = std::env::temp_dir().join(format!("yplayer_mpv_{}", std::process::id()));
-        Self {
-            process: None,
-            socket_path,
-            reader: None,
-            writer: None,
-            next_id: 1,
-            is_playing: false,
-            is_paused: false,
-            position: 0.0,
-            duration: 0.0,
-            volume: 100.0,
-        }
-    }
+impl MpvProcess {
+    pub async fn spawn(
+        opts: &MpvOptions,
+        generation: u64,
+        events: mpsc::UnboundedSender<(u64, MpvEvent)>,
+    ) -> Result<MpvProcess> {
+        let _ = std::fs::remove_file(&opts.socket_path);
 
-    pub async fn play(&mut self, filepath: &str, volume: Option<f64>) -> Result<()> {
-        self.stop().await;
-
-        let vol = volume
-            .map(|v| (v * 100.0).clamp(0.0, 100.0) as u32)
-            .unwrap_or(100);
-        self.volume = vol as f64;
-
-        let _ = std::fs::remove_file(&self.socket_path);
-
-        let child = Command::new("mpv")
+        let mut cmd = Command::new("mpv");
+        cmd.arg("--idle=yes")
             .arg("--no-video")
-            .arg("--idle=no")
-            .arg("--keep-open=no")
-            .arg(format!("--input-ipc-server={}", self.socket_path.display()))
-            .arg(format!("--volume={}", vol))
-            .arg("--")
-            .arg(filepath)
+            .arg("--no-terminal")
+            .arg(format!("--input-ipc-server={}", opts.socket_path.display()))
+            .arg("--input-media-keys=no")
+            .arg("--demuxer-max-bytes=32MiB")
+            .arg("--demuxer-max-back-bytes=8MiB")
+            .arg("--prefetch-playlist=yes")
+            .arg(format!("--volume={}", opts.volume));
+        if let Some(ao) = &opts.ao {
+            cmd.arg(format!("--ao={ao}"));
+        }
+        let child = cmd
+            .args(&opts.extra_args)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
             .context("Failed to spawn mpv — is it installed?")?;
 
-        self.process = Some(child);
-        self.is_playing = true;
-        self.is_paused = false;
-        self.position = 0.0;
-        self.duration = 0.0;
-
         // Connect with a retry loop: the socket file existing does not mean mpv
         // is accepting connections yet. The window is generous (~3s) because a
-        // cold first-ever mpv launch can be slow to create the socket, and
-        // missing it leaves the track with no IPC control for its whole duration.
+        // cold first-ever mpv launch can be slow to create the socket.
         let mut connected = None;
         for _ in 0..120 {
-            if let Ok(stream) = UnixStream::connect(&self.socket_path).await {
+            if let Ok(stream) = UnixStream::connect(&opts.socket_path).await {
                 connected = Some(stream);
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        if let Some(stream) = connected {
-            let (rd, wr) = stream.into_split();
-            self.reader = Some(BufReader::new(rd));
-            self.writer = Some(wr);
-        } else {
-            // Playback still works; we just won't have IPC control this track.
-            self.reader = None;
-            self.writer = None;
-        }
-        Ok(())
-    }
+        let stream = connected.context("mpv IPC socket did not accept connections")?;
+        let (rd, writer) = stream.into_split();
 
-    pub async fn pause_resume(&mut self) -> Result<()> {
-        let new_state = !self.is_paused;
-        self.write_command(&serde_json::json!({
-            "command": ["set_property", "pause", new_state]
-        }))
-        .await?;
-        self.is_paused = new_state;
-        Ok(())
-    }
-
-    pub async fn stop(&mut self) {
-        // Ask mpv to quit only if we actually have a live connection.
-        let sent_quit = if let Some(writer) = self.writer.as_mut() {
-            let msg = serde_json::json!({"command": ["quit"]}).to_string() + "\n";
-            writer.write_all(msg.as_bytes()).await.is_ok()
-        } else {
-            false
-        };
-        self.reader = None;
-        self.writer = None;
-
-        if let Some(mut child) = self.process.take() {
-            // Only wait for a clean exit if we managed to send quit; otherwise
-            // don't burn the timeout — kill immediately.
-            if sent_quit {
-                let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
-            }
-            let _ = child.kill().await;
-        }
-
-        let _ = std::fs::remove_file(&self.socket_path);
-        self.is_playing = false;
-        self.is_paused = false;
-        self.position = 0.0;
-        self.duration = 0.0;
-    }
-
-    pub async fn seek(&mut self, offset: f64) -> Result<()> {
-        self.write_command(&serde_json::json!({
-            "command": ["seek", offset, "relative"]
-        }))
-        .await
-    }
-
-    pub async fn set_volume(&mut self, vol: f64) -> Result<()> {
-        self.volume = vol.clamp(0.0, 100.0);
-        self.write_command(&serde_json::json!({
-            "command": ["set_property", "volume", self.volume]
-        }))
-        .await
-    }
-
-    /// Poll mpv for position/pause/duration. Called from the event loop tick.
-    pub async fn poll_status(&mut self) {
-        // Detect process exit (end of track or crash).
-        if let Some(child) = self.process.as_mut() {
-            if let Ok(Some(_)) = child.try_wait() {
-                self.on_exit();
-                return;
-            }
-        } else {
-            self.is_playing = false;
-            return;
-        }
-
-        if self.reader.is_none() {
-            return;
-        }
-
-        if let Ok(val) = self.get_property("time-pos").await
-            && let Some(pos) = val.as_f64()
+        let pending: Pending = Arc::default();
+        let alive = Arc::new(AtomicBool::new(true));
         {
-            self.position = pos;
-        }
-        if let Ok(val) = self.get_property("pause").await
-            && let Some(paused) = val.as_bool()
-        {
-            self.is_paused = paused;
-        }
-        if self.duration <= 0.0
-            && let Ok(val) = self.get_property("duration").await
-            && let Some(dur) = val.as_f64()
-        {
-            self.duration = dur;
-        }
-    }
-
-    fn on_exit(&mut self) {
-        self.is_playing = false;
-        self.is_paused = false;
-        self.process = None;
-        self.reader = None;
-        self.writer = None;
-        let _ = std::fs::remove_file(&self.socket_path);
-    }
-
-    /// Query a property, correlating the reply by request_id and skipping any
-    /// interleaved event / other-command lines. Bounded by an overall deadline.
-    async fn get_property(&mut self, name: &str) -> Result<Value> {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.write_command(&serde_json::json!({
-            "command": ["get_property", name],
-            "request_id": id,
-        }))
-        .await?;
-
-        let reader = self.reader.as_mut().context("not connected to mpv")?;
-        let deadline = Instant::now() + Duration::from_millis(200);
-        loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .context("timed out waiting for mpv reply")?;
-            let mut line = String::new();
-            let n = tokio::time::timeout(remaining, reader.read_line(&mut line)).await??;
-            if n == 0 {
-                bail!("mpv socket closed");
-            }
-            match classify_mpv_line(&line) {
-                MpvLine::Reply {
-                    request_id,
-                    error,
-                    data,
-                } if request_id == id => {
-                    if error != "success" {
-                        bail!("mpv get_property {name} failed: {error}");
+            let pending = pending.clone();
+            let alive = alive.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(rd).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    match classify_mpv_line(&line) {
+                        MpvLine::Reply {
+                            request_id,
+                            error,
+                            data,
+                        } => {
+                            let tx = pending.lock().unwrap().remove(&request_id);
+                            if let Some(tx) = tx {
+                                let _ = tx.send(if error == "success" {
+                                    Ok(data)
+                                } else {
+                                    Err(error)
+                                });
+                            }
+                        }
+                        MpvLine::Event(ev) => {
+                            let _ = events.send((generation, ev));
+                        }
+                        MpvLine::Other => {}
                     }
-                    return Ok(data);
                 }
-                // Skip replies to fire-and-forget commands and any events.
-                _ => continue,
-            }
+                // Mark dead before failing the waiters, so a command that
+                // registers after the drain sees `alive == false`.
+                alive.store(false, Ordering::SeqCst);
+                pending.lock().unwrap().clear();
+                let _ = events.send((generation, MpvEvent::Exited));
+            });
         }
-    }
 
-    async fn write_command(&mut self, cmd: &Value) -> Result<()> {
-        let writer = self.writer.as_mut().context("not connected to mpv")?;
-        let msg = cmd.to_string() + "\n";
-        writer.write_all(msg.as_bytes()).await?;
-        Ok(())
-    }
-
-    pub fn is_playing(&self) -> bool {
-        self.is_playing && self.process.is_some()
-    }
-
-    pub async fn wait_until_done(&mut self) {
-        if let Some(child) = self.process.as_mut() {
-            let _ = child.wait().await;
+        let mut mpv = MpvProcess {
+            child,
+            writer,
+            pending,
+            alive,
+            next_id: 1,
+            socket_path: opts.socket_path.clone(),
+        };
+        for (i, name) in OBSERVED.iter().enumerate() {
+            mpv.command(vec![json!("observe_property"), json!(i + 1), json!(name)])
+                .await?;
         }
-        self.is_playing = false;
+        Ok(mpv)
     }
 }
 
-impl Drop for MpvPlayer {
-    fn drop(&mut self) {
+impl MpvApi for MpvProcess {
+    async fn command(&mut self, args: Vec<Value>) -> Result<Value> {
+        if !self.alive() {
+            bail!("mpv is not running");
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(id, tx);
+        if !self.alive() {
+            self.pending.lock().unwrap().remove(&id);
+            bail!("mpv is not running");
+        }
+        let name = args
+            .first()
+            .and_then(|a| a.as_str())
+            .unwrap_or("")
+            .to_string();
+        let msg = json!({"command": args, "request_id": id}).to_string() + "\n";
+        if let Err(e) = self.writer.write_all(msg.as_bytes()).await {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(e).context("writing to mpv");
+        }
+        match tokio::time::timeout(COMMAND_TIMEOUT, rx).await {
+            Ok(Ok(Ok(data))) => Ok(data),
+            Ok(Ok(Err(error))) => bail!("mpv {name} failed: {error}"),
+            Ok(Err(_)) => bail!("mpv exited during {name}"),
+            Err(_) => {
+                self.pending.lock().unwrap().remove(&id);
+                bail!("mpv {name} timed out")
+            }
+        }
+    }
+
+    async fn quit(&mut self) {
+        if self.alive() {
+            let _ = self.writer.write_all(b"{\"command\":[\"quit\"]}\n").await;
+        }
+        self.alive.store(false, Ordering::SeqCst);
+        if tokio::time::timeout(Duration::from_secs(1), self.child.wait())
+            .await
+            .is_err()
+        {
+            let _ = self.child.kill().await;
+        }
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+
+    fn alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+}
+
+/// Spawns `MpvProcess`es from a template; the engine supplies the volume.
+#[derive(Debug, Clone)]
+pub struct ProcessSpawner {
+    pub opts_template: MpvOptions,
+}
+
+impl MpvSpawner for ProcessSpawner {
+    type Mpv = MpvProcess;
+
+    async fn spawn(
+        &self,
+        volume: f64,
+        generation: u64,
+        events: mpsc::UnboundedSender<(u64, MpvEvent)>,
+    ) -> Result<MpvProcess> {
+        let opts = MpvOptions {
+            volume,
+            ..self.opts_template.clone()
+        };
+        MpvProcess::spawn(&opts, generation, events).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn classifies_reply_event_and_garbage() {
@@ -321,14 +322,11 @@ mod tests {
             other => panic!("expected reply, got {other:?}"),
         }
         match classify_mpv_line(r#"{"event":"property-change","name":"time-pos","data":12.0}"#) {
-            MpvLine::Event { name, .. } => assert_eq!(name, "property-change"),
+            MpvLine::Event(MpvEvent::PropertyChange { name, .. }) => assert_eq!(name, "time-pos"),
             other => panic!("expected event, got {other:?}"),
         }
         match classify_mpv_line(r#"{"event":"end-file","reason":"eof"}"#) {
-            MpvLine::Event { name, reason } => {
-                assert_eq!(name, "end-file");
-                assert_eq!(reason.as_deref(), Some("eof"));
-            }
+            MpvLine::Event(MpvEvent::EndFile { reason }) => assert_eq!(reason, "eof"),
             other => panic!("expected end-file event, got {other:?}"),
         }
         assert_eq!(classify_mpv_line("not json"), MpvLine::Other);
@@ -345,7 +343,7 @@ mod tests {
             r#"{"request_id":2,"error":"success","data":42.0}"#,
         ];
         let classified: Vec<MpvLine> = lines.iter().map(|l| classify_mpv_line(l)).collect();
-        assert!(matches!(classified[0], MpvLine::Event { .. }));
+        assert!(matches!(classified[0], MpvLine::Event(_)));
         assert!(matches!(
             classified[1],
             MpvLine::Reply { request_id: 1, .. }
@@ -358,5 +356,176 @@ mod tests {
             } => assert_eq!(data.as_f64(), Some(42.0)),
             other => panic!("expected reply id 2, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classifies_property_change_with_name_and_data() {
+        assert_eq!(
+            classify_mpv_line(r#"{"event":"property-change","id":1,"name":"pause","data":true}"#),
+            MpvLine::Event(MpvEvent::PropertyChange {
+                name: "pause".into(),
+                data: json!(true),
+            })
+        );
+        assert_eq!(
+            classify_mpv_line(
+                r#"{"event":"property-change","id":5,"name":"path","data":"/a/b.opus"}"#
+            ),
+            MpvLine::Event(MpvEvent::PropertyChange {
+                name: "path".into(),
+                data: json!("/a/b.opus"),
+            })
+        );
+        // Unavailable property: mpv omits `data`.
+        assert_eq!(
+            classify_mpv_line(r#"{"event":"property-change","id":2,"name":"duration"}"#),
+            MpvLine::Event(MpvEvent::PropertyChange {
+                name: "duration".into(),
+                data: Value::Null,
+            })
+        );
+    }
+
+    #[test]
+    fn classifies_end_file_reason() {
+        assert_eq!(
+            classify_mpv_line(
+                r#"{"event":"end-file","reason":"error","playlist_entry_id":3,"file_error":"loading failed"}"#
+            ),
+            MpvLine::Event(MpvEvent::EndFile {
+                reason: "error".into()
+            })
+        );
+        assert_eq!(
+            classify_mpv_line(r#"{"event":"end-file","reason":"stop","playlist_entry_id":1}"#),
+            MpvLine::Event(MpvEvent::EndFile {
+                reason: "stop".into()
+            })
+        );
+    }
+
+    #[test]
+    fn classifies_file_loaded_restart_and_seek() {
+        assert_eq!(
+            classify_mpv_line(r#"{"event":"file-loaded"}"#),
+            MpvLine::Event(MpvEvent::FileLoaded)
+        );
+        assert_eq!(
+            classify_mpv_line(r#"{"event":"playback-restart"}"#),
+            MpvLine::Event(MpvEvent::PlaybackRestart)
+        );
+        assert_eq!(
+            classify_mpv_line(r#"{"event":"seek"}"#),
+            MpvLine::Event(MpvEvent::Seek)
+        );
+        // Events nothing consumes are not forwarded.
+        assert_eq!(
+            classify_mpv_line(r#"{"event":"audio-reconfig"}"#),
+            MpvLine::Other
+        );
+    }
+
+    #[test]
+    fn classifies_error_reply() {
+        assert_eq!(
+            classify_mpv_line(r#"{"request_id":9,"error":"property unavailable","data":null}"#),
+            MpvLine::Reply {
+                request_id: 9,
+                error: "property unavailable".into(),
+                data: Value::Null,
+            }
+        );
+    }
+
+    fn fixture(name: &str) -> String {
+        format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn test_opts(dir: &tempfile::TempDir) -> MpvOptions {
+        MpvOptions {
+            socket_path: dir.path().join("mpv.sock"),
+            ao: None,
+            volume: 50.0,
+            extra_args: vec!["--ao=null".into()],
+        }
+    }
+
+    /// Next event from the channel, bounded so a broken mpv fails the test.
+    async fn next_event(rx: &mut mpsc::UnboundedReceiver<(u64, MpvEvent)>) -> (u64, MpvEvent) {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for an mpv event")
+            .expect("event channel closed")
+    }
+
+    #[tokio::test]
+    #[ignore = "needs real mpv"]
+    async fn real_mpv_spawn_is_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut mpv = MpvProcess::spawn(&test_opts(&dir), 1, tx).await.unwrap();
+        assert!(mpv.alive());
+        let idle = mpv
+            .command(vec![json!("get_property"), json!("idle-active")])
+            .await
+            .unwrap();
+        assert_eq!(idle, json!(true));
+        mpv.quit().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs real mpv"]
+    async fn real_mpv_loadfile_emits_file_loaded_and_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut mpv = MpvProcess::spawn(&test_opts(&dir), 7, tx).await.unwrap();
+        mpv.command(vec![json!("loadfile"), json!(fixture("tone.opus"))])
+            .await
+            .unwrap();
+        let (mut loaded, mut duration) = (false, None);
+        while !loaded || duration.is_none() {
+            let (generation, ev) = next_event(&mut rx).await;
+            assert_eq!(generation, 7);
+            match ev {
+                MpvEvent::FileLoaded => loaded = true,
+                MpvEvent::PropertyChange { name, data } if name == "duration" => {
+                    duration = data.as_f64();
+                }
+                _ => {}
+            }
+        }
+        let d = duration.unwrap();
+        assert!((d - 4.0).abs() < 0.1, "duration {d}");
+        mpv.quit().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs real mpv"]
+    async fn real_mpv_quit_emits_exited() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut mpv = MpvProcess::spawn(&test_opts(&dir), 3, tx).await.unwrap();
+        mpv.quit().await;
+        assert!(!mpv.alive());
+        loop {
+            if let (3, MpvEvent::Exited) = next_event(&mut rx).await {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs real mpv"]
+    async fn real_mpv_command_after_exit_errors_quickly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut mpv = MpvProcess::spawn(&test_opts(&dir), 1, tx).await.unwrap();
+        mpv.quit().await;
+        let started = std::time::Instant::now();
+        let res = mpv
+            .command(vec![json!("get_property"), json!("idle-active")])
+            .await;
+        assert!(res.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
