@@ -2,7 +2,7 @@
 
 A YouTube audio player for macOS with a local cache. `yplay serve` runs in the background as a LaunchAgent and owns the library, playback, and downloads; the `yplay` CLI talks to it over a Unix socket. New URLs start playing while they download (first audio in a few seconds), and cached tracks play with no network access.
 
-The terminal UI (Ratatui) has been removed. A SwiftUI menu-bar app is the planned UI; it is upcoming and not available yet. Until then, control playback with the `yplay` CLI.
+The terminal UI (Ratatui) has been removed. The UI is a SwiftUI menu-bar app (see [Menu-bar app](#menu-bar-app)); the `yplay` CLI controls the same service.
 
 ## Architecture
 
@@ -63,6 +63,30 @@ scripts/uninstall.sh      # or: just uninstall
 ```
 
 Stops the service and removes the LaunchAgent plist and `~/.local/bin/yplay`. The cache, library DB, `config.toml`, and logs are kept.
+
+## Menu-bar app
+
+`Yplayer.app` lives in the menu bar only (no Dock icon). It is a client of the service: it needs `yplay serve` running (the `com.yplayer.service` LaunchAgent) and never plays audio itself. While it cannot reach the service it shows "Can't reach the yplay service — retrying in Ns" with a Retry Now button.
+
+- Status item: `music.note` when not playing, `waveform` while playing; click to open or close the popover.
+- Now-playing card: artwork, title, uploader, scrubber with elapsed/remaining time, previous · play/pause · next, loop mode (none → all → single → shuffle), volume, lyrics toggle (synced lyrics replace the library while on), and a ⋯ menu (Remove from Album…, Delete from Library…, Show in Finder, Copy YouTube Link).
+- Library tabs: Albums · Songs · Search. Albums: + creates an album, double-click a name to rename it, Delete Album… keeps its songs. An album's songs can be reordered by dragging. Downloading rows show progress; failed rows show a warning icon and a Retry menu item.
+- Track rows: double-click or Return plays; right-click for Play Next, Add to Album ▸, Remove from Album… (album view), Delete from Library…, Show in Finder, Copy YouTube Link, Retry (failed only), Rename…; trackpad swipe-left removes from the album (album view) or deletes from the library (Songs).
+- Deleting from the library moves the audio file to the Trash; every removal and deletion asks for confirmation first.
+- Media keys and Control Center's Now Playing show the current song and control the service.
+
+Keyboard shortcuts (popover open):
+
+| Key | Action |
+|-----|--------|
+| Space | Play/pause (not while typing in a text field) |
+| ⌘F | Search the library |
+| Return | Play the selected row |
+| ⌫ | Remove from album (album view) or delete from library (Songs), after confirmation |
+| ⌘⌫ | Delete from library, after confirmation |
+| Esc | Close the confirmation, else the popover |
+
+Install and uninstall: `scripts/install.sh` also builds the app with `scripts/build-app.sh`, installs it to `~/Applications/Yplayer.app` (replacing any previous copy), writes `~/Library/LaunchAgents/com.yplayer.app.plist` (`RunAtLoad`; relaunched only after an abnormal exit; GUI login sessions only; logs to `~/Library/Logs/yplayer/app.log`), and restarts it with `launchctl bootstrap gui/$UID`. `scripts/uninstall.sh` also stops the app and removes its LaunchAgent plist and `~/Applications/Yplayer.app`. `just app` only builds `build/Yplayer.app`.
 
 ## Usage
 
@@ -166,9 +190,11 @@ Legacy flat files (`<id>.<ext>` + `<id>.json`) are still recognized, and legacy 
 ```bash
 scripts/perf-budget.sh idle      # or: just perf idle
 scripts/perf-budget.sh playing   # while a track plays
+scripts/perf-budget.sh app-closed   # menu-bar app running, popover closed
+scripts/perf-budget.sh app-open     # popover open while a track plays
 ```
 
-Samples the running `yplay serve` and its mpv/Python children with `top` for 20 s and prints average CPU, idle wakeups/s, and max memory per process. Budget: `idle` — service ≤ 0.2 idle wakeups/s, < 10 MB, no mpv or Python worker running; `playing` — service ≤ 0.2 idle wakeups/s, mpv ≤ 60 MB. Exits 0 on PASS, 1 on FAIL.
+Samples the running `yplay serve` and its mpv/Python children (or, for the `app-*` states, the `Yplayer` process) with `top` for 20 s and prints average CPU, idle wakeups/s, and max memory per process. Budget: `idle` — service ≤ 0.2 idle wakeups/s, < 10 MB, no mpv or Python worker running; `playing` — service ≤ 0.2 idle wakeups/s, mpv ≤ 60 MB; `app-closed` — Yplayer ≤ 0.2 idle wakeups/s, < 40 MB; `app-open` — Yplayer ≤ 1.5 idle wakeups/s. Exits 0 on PASS, 1 on FAIL, 2 when the process is not running or more than one is.
 
 ## Development
 

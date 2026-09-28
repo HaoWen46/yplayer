@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build yplay and install `yplay serve` as the LaunchAgent com.yplayer.service.
+# Build yplay and install `yplay serve` as the LaunchAgent com.yplayer.service;
+# build the menu-bar app and install it as the LaunchAgent com.yplayer.app.
 # Idempotent: safe to re-run after pulling changes.
 set -euo pipefail
 
@@ -11,6 +12,10 @@ PYTHON="$REPO/.venv/bin/python3"
 CONFIG="$HOME/Library/Application Support/yplayer/config.toml"
 LOG="$HOME/Library/Logs/yplayer/service.log"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+APP_LABEL="com.yplayer.app"
+APP="$HOME/Applications/Yplayer.app"
+APP_LOG="$HOME/Library/Logs/yplayer/app.log"
+APP_PLIST="$HOME/Library/LaunchAgents/$APP_LABEL.plist"
 
 cd "$REPO"
 
@@ -75,3 +80,33 @@ launchctl bootstrap "$DOMAIN" "$PLIST"
 echo "==> status"
 launchctl print "$DOMAIN/$LABEL" | grep -E '^[[:space:]]*(state|pid|last exit code) =' || true
 echo "Log: $LOG"
+
+echo "==> building the menu-bar app"
+BUILT="$("$REPO/scripts/build-app.sh")"
+
+echo "==> staging $APP.tmp"
+mkdir -p "$(dirname "$APP")"
+rm -rf "$APP.tmp"
+ditto "$BUILT" "$APP.tmp"
+
+echo "==> rendering $APP_PLIST"
+sed -e "s|@BIN@|$APP/Contents/MacOS/Yplayer|g" -e "s|@LOG@|$APP_LOG|g" \
+    "$REPO/packaging/$APP_LABEL.plist.in" >"$APP_PLIST"
+
+echo "==> stopping $DOMAIN/$APP_LABEL (if loaded)"
+launchctl bootout "$DOMAIN/$APP_LABEL" 2>/dev/null || true
+for _ in $(seq 50); do
+    launchctl print "$DOMAIN/$APP_LABEL" >/dev/null 2>&1 || break
+    sleep 0.1
+done
+
+echo "==> installing $APP"
+rm -rf "$APP"
+mv "$APP.tmp" "$APP"
+
+echo "==> starting $DOMAIN/$APP_LABEL"
+launchctl bootstrap "$DOMAIN" "$APP_PLIST"
+
+echo "==> status"
+launchctl print "$DOMAIN/$APP_LABEL" | grep -E '^[[:space:]]*(state|pid|last exit code) =' || true
+echo "Log: $APP_LOG"
