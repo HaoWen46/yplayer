@@ -22,6 +22,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone)]
 pub struct WorkerOptions {
     pub worker_python: Option<String>,
+    /// Exact program + args; overrides `YPLAY_WORKER_CMD` and python discovery.
+    pub worker_cmd: Option<Vec<String>>,
     pub log_path: PathBuf,
     pub idle_timeout: Duration,       // 60 s in the service
     pub inactivity_timeout: Duration, // 180 s in the service
@@ -248,7 +250,13 @@ impl Actor {
     }
 
     async fn spawn_proc(&mut self) -> Result<()> {
-        let (program, args) = worker_command(self.opts.worker_python.as_deref())?;
+        let (program, args) = match &self.opts.worker_cmd {
+            Some(cmd) => {
+                let (program, args) = cmd.split_first().context("worker_cmd is empty")?;
+                (program.clone(), args.to_vec())
+            }
+            None => worker_command(self.opts.worker_python.as_deref())?,
+        };
         let stderr = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -631,6 +639,7 @@ note("exits", str(os.getpid()))
         unsafe { std::env::set_var("YPLAY_WORKER_CMD", cmd) };
         let worker = WorkerHandle::spawn(WorkerOptions {
             worker_python: None,
+            worker_cmd: None,
             log_path: tmp.path().join("worker.log"),
             idle_timeout: idle,
             inactivity_timeout: inactivity,

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -7,8 +7,9 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Instant;
 
+use super::downloads::{self, Downloads, JobMsg};
 use crate::config::{Config, SessionState};
-use crate::download::worker::WorkerHandle;
+use crate::download::worker::{JobId, WorkerHandle, WorkerMsg};
 use crate::http::HttpGet;
 use crate::library::db::{Db, DbError, LyricsRow};
 use crate::library::reconcile::{ReconcileReport, reconcile};
@@ -16,10 +17,12 @@ use crate::lyrics::{self, LyricsOutcome};
 use crate::player::engine::{Engine, EngineError, TrackResolver};
 use crate::player::mpv::{MpvEvent, MpvSpawner};
 use crate::protocol::{
-    Command, ContextRef, ErrorCode, Event, PROTOCOL, PlayState, PlayerState, Response,
+    AddResult, AlbumRef, Command, ContextRef, DownloadPhase, ErrorCode, Event, PROTOCOL, PlayState,
+    PlayerState, Response, Severity,
 };
 use crate::types::{Album, LoopMode, Track, TrackState};
 use crate::updater::{UpdateOutcome, Updater};
+use crate::ytid;
 
 pub const EVENT_CAPACITY: usize = 1024;
 /// Cached lyrics misses are retried after this long.
@@ -63,6 +66,7 @@ enum Internal {
         outcome: LyricsOutcome,
     },
     Updated(UpdateOutcome),
+    Job(JobMsg),
 }
 
 #[derive(Clone)]
@@ -99,14 +103,27 @@ fn respond(id: u64, result: Result<Value, CmdError>) -> Response {
     }
 }
 
-/// Complete tracks whose audio file exists play from that path.
-struct Resolver<'a>(&'a Db);
+/// Complete tracks whose audio file exists play from that path; downloading
+/// tracks whose `Started` arrived stream from `appending://<absolute path>`.
+struct Resolver<'a> {
+    db: &'a Db,
+    downloads: &'a Downloads,
+}
 
 impl TrackResolver for Resolver<'_> {
     fn playable_path(&self, track_id: &str) -> Option<String> {
-        let track = self.0.get_track(track_id).ok()??;
-        let path = track.audio_path?;
-        (track.state == TrackState::Complete && Path::new(&path).exists()).then_some(path)
+        let track = self.db.get_track(track_id).ok()??;
+        match track.state {
+            TrackState::Complete => {
+                let path = track.audio_path?;
+                Path::new(&path).exists().then_some(path)
+            }
+            TrackState::Downloading => {
+                let path = std::path::absolute(self.downloads.streaming_path(track_id)?).ok()?;
+                Some(format!("appending://{}", path.to_string_lossy()))
+            }
+            TrackState::Failed => None,
+        }
     }
 }
 
@@ -132,6 +149,9 @@ pub struct Core<S: MpvSpawner> {
     lyrics_waiters: HashMap<String, Vec<(u64, oneshot::Sender<Reply>)>>,
     reconciling: bool,
     update_at: Option<Instant>,
+    downloads: Downloads,
+    /// Track to play as soon as its download's `Started` arrives.
+    pending_play: Option<String>,
 }
 
 impl<S: MpvSpawner> Core<S> {
@@ -166,6 +186,8 @@ impl<S: MpvSpawner> Core<S> {
             lyrics_waiters: HashMap::new(),
             reconciling: false,
             update_at: None,
+            downloads: Downloads::default(),
+            pending_play: None,
         };
         let inbox = Inbox {
             requests: requests_rx,
@@ -194,7 +216,7 @@ impl<S: MpvSpawner> Core<S> {
                 () = &mut stop => return,
                 Some(req) = inbox.requests.recv() => self.on_request(req).await,
                 Some((generation, ev)) = inbox.mpv.recv() => self.on_mpv_event(generation, ev).await,
-                Some(msg) = inbox.internal.recv() => self.on_internal(msg),
+                Some(msg) = inbox.internal.recv() => self.on_internal(msg).await,
                 () = sleep_until_opt(self.engine.idle_deadline()) => self.engine.on_idle_deadline().await,
                 () = sleep_until_opt(self.update_at) => self.check_update(),
             }
@@ -213,7 +235,10 @@ impl<S: MpvSpawner> Core<S> {
         let Request { id, cmd, reply } = req;
         let prev = self.engine.state();
         let mut events = None;
-        let r = Resolver(&self.db);
+        let r = Resolver {
+            db: &self.db,
+            downloads: &self.downloads,
+        };
         let result = match cmd {
             Command::Hello { protocol } if protocol != PROTOCOL => Err(CmdError(
                 ErrorCode::ProtocolMismatch,
@@ -261,9 +286,11 @@ impl<S: MpvSpawner> Core<S> {
                 Ok(LyricsLookup::Fetch(track)) => return self.fetch_lyrics(id, *track, reply),
                 Err(e) => Err(e),
             },
-            Command::Add { .. } | Command::TrackDelete { .. } | Command::TrackRetry { .. } => {
-                Err(CmdError(ErrorCode::Internal, "not implemented".into()))
+            Command::Add { url, album, play } => self.add(&url, album, play).await,
+            Command::TrackDelete { track_id, to_trash } => {
+                self.track_delete(&track_id, to_trash).await
             }
+            Command::TrackRetry { track_id } => self.track_retry(&track_id),
         };
         self.player_changed(&prev, false);
         let _ = reply.send(Reply {
@@ -274,16 +301,16 @@ impl<S: MpvSpawner> Core<S> {
 
     async fn on_mpv_event(&mut self, generation: u64, ev: MpvEvent) {
         let prev = self.engine.state();
-        if self
-            .engine
-            .on_mpv_event(generation, ev, &Resolver(&self.db))
-            .await
-        {
+        let r = Resolver {
+            db: &self.db,
+            downloads: &self.downloads,
+        };
+        if self.engine.on_mpv_event(generation, ev, &r).await {
             self.player_changed(&prev, true);
         }
     }
 
-    fn on_internal(&mut self, msg: Internal) {
+    async fn on_internal(&mut self, msg: Internal) {
         match msg {
             Internal::Reconciled(result) => self.on_reconciled(result),
             Internal::Lyrics { track_id, outcome } => self.on_lyrics(track_id, outcome),
@@ -293,6 +320,7 @@ impl<S: MpvSpawner> Core<S> {
                     self.worker.restart_when_idle();
                 }
             }
+            Internal::Job(msg) => self.on_job(msg).await,
         }
     }
 
@@ -362,8 +390,12 @@ impl<S: MpvSpawner> Core<S> {
             ContextRef::Album(album_id) => self.require_album(*album_id)?.track_ids,
             ContextRef::Library => self.db.library_order()?,
         };
+        let r = Resolver {
+            db: &self.db,
+            downloads: &self.downloads,
+        };
         self.engine
-            .play(context.clone(), order, &track_id, &Resolver(&self.db))
+            .play(context.clone(), order, &track_id, &r)
             .await?;
         self.db.touch_last_played(&track_id)?;
         if let ContextRef::Album(album_id) = context {
@@ -374,7 +406,11 @@ impl<S: MpvSpawner> Core<S> {
 
     async fn play_next(&mut self, track_id: &str) -> Result<Value, CmdError> {
         self.require_track(track_id)?;
-        ok(self.engine.play_next(track_id, &Resolver(&self.db)).await)
+        let r = Resolver {
+            db: &self.db,
+            downloads: &self.downloads,
+        };
+        ok(self.engine.play_next(track_id, &r).await)
     }
 
     /// Emit `album.upsert` for `album_id` and bump the library version.
@@ -396,7 +432,11 @@ impl<S: MpvSpawner> Core<S> {
             .get_album(album_id)?
             .map(|a| a.track_ids)
             .unwrap_or_default();
-        let _ = self.engine.replace_order(order, &Resolver(&self.db)).await;
+        let r = Resolver {
+            db: &self.db,
+            downloads: &self.downloads,
+        };
+        let _ = self.engine.replace_order(order, &r).await;
         Ok(())
     }
 
@@ -461,6 +501,314 @@ impl<S: MpvSpawner> Core<S> {
         Ok(json!({}))
     }
 
+    /// Emit `track.upsert` for `track_id` and bump the library version.
+    fn track_changed(&mut self, track_id: &str) -> Result<(), CmdError> {
+        let track = self.require_track(track_id)?;
+        self.emit(Event::TrackUpsert { track });
+        self.library_version += 1;
+        Ok(())
+    }
+
+    fn emit_download(
+        &self,
+        track_id: &str,
+        phase: DownloadPhase,
+        bytes: Option<u64>,
+        total: Option<u64>,
+        error: Option<String>,
+    ) {
+        self.emit(Event::Download {
+            track_id: track_id.to_string(),
+            phase,
+            bytes,
+            total,
+            error,
+        });
+    }
+
+    fn toast(&self, severity: Severity, message: String) {
+        self.emit(Event::Toast { severity, message });
+    }
+
+    /// The drop flow: link to the album, then play the cached file, stream
+    /// the in-flight download, or start a new one.
+    async fn add(
+        &mut self,
+        url: &str,
+        album: Option<AlbumRef>,
+        play: bool,
+    ) -> Result<Value, CmdError> {
+        let track_id = ytid::parse_video_id(url).map_err(|e| {
+            let (code, msg) = downloads::url_error(e);
+            CmdError(code, msg.into())
+        })?;
+        let album_id = match album {
+            None => match self.db.last_used_album()? {
+                Some(id) => id,
+                None => self.db.get_or_create_album("Inbox")?,
+            },
+            Some(AlbumRef::Name { name }) => self.db.get_or_create_album(&name)?,
+            Some(AlbumRef::Id { id }) => self.require_album(id)?.id,
+        };
+        self.db.touch_album(album_id)?;
+        let existing = self.db.get_track(&track_id)?;
+        let was_new = existing.is_none();
+        let was_in_album = self.db.albums_containing(&track_id)?.contains(&album_id);
+        let cached = existing.is_some_and(|t| {
+            t.state == TrackState::Complete && t.audio_path.is_some_and(|p| Path::new(&p).exists())
+        });
+        if cached {
+            self.album_add(album_id, &track_id).await?;
+            if play {
+                self.play_dropped(&track_id, album_id).await?;
+            }
+        } else if let Some(d) = self.downloads.get_mut(&track_id) {
+            if play {
+                d.album_id = Some(album_id);
+            }
+            self.album_add(album_id, &track_id).await?;
+            if play {
+                if self.downloads.streaming_path(&track_id).is_some() {
+                    self.play_dropped(&track_id, album_id).await?;
+                } else {
+                    self.pending_play = Some(track_id.clone());
+                }
+            }
+        } else {
+            self.db
+                .insert_pending(&track_id, &downloads::canonical_url(&track_id))?;
+            self.track_changed(&track_id)?;
+            self.album_add(album_id, &track_id).await?;
+            self.start_download(&track_id, play.then_some(album_id));
+            if play {
+                self.pending_play = Some(track_id.clone());
+            }
+        }
+        Ok(json!(AddResult {
+            track_id,
+            album_id,
+            was_new,
+            was_in_album,
+        }))
+    }
+
+    /// Play `[track_id]` followed by the album's other tracks in album order.
+    async fn play_dropped(&mut self, track_id: &str, album_id: i64) -> Result<(), CmdError> {
+        let album = self.require_album(album_id)?;
+        let order: Vec<String> = std::iter::once(track_id.to_string())
+            .chain(album.track_ids.into_iter().filter(|id| id != track_id))
+            .collect();
+        let r = Resolver {
+            db: &self.db,
+            downloads: &self.downloads,
+        };
+        self.engine
+            .play(ContextRef::Album(album_id), order, track_id, &r)
+            .await?;
+        self.db.touch_last_played(track_id)?;
+        Ok(())
+    }
+
+    /// Send a download job to the worker and forward its messages into the
+    /// core loop.
+    fn start_download(&mut self, track_id: &str, album_id: Option<i64>) {
+        let (job, mut rx) = self.worker.download(
+            downloads::canonical_url(track_id),
+            self.config.cache_dir.clone(),
+        );
+        let tx = self.internal.clone();
+        let id = track_id.to_string();
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                let msg = JobMsg {
+                    track_id: id.clone(),
+                    job,
+                    msg,
+                };
+                if tx.send(Internal::Job(msg)).is_err() {
+                    return;
+                }
+            }
+        });
+        self.downloads.insert(track_id, job, album_id);
+        self.emit_download(track_id, DownloadPhase::Fetching, None, None, None);
+    }
+
+    async fn on_job(&mut self, JobMsg { track_id, job, msg }: JobMsg) {
+        if !self.downloads.is_active(&track_id, job) {
+            if self.downloads.is_doomed(job) {
+                self.on_doomed_job(&track_id, job, msg);
+            }
+            return;
+        }
+        let prev = self.engine.state();
+        match msg {
+            WorkerMsg::Started { path, dir, meta } => {
+                let _ = self.db.mark_started(&track_id, &meta, &path);
+                if let Some(d) = self.downloads.get_mut(&track_id) {
+                    d.path = Some(path);
+                    d.dir = Some(dir);
+                }
+                let _ = self.track_changed(&track_id);
+                self.emit_download(&track_id, DownloadPhase::Downloading, None, None, None);
+                if self.pending_play.as_deref() == Some(track_id.as_str()) {
+                    self.pending_play = None;
+                    if let Some(album_id) = self.downloads.get(&track_id).and_then(|d| d.album_id)
+                        && let Err(CmdError(_, message)) =
+                            self.play_dropped(&track_id, album_id).await
+                    {
+                        self.toast(Severity::Error, message);
+                    }
+                }
+            }
+            WorkerMsg::Progress { bytes, total } => {
+                if self
+                    .downloads
+                    .get_mut(&track_id)
+                    .is_some_and(|d| d.progress_due())
+                {
+                    self.emit_download(
+                        &track_id,
+                        DownloadPhase::Downloading,
+                        Some(bytes),
+                        total,
+                        None,
+                    );
+                }
+            }
+            WorkerMsg::Done {
+                path,
+                meta,
+                thumb,
+                format,
+                file_size,
+                ..
+            } => {
+                self.downloads.finish(&track_id);
+                let _ = self.db.mark_complete(
+                    &track_id,
+                    &meta,
+                    &path,
+                    format.as_deref(),
+                    file_size,
+                    thumb.as_deref(),
+                );
+                let _ = self.track_changed(&track_id);
+                self.emit_download(&track_id, DownloadPhase::Done, None, None, None);
+            }
+            WorkerMsg::Failed {
+                error,
+                cancelled,
+                transport,
+            } => {
+                let download = self.downloads.finish(&track_id);
+                if self.pending_play.as_deref() == Some(track_id.as_str()) {
+                    self.pending_play = None;
+                }
+                if let Some(dir) = download.and_then(|d| d.dir) {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                if cancelled {
+                    self.emit_download(&track_id, DownloadPhase::Cancelled, None, None, None);
+                } else {
+                    let _ = self.db.mark_failed(&track_id);
+                    let _ = self.track_changed(&track_id);
+                    self.emit_download(
+                        &track_id,
+                        DownloadPhase::Failed,
+                        None,
+                        None,
+                        Some(error.clone()),
+                    );
+                    let message = if transport {
+                        format!("Downloader unavailable: {error}")
+                    } else {
+                        error
+                    };
+                    self.toast(Severity::Error, message);
+                }
+            }
+        }
+        self.player_changed(&prev, false);
+    }
+
+    /// A job of a deleted track: remove its folder after the terminal message.
+    fn on_doomed_job(&mut self, track_id: &str, job: JobId, msg: WorkerMsg) {
+        let done_dir = match msg {
+            WorkerMsg::Started { dir, .. } => {
+                self.downloads.doomed_started(job, dir);
+                return;
+            }
+            WorkerMsg::Progress { .. } => return,
+            WorkerMsg::Done { dir, .. } => Some(dir),
+            WorkerMsg::Failed { .. } => None,
+        };
+        let Some((dir, to_trash)) = self.downloads.take_doomed(job) else {
+            return;
+        };
+        if let Some(dir) = dir.or(done_dir) {
+            let _ = downloads::remove_path(Path::new(&dir), to_trash);
+        }
+        self.emit_download(track_id, DownloadPhase::Cancelled, None, None, None);
+    }
+
+    /// Cancel its download, move playback on, drop the row, then remove its
+    /// files (an in-flight download's folder goes after its terminal message).
+    async fn track_delete(&mut self, track_id: &str, to_trash: bool) -> Result<Value, CmdError> {
+        let track = self.require_track(track_id)?;
+        let in_flight = match self.downloads.doom(track_id, to_trash) {
+            Some(job) => {
+                self.worker.cancel(job);
+                true
+            }
+            None => false,
+        };
+        if self.pending_play.as_deref() == Some(track_id) {
+            self.pending_play = None;
+        }
+        let r = Resolver {
+            db: &self.db,
+            downloads: &self.downloads,
+        };
+        let _ = self.engine.remove_track(track_id, &r).await;
+        let albums = self.db.albums_containing(track_id)?;
+        self.db.delete_track(track_id)?;
+        self.emit(Event::TrackRemoved {
+            track_id: track_id.to_string(),
+        });
+        self.library_version += 1;
+        for album_id in albums {
+            self.album_changed(album_id)?;
+        }
+        if !in_flight {
+            for path in downloads::track_files(&track) {
+                downloads::remove_path(&path, to_trash).map_err(|e| {
+                    CmdError(
+                        ErrorCode::Internal,
+                        format!("removing {}: {e:#}", path.display()),
+                    )
+                })?;
+            }
+        }
+        Ok(json!({}))
+    }
+
+    /// Re-download a failed track: no album change, no play.
+    fn track_retry(&mut self, track_id: &str) -> Result<Value, CmdError> {
+        let track = self.require_track(track_id)?;
+        if track.state != TrackState::Failed {
+            return Err(CmdError(
+                ErrorCode::BadRequest,
+                "only failed tracks can be retried".into(),
+            ));
+        }
+        self.db
+            .insert_pending(track_id, &downloads::canonical_url(track_id))?;
+        self.track_changed(track_id)?;
+        self.start_download(track_id, None);
+        Ok(json!({}))
+    }
+
     fn spawn_reconcile(&mut self) {
         if self.reconciling {
             return;
@@ -468,11 +816,12 @@ impl<S: MpvSpawner> Core<S> {
         self.reconciling = true;
         let db_path = self.config.db_path();
         let cache_dir = self.config.cache_dir.clone();
+        let in_flight = self.downloads.in_flight();
         let tx = self.internal.clone();
         tokio::task::spawn_blocking(move || {
             let result = Db::open(&db_path, &cache_dir)
                 .map_err(anyhow::Error::from)
-                .and_then(|db| reconcile(&cache_dir, &db, &HashSet::new()))
+                .and_then(|db| reconcile(&cache_dir, &db, &in_flight))
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Internal::Reconciled(result));
         });

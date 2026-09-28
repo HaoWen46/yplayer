@@ -32,6 +32,7 @@ anyhow = "1"
 which = "8"
 rand = "0.10"
 regex-lite = "0.1"
+trash = "5.2.9"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,5 +1,6 @@
 pub mod conn;
 pub mod core;
+pub mod downloads;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -55,6 +56,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     };
     let worker = WorkerHandle::spawn(WorkerOptions {
         worker_python: config.worker_python.clone(),
+        worker_cmd: None,
         log_path: Config::worker_log_path(&state_dir),
         idle_timeout: WORKER_IDLE,
         inactivity_timeout: WORKER_INACTIVITY,
@@ -157,6 +159,7 @@ mod tests {
     use crate::protocol::{Command, ContextRef, MAX_LINE};
     use crate::types::{LoopMode, Track, TrackState};
     use serde_json::{Value, json};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::sync::oneshot;
@@ -183,6 +186,32 @@ mod tests {
             let _ = self.stop.take().unwrap().send(());
             self.task.take().unwrap().await.unwrap();
         }
+
+        /// Worker processes started (the fake appends its pid to `spawns`).
+        fn spawns(&self) -> usize {
+            lines(&self.dir.path().join("spawns")).len()
+        }
+
+        /// Let the fake worker finish a `hold…` download.
+        fn release(&self, vid: &str) {
+            std::fs::write(self.dir.path().join(format!("release-{vid}")), b"").unwrap();
+        }
+
+        fn track_dir(&self, vid: &str) -> PathBuf {
+            self.cache().join(format!("Title {vid} [{}]", &vid[..8]))
+        }
+    }
+
+    impl Drop for Svc {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.sock);
+        }
+    }
+
+    fn lines(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .map(|s| s.lines().map(String::from).collect())
+            .unwrap_or_default()
     }
 
     fn config(dir: &Path) -> Config {
@@ -217,11 +246,17 @@ mod tests {
         db
     }
 
-    fn new_core(dir: &Path, fake: &FakeSpawner, capacity: usize) -> (Core<FakeSpawner>, Inbox) {
+    fn new_core(
+        dir: &Path,
+        fake: &FakeSpawner,
+        capacity: usize,
+        worker_cmd: Option<Vec<String>>,
+    ) -> (Core<FakeSpawner>, Inbox) {
         let config = config(dir);
         let db = seed(&config);
         let worker = WorkerHandle::spawn(WorkerOptions {
             worker_python: None,
+            worker_cmd,
             log_path: dir.join("worker.log"),
             idle_timeout: WORKER_IDLE,
             inactivity_timeout: WORKER_INACTIVITY,
@@ -246,9 +281,38 @@ mod tests {
     async fn start(capacity: usize) -> Svc {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("yplay.sock");
+        launch(dir, sock, capacity, None).await
+    }
+
+    static SOCK_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    /// A running service whose worker is `FAKE_WORKER`; its socket is a
+    /// short path under /tmp.
+    async fn start_with_worker() -> Svc {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake_worker.py");
+        std::fs::write(&script, FAKE_WORKER).unwrap();
+        let sock = PathBuf::from(format!(
+            "/tmp/yp13-{}-{}.sock",
+            std::process::id(),
+            SOCK_SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        let cmd = vec![
+            "/usr/bin/python3".to_string(),
+            script.to_string_lossy().into_owned(),
+        ];
+        launch(dir, sock, EVENT_CAPACITY, Some(cmd)).await
+    }
+
+    async fn launch(
+        dir: tempfile::TempDir,
+        sock: PathBuf,
+        capacity: usize,
+        worker_cmd: Option<Vec<String>>,
+    ) -> Svc {
         let fake = FakeSpawner::default();
         let listener = bind_socket(&sock).await.unwrap();
-        let (mut core, inbox) = new_core(dir.path(), &fake, capacity);
+        let (mut core, inbox) = new_core(dir.path(), &fake, capacity, worker_cmd);
         core.start();
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::task::spawn_local(run(core, inbox, listener, sock.clone(), async move {
@@ -303,6 +367,26 @@ mod tests {
             let resp = self.recv().await;
             assert_eq!(resp["id"], id, "{resp}");
             resp
+        }
+
+        /// A connection that has subscribed; it then only receives events.
+        async fn subscribed(sock: &Path) -> Client {
+            let mut c = Client::connect(sock).await;
+            c.call(json!({"id": 0, "cmd": "subscribe"})).await;
+            c
+        }
+
+        /// Events up to and including the first one matching `pred`.
+        async fn until(&mut self, pred: impl Fn(&Value) -> bool) -> Vec<Value> {
+            let mut seen = Vec::new();
+            loop {
+                let ev = self.recv().await;
+                let hit = pred(&ev);
+                seen.push(ev);
+                if hit {
+                    return seen;
+                }
+            }
         }
     }
 
@@ -593,7 +677,7 @@ mod tests {
         let sock = dir.path().join("yplay.sock");
         let _listener = bind_socket(&sock).await.unwrap();
         let fake = FakeSpawner::default();
-        let (mut core, _inbox) = new_core(dir.path(), &fake, EVENT_CAPACITY);
+        let (mut core, _inbox) = new_core(dir.path(), &fake, EVENT_CAPACITY, None);
         for cmd in [
             Command::Volume { value: 42.0 },
             Command::Loop {
@@ -619,5 +703,490 @@ mod tests {
         assert_eq!(session.loop_mode, Some(LoopMode::All));
         assert_eq!(session.last_track_id.as_deref(), Some(A));
         assert_eq!(session.last_context, Some(json!({"library": true})));
+    }
+
+    // Speaks worker protocol v2. The video id's first four characters pick
+    // the behaviour: `okay` completes at once; `hold` waits for a
+    // `release-<id>` file (or a cancel); `fail` fails after `started`;
+    // `flak` fails the first time and completes afterwards. Spawns and
+    // cancels are appended to files next to the script.
+    const FAKE_WORKER: &str = r#"
+import json, os, sys, threading, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+lock = threading.Lock()
+cancels = {}
+
+
+def note(name, text):
+    with open(os.path.join(HERE, name), "a") as f:
+        f.write(text + "\n")
+
+
+def send(obj):
+    with lock:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+def held(n, vid):
+    release = os.path.join(HERE, "release-" + vid)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if cancels[n].is_set():
+            return "cancelled"
+        if os.path.exists(release):
+            return "released"
+        time.sleep(0.02)
+    return "timeout"
+
+
+def download(req):
+    n = req["id"]
+    vid = req["url"].split("v=", 1)[1][:11]
+    kind = vid[:4]
+    if kind == "flak":
+        marker = os.path.join(HERE, "flaky-" + vid)
+        kind = "okay" if os.path.exists(marker) else "fail"
+        open(marker, "a").close()
+    d = os.path.join(req["cache_dir"], "Title " + vid + " [" + vid[:8] + "]")
+    path = os.path.join(d, "audio.webm")
+    meta = {"id": vid, "title": "Title " + vid, "uploader": "Up", "duration": 42,
+            "webpage_url": "https://www.youtube.com/watch?v=" + vid}
+    os.makedirs(d, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(b"x" * 100)
+    send({"id": n, "event": "started", "path": path, "dir": d, "meta": meta})
+    send({"id": n, "event": "progress", "bytes": 50, "total": 100})
+    send({"id": n, "event": "progress", "bytes": 100, "total": 100})
+    if kind == "fail":
+        send({"id": n, "ok": False, "error": "ERROR: [youtube] " + vid + ": Video unavailable",
+              "cancelled": False})
+        return
+    if kind == "hold":
+        outcome = held(n, vid)
+        if outcome == "cancelled":
+            send({"id": n, "ok": False, "error": "cancelled", "cancelled": True})
+            return
+        if outcome == "timeout":
+            send({"id": n, "ok": False, "error": "hold timed out", "cancelled": False})
+            return
+    thumb = os.path.join(d, "cover.jpg")
+    open(thumb, "wb").close()
+    with open(os.path.join(d, "meta.json"), "w") as f:
+        json.dump(meta, f)
+    send({"id": n, "ok": True, "path": path, "dir": d, "meta": meta, "thumb": thumb,
+          "format": "webm", "file_size": 100})
+
+
+note("spawns", str(os.getpid()))
+send({"event": "ready", "ok": True, "protocol": 2})
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    req = json.loads(line)
+    if req["cmd"] == "cancel":
+        note("cancels", str(req["target"]))
+        if req["target"] in cancels:
+            cancels[req["target"]].set()
+        send({"id": req["id"], "ok": True})
+    elif req["cmd"] == "download":
+        cancels[req["id"]] = threading.Event()
+        threading.Thread(target=download, args=(req,), daemon=True).start()
+"#;
+
+    fn is_download(ev: &Value, vid: &str, phase: &str) -> bool {
+        ev["event"] == "download" && ev["track_id"] == vid && ev["phase"] == phase
+    }
+
+    fn is_player(ev: &Value, vid: &str) -> bool {
+        ev["event"] == "player" && ev["track_id"] == vid
+    }
+
+    fn loadfile(path: &str) -> Vec<Value> {
+        vec![json!("loadfile"), json!(path), json!("replace")]
+    }
+
+    fn seeded_path(svc: &Svc, id: &str) -> String {
+        svc.cache()
+            .join(format!("Song {id} [{}]/audio.opus", &id[..8]))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn appending(svc: &Svc, vid: &str) -> String {
+        format!(
+            "appending://{}",
+            svc.track_dir(vid).join("audio.webm").display()
+        )
+    }
+
+    fn track<'a>(lib: &'a Value, id: &str) -> Option<&'a Value> {
+        lib["result"]["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == id)
+    }
+
+    #[tokio::test]
+    async fn add_cache_hit_plays_without_worker_spawn() {
+        LocalSet::new()
+            .run_until(async {
+                let mut svc = start_with_worker().await;
+                let mut sub = Client::subscribed(&svc.sock).await;
+                let mut c = Client::connect(&svc.sock).await;
+                let aid = c
+                    .call(json!({"id": 1, "cmd": "album.create", "name": "Mix"}))
+                    .await["result"]["album"]["id"]
+                    .as_i64()
+                    .unwrap();
+                c.call(json!({"id": 2, "cmd": "album.add", "album_id": aid, "track_id": B}))
+                    .await;
+
+                let resp = c
+                    .call(json!({"id": 3, "cmd": "add",
+                        "url": format!("https://www.youtube.com/watch?v={A}&list=PLx"),
+                        "album": {"name": "Mix"}}))
+                    .await;
+                assert_eq!(
+                    resp["result"],
+                    json!({"track_id": A, "album_id": aid, "was_new": false, "was_in_album": false})
+                );
+                let evs = sub.until(|ev| is_player(ev, A)).await;
+                let player = evs.last().unwrap();
+                assert_eq!(player["state"], json!("playing"));
+                assert_eq!(player["context"], json!({"album_id": aid}));
+                assert_eq!(svc.fake.commands(), vec![loadfile(&seeded_path(&svc, A))]);
+
+                // Drop-play context: the dropped track, then the album's others.
+                c.call(json!({"id": 4, "cmd": "next"})).await;
+                assert_eq!(
+                    svc.fake.commands().last().unwrap(),
+                    &loadfile(&seeded_path(&svc, B))
+                );
+
+                // Default album: last used; already linked now.
+                let resp = c
+                    .call(
+                        json!({"id": 5, "cmd": "add", "url": format!("https://youtu.be/{A}"),
+                        "album": null, "play": false}),
+                    )
+                    .await;
+                assert_eq!(resp["result"]["album_id"], json!(aid));
+                assert_eq!(resp["result"]["was_in_album"], json!(true));
+                let lib = c.call(json!({"id": 6, "cmd": "library.get"})).await;
+                assert_eq!(lib["result"]["albums"][0]["track_ids"], json!([B, A]));
+                assert_eq!(svc.spawns(), 0);
+                svc.stop().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn add_new_url_streams_via_appending_then_completes() {
+        const V: &str = "okayaaaaaaa";
+        LocalSet::new()
+            .run_until(async {
+                let mut svc = start_with_worker().await;
+                let mut sub = Client::subscribed(&svc.sock).await;
+                let mut c = Client::connect(&svc.sock).await;
+
+                let resp = c
+                    .call(
+                        json!({"id": 1, "cmd": "add", "url": format!("https://youtu.be/{V}?si=x"),
+                        "album": null}),
+                    )
+                    .await;
+                let result = &resp["result"];
+                assert_eq!(result["track_id"], json!(V));
+                assert_eq!(result["was_new"], json!(true));
+                assert_eq!(result["was_in_album"], json!(false));
+
+                let evs = sub.until(|ev| is_download(ev, V, "done")).await;
+                let steps: Vec<String> = evs
+                    .iter()
+                    .filter(|ev| ev["event"] == "download" || ev["event"] == "player")
+                    .map(|ev| match ev["event"].as_str().unwrap() {
+                        "player" => format!("player:{}", ev["state"].as_str().unwrap()),
+                        _ => format!("{}:{}", ev["phase"].as_str().unwrap(), ev["bytes"]),
+                    })
+                    .collect();
+                // The second progress line arrives within 500 ms: throttled.
+                assert_eq!(
+                    steps,
+                    [
+                        "fetching:null",
+                        "downloading:null",
+                        "player:playing",
+                        "downloading:50",
+                        "done:null",
+                    ]
+                );
+                assert!(evs.iter().any(|ev| ev["event"] == "album.upsert"
+                    && ev["album"]["name"] == "Inbox"
+                    && ev["album"]["track_ids"] == json!([V])));
+                assert_eq!(svc.fake.commands(), vec![loadfile(&appending(&svc, V))]);
+
+                let lib = c.call(json!({"id": 2, "cmd": "library.get"})).await;
+                let t = track(&lib, V).unwrap();
+                let dir = svc.track_dir(V);
+                assert_eq!(t["state"], json!("complete"));
+                assert_eq!(t["title"], json!(format!("Title {V}")));
+                assert_eq!(t["audio_path"], json!(dir.join("audio.webm")));
+                assert_eq!(t["thumb_path"], json!(dir.join("cover.jpg")));
+                assert_eq!(t["format"], json!("webm"));
+                assert_eq!(t["file_size"], json!(100));
+                assert_eq!(svc.spawns(), 1);
+                svc.stop().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn second_drop_plays_on_its_started_while_first_still_downloads() {
+        const V1: &str = "holdaaaaaaa";
+        const V2: &str = "holdbbbbbbb";
+        LocalSet::new()
+            .run_until(async {
+                let mut svc = start_with_worker().await;
+                let mut sub = Client::subscribed(&svc.sock).await;
+                let mut c = Client::connect(&svc.sock).await;
+
+                c.call(json!({"id": 1, "cmd": "add", "url": format!("https://youtu.be/{V1}"), "album": null}))
+                    .await;
+                sub.until(|ev| is_player(ev, V1)).await;
+                c.call(json!({"id": 2, "cmd": "add", "url": format!("https://youtu.be/{V2}"), "album": null}))
+                    .await;
+                sub.until(|ev| is_player(ev, V2)).await;
+                assert_eq!(
+                    svc.fake.commands(),
+                    vec![loadfile(&appending(&svc, V1)), loadfile(&appending(&svc, V2))]
+                );
+                let lib = c.call(json!({"id": 3, "cmd": "library.get"})).await;
+                for v in [V1, V2] {
+                    assert_eq!(track(&lib, v).unwrap()["state"], json!("downloading"));
+                }
+
+                svc.release(V1);
+                svc.release(V2);
+                sub.until(|ev| is_download(ev, V1, "done")).await;
+                let lib = c.call(json!({"id": 4, "cmd": "library.get"})).await;
+                assert_eq!(track(&lib, V1).unwrap()["state"], json!("complete"));
+                assert_eq!(svc.spawns(), 1);
+                svc.stop().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn add_rejects_playlist_and_non_youtube_urls() {
+        LocalSet::new()
+            .run_until(async {
+                let mut svc = start_with_worker().await;
+                let mut c = Client::connect(&svc.sock).await;
+                let resp = c
+                    .call(json!({"id": 1, "cmd": "add", "url": "https://www.youtube.com/playlist?list=PLabc", "album": null}))
+                    .await;
+                assert_eq!(
+                    resp["error"],
+                    json!({"code": "unsupported_url", "message": "Playlists are not supported yet"})
+                );
+                for (id, url) in [
+                    (2, "https://vimeo.com/123"),
+                    (3, "https://www.youtube.com/watch?v=short"),
+                ] {
+                    let resp = c
+                        .call(json!({"id": id, "cmd": "add", "url": url, "album": null}))
+                        .await;
+                    assert_eq!(resp["error"]["code"], json!("invalid_url"), "{url}");
+                }
+                let lib = c.call(json!({"id": 4, "cmd": "library.get"})).await;
+                assert_eq!(lib["result"]["albums"], json!([]));
+                assert_eq!(svc.spawns(), 0);
+                svc.stop().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn undo_during_download_cancels_job_and_removes_dir() {
+        const V: &str = "holdccccccc";
+        LocalSet::new()
+            .run_until(async {
+                let mut svc = start_with_worker().await;
+                let mut sub = Client::subscribed(&svc.sock).await;
+                let mut c = Client::connect(&svc.sock).await;
+
+                let resp = c
+                    .call(json!({"id": 1, "cmd": "add", "url": format!("https://youtu.be/{V}"), "album": null}))
+                    .await;
+                let aid = resp["result"]["album_id"].as_i64().unwrap();
+                sub.until(|ev| is_player(ev, V)).await;
+                assert!(svc.track_dir(V).is_dir());
+
+                let resp = c
+                    .call(json!({"id": 2, "cmd": "album.remove", "album_id": aid, "track_id": V}))
+                    .await;
+                assert_eq!(resp["ok"], json!(true));
+                let resp = c
+                    .call(json!({"id": 3, "cmd": "track.delete", "track_id": V, "to_trash": false}))
+                    .await;
+                assert_eq!(resp["ok"], json!(true), "{resp}");
+
+                let evs = sub.until(|ev| is_download(ev, V, "cancelled")).await;
+                assert!(evs.contains(&json!({"event": "track.removed", "track_id": V})));
+                assert!(!svc.track_dir(V).exists());
+                assert_eq!(lines(&svc.dir.path().join("cancels")).len(), 1);
+                let lib = c.call(json!({"id": 4, "cmd": "library.get"})).await;
+                assert!(track(&lib, V).is_none());
+                assert_eq!(lib["result"]["albums"][0]["track_ids"], json!([]));
+                let now = c.call(json!({"id": 5, "cmd": "now"})).await;
+                assert_eq!(now["result"]["player"]["state"], json!("stopped"));
+                svc.stop().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn failed_download_deletes_dir_marks_failed_and_toasts() {
+        const V: &str = "failaaaaaaa";
+        LocalSet::new()
+            .run_until(async {
+                let mut svc = start_with_worker().await;
+                let mut sub = Client::subscribed(&svc.sock).await;
+                let mut c = Client::connect(&svc.sock).await;
+
+                c.call(
+                    json!({"id": 1, "cmd": "add", "url": format!("https://youtu.be/{V}"),
+                    "album": null, "play": false}),
+                )
+                .await;
+                let evs = sub.until(|ev| ev["event"] == "toast").await;
+                let error = format!("ERROR: [youtube] {V}: Video unavailable");
+                assert_eq!(
+                    evs.last().unwrap(),
+                    &json!({"event": "toast", "severity": "error", "message": error})
+                );
+                assert!(
+                    evs.iter()
+                        .any(|ev| is_download(ev, V, "failed") && ev["error"] == error)
+                );
+                assert!(evs.iter().any(|ev| ev["event"] == "track.upsert"
+                    && ev["track"]["id"] == V
+                    && ev["track"]["state"] == "failed"));
+                assert!(!svc.track_dir(V).exists());
+                let lib = c.call(json!({"id": 2, "cmd": "library.get"})).await;
+                assert_eq!(track(&lib, V).unwrap()["state"], json!("failed"));
+                assert!(svc.fake.commands().is_empty());
+                svc.stop().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn retry_redownloads_failed_track() {
+        const V: &str = "flakaaaaaaa";
+        LocalSet::new()
+            .run_until(async {
+                let mut svc = start_with_worker().await;
+                let mut sub = Client::subscribed(&svc.sock).await;
+                let mut c = Client::connect(&svc.sock).await;
+
+                c.call(
+                    json!({"id": 1, "cmd": "add", "url": format!("https://youtu.be/{V}"),
+                    "album": null, "play": false}),
+                )
+                .await;
+                sub.until(|ev| is_download(ev, V, "failed")).await;
+
+                let resp = c
+                    .call(json!({"id": 2, "cmd": "track.retry", "track_id": A}))
+                    .await;
+                assert_eq!(resp["error"]["code"], json!("bad_request"));
+                let resp = c
+                    .call(json!({"id": 3, "cmd": "track.retry", "track_id": V}))
+                    .await;
+                assert_eq!(resp, json!({"id": 3, "ok": true, "result": {}}));
+                let evs = sub.until(|ev| is_download(ev, V, "done")).await;
+                assert!(evs.iter().any(|ev| is_download(ev, V, "fetching")));
+                assert!(!evs.iter().any(|ev| ev["event"] == "album.upsert"));
+
+                let lib = c.call(json!({"id": 4, "cmd": "library.get"})).await;
+                assert_eq!(track(&lib, V).unwrap()["state"], json!("complete"));
+                assert_eq!(lib["result"]["albums"][0]["track_ids"], json!([V]));
+                assert!(svc.track_dir(V).join("audio.webm").is_file());
+                assert!(svc.fake.commands().is_empty());
+                assert_eq!(svc.spawns(), 1);
+                svc.stop().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn deleting_current_track_advances_playback() {
+        LocalSet::new()
+            .run_until(async {
+                let mut svc = start_with_worker().await;
+                let mut c = Client::connect(&svc.sock).await;
+                let aid = c
+                    .call(json!({"id": 1, "cmd": "album.create", "name": "Mix"}))
+                    .await["result"]["album"]["id"]
+                    .as_i64()
+                    .unwrap();
+                for (id, t) in [(2, A), (3, B)] {
+                    c.call(json!({"id": id, "cmd": "album.add", "album_id": aid, "track_id": t}))
+                        .await;
+                }
+                c.call(
+                    json!({"id": 4, "cmd": "play", "track_id": A, "context": {"album_id": aid}}),
+                )
+                .await;
+                let mut sub = Client::subscribed(&svc.sock).await;
+                let a_dir = svc.cache().join(format!("Song {A} [aaaaaaaa]"));
+                assert!(a_dir.is_dir());
+
+                let resp = c
+                    .call(json!({"id": 5, "cmd": "track.delete", "track_id": A, "to_trash": false}))
+                    .await;
+                assert_eq!(resp, json!({"id": 5, "ok": true, "result": {}}));
+                let evs = sub.until(|ev| is_player(ev, B)).await;
+                assert_eq!(evs.last().unwrap()["state"], json!("playing"));
+                assert!(evs.contains(&json!({"event": "track.removed", "track_id": A})));
+                assert!(
+                    evs.iter().any(|ev| ev["event"] == "album.upsert"
+                        && ev["album"]["track_ids"] == json!([B]))
+                );
+                assert_eq!(
+                    svc.fake.commands().last().unwrap(),
+                    &loadfile(&seeded_path(&svc, B))
+                );
+                assert!(!a_dir.exists());
+                assert!(Path::new(&seeded_path(&svc, B)).exists());
+                svc.stop().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn delete_to_trash_moves_folder_to_trash() {
+        LocalSet::new()
+            .run_until(async {
+                let mut svc = start_with_worker().await;
+                let mut c = Client::connect(&svc.sock).await;
+                let b_dir = svc.cache().join(format!("Song {B} [bbbbbbbb]"));
+                assert!(b_dir.is_dir());
+
+                let resp = c
+                    .call(json!({"id": 1, "cmd": "track.delete", "track_id": B}))
+                    .await;
+                assert_eq!(resp, json!({"id": 1, "ok": true, "result": {}}));
+                assert!(!b_dir.exists());
+                let lib = c.call(json!({"id": 2, "cmd": "library.get"})).await;
+                assert!(track(&lib, B).is_none());
+                svc.stop().await;
+            })
+            .await;
     }
 }
