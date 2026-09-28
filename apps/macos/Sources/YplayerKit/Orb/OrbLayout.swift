@@ -3,19 +3,28 @@ import Foundation
 public struct OrbLayout: Sendable {
     public let radius: CGFloat
     public let bubble: CGFloat
+    public let gap: CGFloat
     public let core: CGFloat
     public let coreCenter: CGPoint
     public let bubbleCenters: [CGPoint]
     public let size: CGSize
 
-    public init(targetCount: Int, radius: CGFloat = 92, bubble: CGFloat = 64, core: CGFloat = 72) {
-        self.radius = radius
+    /// Bubbles fan left on an arc from 100° to 260° (evenly spaced; a single bubble at 180°) at
+    /// the smallest radius of at least 96 pt that keeps adjacent bubbles, and each bubble and the
+    /// core, `gap` apart.
+    public init(targetCount: Int, bubble: CGFloat = 58, gap: CGFloat = 8, core: CGFloat = 72) {
         self.bubble = bubble
+        self.gap = gap
         self.core = core
         let count = max(targetCount, 0)
+        let step: CGFloat = count > 1 ? 160 / CGFloat(count - 1) : 0
+        var radius = max(96, core / 2 + bubble / 2 + gap)
+        if count > 1 {
+            radius = max(radius, (bubble + gap) / (2 * sin(step / 2 * .pi / 180)))
+        }
+        self.radius = radius
         let offsets = (0..<count).map { index in
-            let degrees: CGFloat =
-                count == 1 ? 180 : 110 + 140 * CGFloat(index) / CGFloat(count - 1)
+            let degrees: CGFloat = count == 1 ? 180 : 100 + step * CGFloat(index)
             let radians = degrees * .pi / 180
             return CGPoint(x: radius * cos(radians), y: -radius * sin(radians))
         }

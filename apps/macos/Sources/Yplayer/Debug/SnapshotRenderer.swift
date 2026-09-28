@@ -51,6 +51,11 @@ enum SnapshotRenderer {
                 "popover-search",
                 popover(DebugFixtures.searchModel(), route: LibraryRoute(tab: .search, query: "はむ"))
             ),
+            ("orb-armed", orb(DebugFixtures.orbState(.armed))),
+            ("orb-bloom", orb(DebugFixtures.orbState(.bloom(hovered: nil)))),
+            ("orb-bloom-hover", orb(DebugFixtures.orbState(.bloom(hovered: 1)))),
+            ("orb-toast", orb(DebugFixtures.orbState(.toast(DebugFixtures.addedToast)))),
+            ("orb-name-prompt", namePrompt()),
         ]
     }
 
@@ -144,5 +149,52 @@ extension SnapshotRenderer {
     private static func restartClock(_ store: LibraryStore) {
         guard store.player?.state == .playing else { return }
         store.apply(.event(.player(DebugFixtures.player())))
+    }
+
+    /// The orb's canvas at the right edge of a popover-sized stand-in for a dark video page,
+    /// inset 12 pt and vertically centered, as the panel sits on screen.
+    fileprivate static func orb(_ state: OrbState) -> AnyView {
+        AnyView(
+            OrbView(state: state)
+                .padding(.trailing, 12)
+                .frame(width: size.width, height: size.height, alignment: .trailing)
+                .background { pageBackdrop }
+                .environment(\.appearsActive, true))
+    }
+
+    /// The name prompt card to the left of the armed core, as the two panels sit on screen.
+    fileprivate static func namePrompt() -> AnyView {
+        let state = DebugFixtures.orbState(.armed)
+        return AnyView(
+            ZStack(alignment: .trailing) {
+                OrbView(state: state)
+                    .padding(.trailing, 12)
+                NamePromptView(create: { _ in }, cancel: {})
+                    .padding(.trailing, 12 + state.layout.core + 12)
+            }
+            .frame(width: size.width, height: size.height, alignment: .trailing)
+            .background { pageBackdrop }
+            .environment(\.appearsActive, true))
+    }
+
+    /// A dark page with a video frame and text lines, standing in for YouTube behind the orb.
+    private static var pageBackdrop: some View {
+        ZStack(alignment: .topLeading) {
+            Color(white: 0.06)
+            VStack(alignment: .leading, spacing: 10) {
+                LinearGradient(
+                    colors: [.indigo, .purple, .pink, .orange], startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .frame(height: 200)
+                .clipShape(.rect(cornerRadius: 12))
+                ForEach(0..<8, id: \.self) { line in
+                    Capsule()
+                        .fill(Color(white: line == 0 ? 0.85 : 0.3))
+                        .frame(width: line == 0 ? 280 : CGFloat(300 - line * 22), height: 10)
+                }
+            }
+            .padding(16)
+        }
     }
 }

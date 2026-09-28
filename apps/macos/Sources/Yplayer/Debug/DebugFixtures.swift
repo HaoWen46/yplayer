@@ -155,4 +155,33 @@ enum DebugFixtures {
         store.apply(.event(.trackUpsert(kanaTrack)))
         return model(store)
     }
+
+    /// Albums for the orb: five used ones (CJK, Korean, a long Latin name) and a never-used one
+    /// past the five-bubble cap.
+    static let orbAlbums: [Album] =
+        albums + [
+            Album(
+                id: 3, name: "ヨルシカ", trackIDs: [], createdAt: 1_790_200_000,
+                lastUsedAt: 1_790_400_000),
+            Album(
+                id: 4, name: "Late Night Lo-fi Study Beats", trackIDs: [], createdAt: 1_790_300_000,
+                lastUsedAt: 1_790_300_000),
+            Album(
+                id: 5, name: "아이유", trackIDs: [], createdAt: 1_790_300_000,
+                lastUsedAt: 1_790_200_000),
+            Album(id: 6, name: "Workout", trackIDs: [], createdAt: 1_790_300_000, lastUsedAt: nil),
+        ]
+
+    /// The orb over `orbAlbums` in `phase`.
+    static func orbState(_ phase: OrbPhase) -> OrbState {
+        let state = OrbState()
+        state.setTargets(OrbTargets.make(albums: orbAlbums))
+        state.phase = phase
+        return state
+    }
+
+    /// The toast after a new song was dropped on "ずとまよ".
+    static let addedToast = AddedToast(
+        album: "ずとまよ",
+        result: AddResult(trackID: "fixture-001", albumID: 1, wasNew: true, wasInAlbum: false))
 }

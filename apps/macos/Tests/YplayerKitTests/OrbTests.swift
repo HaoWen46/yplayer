@@ -129,7 +129,7 @@ func orbLayoutBubblesFanLeftOnTheArc(_ count: Int) {
     for center in layout.bubbleCenters {
         #expect(center.x < layout.coreCenter.x)
         let distance = hypot(center.x - layout.coreCenter.x, center.y - layout.coreCenter.y)
-        #expect(abs(distance - 92) < 0.001)
+        #expect(abs(distance - layout.radius) < 0.001)
     }
     if count > 1, let first = layout.bubbleCenters.first, let last = layout.bubbleCenters.last {
         #expect(first.y < layout.coreCenter.y)
@@ -146,9 +146,22 @@ func orbLayoutSizeContainsAllBubbles(_ count: Int) {
             && center.y + radius <= layout.size.height + 0.001
     }
     for center in layout.bubbleCenters {
-        #expect(contains(center, radius: 32))
+        #expect(contains(center, radius: layout.bubble / 2))
     }
-    #expect(contains(layout.coreCenter, radius: 36))
+    #expect(contains(layout.coreCenter, radius: layout.core / 2))
+}
+
+@Test(arguments: 1...6)
+func orbLayoutBubblesNeverOverlapEachOtherOrTheCore(_ count: Int) {
+    let layout = OrbLayout(targetCount: count)
+    let centers = layout.bubbleCenters
+    for (a, b) in zip(centers, centers.dropFirst()) {
+        #expect(hypot(a.x - b.x, a.y - b.y) >= layout.bubble + layout.gap - 0.001)
+    }
+    for center in centers {
+        let distance = hypot(center.x - layout.coreCenter.x, center.y - layout.coreCenter.y)
+        #expect(distance >= layout.core / 2 + layout.bubble / 2 + layout.gap - 0.001)
+    }
 }
 
 @Test func dropPayloadPicksFirstYouTubeURLAndTrims() {

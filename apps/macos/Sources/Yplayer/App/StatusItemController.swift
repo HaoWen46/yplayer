@@ -23,6 +23,9 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         observePlayState()
     }
 
+    /// Whether the popover is shown (the orb ignores drags that start then).
+    var isPopoverShown: Bool { popover != nil }
+
     func show() {
         guard popover == nil, let button = item.button else { return }
         let popover = NSPopover()

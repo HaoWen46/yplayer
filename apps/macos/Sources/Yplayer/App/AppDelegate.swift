@@ -3,11 +3,13 @@ import YplayerKit
 
 /// Debug flags: `--snapshot-dir <dir>` renders the debug states to PNGs and exits;
 /// `--open-popover` opens the popover 1 s after launch; `--cycle-popover <n>` opens and closes
-/// it `n` times and logs the memory footprint after each close (memory verification).
+/// it `n` times and logs the memory footprint after each close (memory verification);
+/// `--log-drags` writes each observed drag's pasteboard types to stderr.
 struct LaunchOptions {
     var snapshotDir: URL?
     var openPopover = false
     var cyclePopover = 0
+    var logDrags = false
 
     init(arguments: [String]) {
         var rest = arguments.dropFirst().makeIterator()
@@ -19,6 +21,8 @@ struct LaunchOptions {
                 openPopover = true
             case "--cycle-popover":
                 cyclePopover = rest.next().flatMap { Int($0) } ?? 0
+            case "--log-drags":
+                logDrags = true
             default:
                 break
             }
@@ -31,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let options: LaunchOptions
     private var statusItem: StatusItemController?
     private var nowPlaying: NowPlayingController?
+    private var orb: OrbController?
 
     init(options: LaunchOptions) {
         self.options = options
@@ -56,6 +61,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         nowPlaying = NowPlayingController(model: model)
         let statusItem = StatusItemController(model: model)
         self.statusItem = statusItem
+        orb = OrbController(
+            model: model,
+            isPopoverShown: { [weak statusItem] in statusItem?.isPopoverShown ?? false },
+            logDrags: options.logDrags)
         if options.openPopover {
             Task {
                 try? await Task.sleep(for: .seconds(1))
