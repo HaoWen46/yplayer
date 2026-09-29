@@ -8,7 +8,11 @@ use yplayer::service::{self, ServeOptions};
 use yplayer::types::Track;
 
 #[derive(Parser, Debug)]
-#[command(name = "yplay", about = "Fast YouTube audio player with local cache")]
+#[command(
+    name = "yplay",
+    version,
+    about = "Fast YouTube audio player with local cache"
+)]
 struct Cli {
     /// Service socket (default: $YPLAY_SOCKET, else <state dir>/yplay.sock)
     #[arg(long, global = true)]

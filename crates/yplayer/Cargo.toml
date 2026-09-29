@@ -1,6 +1,6 @@
 [package]
 name = "yplayer"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "yplayer background service and CLI: cached YouTube audio playback via mpv"
 

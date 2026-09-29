@@ -1,70 +1,43 @@
 # Yplayer
 
-A YouTube audio player for macOS that plays from a local cache. Drag a YouTube link from Safari or Chrome onto the floating orb: the song goes into an album and starts playing within a few seconds, and every later play is offline. A menu-bar app shows the library and controls playback; the `yplay` CLI controls the same background service from a terminal.
+A YouTube audio player for macOS that plays from a local cache. Drag a YouTube link from Safari or Chrome onto the floating orb: the song goes into an album and starts playing within a few seconds, and every later play is offline. A menu-bar app shows the library and controls playback; the `yplay` command controls the same background service from a terminal.
 
-## Architecture
-
-```
- Yplayer.app (menu bar + orb) ──┐
- yplay CLI (add/play/pause/…) ──┤ Unix socket, newline-delimited JSON
-                                │ ~/Library/Application Support/yplayer/yplay.sock
-                                ▼
-                        yplay serve (Rust, LaunchAgent, KeepAlive)
-                        ├─ library: SQLite, the only writer
-                        ├─ player: one persistent mpv (--idle=yes), event-driven IPC
-                        ├─ downloader: on-demand Python yt-dlp worker, concurrent jobs
-                        └─ lyrics: LRCLIB over HTTP, cached in SQLite
-```
-
-- The service is the single source of truth: clients never touch the DB, mpv, or cache files.
-- mpv starts on first playback and exits after 10 minutes stopped; the Python worker starts on the first download and exits 60 s after its last job.
-- yt-dlp is checked for updates at most once a day and upgraded with `uv` when a newer release exists.
-
-## Requirements
-
-| Tool | Required | Purpose |
-|------|----------|---------|
-| **macOS 26** | Yes | The menu-bar app's Liquid Glass UI |
-| **Xcode Command Line Tools** | Yes | Swift 6.2, builds the menu-bar app (`xcode-select --install`) |
-| **mpv** | Yes | Audio playback |
-| **Rust (cargo)** | Yes | Builds the `yplay` binary |
-| **Python 3.11+** | Yes | Runs the yt-dlp download worker (in the repo's `.venv`) |
-| **uv** | Yes | Installs the worker package; upgrades yt-dlp |
-| **deno** | Yes | JavaScript runtime yt-dlp uses for YouTube downloads |
-| **ffmpeg** | No | Evens out loudness (each song is measured once); without it songs play at their own volume |
-
-```bash
-brew install mpv uv deno
-```
+<p align="center">
+  <img src="docs/images/orb.png" width="260" alt="Dragging a link: the orb fans out into albums">
+  <img src="docs/images/library.png" width="260" alt="The menu-bar player and library">
+  <img src="docs/images/up-next.png" width="260" alt="Up Next">
+</p>
 
 ## Install
 
-```bash
-git clone https://github.com/HaoWen46/yplayer.git
-cd yplayer
-uv venv .venv
-scripts/install.sh        # or: just install
-```
-
-`scripts/install.sh` is idempotent; re-run it after pulling changes. It:
-
-1. Builds with `cargo build --release` and installs the binary to `~/.local/bin/yplay`.
-2. Installs the worker package with `uv pip install --python .venv/bin/python -e .`.
-3. Adds `worker_python = "<repo>/.venv/bin/python3"` to `config.toml` only if that key is absent (creating the file if needed); existing values are never changed.
-4. Writes `~/Library/LaunchAgents/com.yplayer.service.plist` (runs `~/.local/bin/yplay serve`, `KeepAlive`, `RunAtLoad`, logs to `~/Library/Logs/yplayer/service.log`).
-5. Stops the service if it is loaded, then backs up the library DB once: `<cache_dir>/.yplayer.db` to `<cache_dir>/.yplayer.db.pre-service.bak` (owner-only) if the DB exists and no backup exists yet (an existing backup is never overwritten).
-6. Starts the service with `launchctl bootstrap gui/$UID` and prints its status.
-7. Builds the menu-bar app and installs it with its own LaunchAgent (see [Menu-bar app](#menu-bar-app)).
-
-Check the service with `launchctl print gui/$UID/com.yplayer.service`.
-
-### Uninstall
+Paste this into Terminal:
 
 ```bash
-scripts/uninstall.sh      # or: just uninstall
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/HaoWen46/yplayer/main/scripts/get.sh)"
 ```
 
-Stops the service and the app and removes their LaunchAgent plists, `~/.local/bin/yplay`, and `~/Applications/Yplayer.app`. The cache, library DB, `config.toml`, and logs are kept.
+You need macOS 26 or newer on an Apple silicon Mac, and [Homebrew](https://brew.sh). The installer:
+
+- installs `mpv`, `ffmpeg`, `deno` and `uv` with Homebrew if they are missing (this part can take a few minutes the first time);
+- downloads the latest [release](https://github.com/HaoWen46/yplayer/releases) and checks its checksum;
+- puts `Yplayer.app` in `~/Applications`, the `yplay` command in `~/.local/bin`, and the downloader's Python environment in `~/Library/Application Support/yplayer/venv`;
+- starts the player service and the menu-bar app, and has both start at login.
+
+Songs go to `~/Music/yt-audio` (change it in Settings). No accounts, no permissions to grant.
+
+**Update:** run the same command again. **Uninstall:** `"$HOME/Library/Application Support/yplayer/uninstall.sh"` (keeps your songs and settings).
+
+## How to use
+
+- **Add a song:** start dragging a YouTube link (the address in Safari's address bar, the site icon left of Chrome's address, or any link on a page). An orb appears at the right edge of the screen; drop the link on it, or on one of the albums it fans out into. The song plays within seconds while it downloads, and never downloads again. Undo stays available for 6 s.
+- **Play and browse:** click the ♪ in the menu bar. Space plays/pauses, ⌘F searches, media keys and Control Center work too.
+- **Up Next:** the list button next to the lyrics button shows what plays next; drag to reorder, swipe to remove, double-click to jump.
+- **Settings:** the gear button (or ⌘,): even out loudness, move the music folder, YouTube search key.
+- **Terminal:** `yplay add <url>`, `yplay now`, `yplay toggle`, `yplay --help`.
+
+<p align="center">
+  <img src="docs/images/settings.png" width="360" alt="Settings">
+</p>
 
 ## Menu-bar app
 
@@ -208,6 +181,75 @@ With `level_loudness` on, the service measures each song once with ffmpeg's EBU 
 
 Legacy flat files (`<id>.<ext>` + `<id>.json`) are still recognized, and legacy `albums/*.album.json` files are imported into the DB once.
 
+## Architecture
+
+```
+ Yplayer.app (menu bar + orb) ──┐
+ yplay CLI (add/play/pause/…) ──┤ Unix socket, newline-delimited JSON
+                                │ ~/Library/Application Support/yplayer/yplay.sock
+                                ▼
+                        yplay serve (Rust, LaunchAgent, KeepAlive)
+                        ├─ library: SQLite, the only writer
+                        ├─ player: one persistent mpv (--idle=yes), event-driven IPC
+                        ├─ downloader: on-demand Python yt-dlp worker, concurrent jobs
+                        └─ lyrics: LRCLIB over HTTP, cached in SQLite
+```
+
+- The service is the single source of truth: clients never touch the DB, mpv, or cache files.
+- mpv starts on first playback and exits after 10 minutes stopped; the Python worker starts on the first download and exits 60 s after its last job.
+- yt-dlp is checked for updates at most once a day and upgraded with `uv` when a newer release exists.
+
+## Build from source
+
+For development, or on an Intel Mac. Requirements:
+
+| Tool | Required | Purpose |
+|------|----------|---------|
+| **macOS 26** | Yes | The menu-bar app's Liquid Glass UI |
+| **Xcode Command Line Tools** | Yes | Swift 6.2, builds the menu-bar app (`xcode-select --install`) |
+| **mpv** | Yes | Audio playback |
+| **Rust (cargo)** | Yes | Builds the `yplay` binary |
+| **Python 3.11+** | Yes | Runs the yt-dlp download worker (in the repo's `.venv`) |
+| **uv** | Yes | Installs the worker package; upgrades yt-dlp |
+| **deno** | Yes | JavaScript runtime yt-dlp uses for YouTube downloads |
+| **ffmpeg** | No | Evens out loudness (each song is measured once); without it songs play at their own volume |
+
+```bash
+brew install mpv ffmpeg uv deno rust
+git clone https://github.com/HaoWen46/yplayer.git
+cd yplayer
+uv venv .venv
+scripts/install.sh        # or: just install
+```
+
+`scripts/install.sh` is idempotent; re-run it after pulling changes. It:
+
+1. Builds with `cargo build --release` and installs the binary to `~/.local/bin/yplay`.
+2. Installs the worker package with `uv pip install --python .venv/bin/python -e .`.
+3. Adds `worker_python = "<repo>/.venv/bin/python3"` to `config.toml` only if that key is absent (creating the file if needed); existing values are never changed.
+4. Writes `~/Library/LaunchAgents/com.yplayer.service.plist` (runs `~/.local/bin/yplay serve`, `KeepAlive`, `RunAtLoad`, logs to `~/Library/Logs/yplayer/service.log`).
+5. Stops the service if it is loaded, then backs up the library DB once: `<cache_dir>/.yplayer.db` to `<cache_dir>/.yplayer.db.pre-service.bak` (owner-only) if the DB exists and no backup exists yet (an existing backup is never overwritten).
+6. Starts the service with `launchctl bootstrap gui/$UID` and prints its status.
+7. Builds the menu-bar app and installs it with its own LaunchAgent (see [Menu-bar app](#menu-bar-app)).
+
+Check the service with `launchctl print gui/$UID/com.yplayer.service`.
+
+### Uninstall (source install)
+
+```bash
+scripts/uninstall.sh      # or: just uninstall
+```
+
+Stops the service and the app and removes their LaunchAgent plists, `~/.local/bin/yplay`, and `~/Applications/Yplayer.app`. The cache, library DB, `config.toml`, and logs are kept.
+
+## Releasing
+
+1. Set the same version in `crates/yplayer/Cargo.toml`, `pyproject.toml`, `yplayer/__init__.py` and `apps/macos/Packaging/Info.plist`.
+2. Merge to `main`, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. The Release workflow builds `yplayer-macos-arm64.tar.gz` on macOS 26 and publishes it with its `.sha256`; `scripts/get.sh` installs the latest release.
+
+`scripts/package-release.sh` builds the same package into `dist/` locally; `YPLAYER_TARBALL=dist/yplayer-macos-arm64.tar.gz scripts/get.sh` installs it (add `YPLAYER_NO_LAUNCHD=1` and a temporary `HOME` to try it without touching your install).
+
 ## Performance check
 
 ```bash
@@ -247,7 +289,7 @@ apps/macos/          # SwiftUI menu-bar app + drop orb (Swift package)
 yplayer/             # Python package: yt-dlp download worker (worker.py, core.py)
 tests/               # Python worker tests
 packaging/           # LaunchAgent plist templates (service, app)
-scripts/             # install, uninstall, app build, app icon, Swift tests, performance check
+scripts/             # get.sh (one-line install), install, uninstall, release package, app build, app icon, Swift tests, performance check
 docs/specs/          # design spec with verification results
 docs/plans/          # implementation plans, one per sub-project
 ```

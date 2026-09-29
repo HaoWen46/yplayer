@@ -1,0 +1,36 @@
+name: Release
+
+# Push a tag vX.Y.Z (matching the versions in Cargo.toml, pyproject.toml and
+# Info.plist) to publish a GitHub release with the package scripts/get.sh
+# installs. A manual run builds the package as a workflow artifact only.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v6
+      - name: Build the package
+        run: scripts/package-release.sh ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+      - name: Keep the package (manual runs)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: yplayer-macos-arm64
+          path: dist/yplayer-macos-arm64.tar.gz*
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${{ github.ref_name }}"
+          dist/yplayer-macos-arm64.tar.gz dist/yplayer-macos-arm64.tar.gz.sha256
+          --title "Yplayer ${{ github.ref_name }}" --generate-notes

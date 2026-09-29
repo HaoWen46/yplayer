@@ -11,5 +11,7 @@
 - Every folder delete goes through `library::safe_fs::remove_track_dir` (direct child of the cache, `[id8]` name suffix, never a symlink; automatic cleanups refuse folders holding user files).
 - mpv needs `--audio-format=float` on macOS 27, or it falls back to avfoundation with a ~4 s buffer.
 - yt-dlp updates belong to the service (daily check, exact release tag, binary-only, at least a day old); never update on the request path.
-- `scripts/install.sh` and `scripts/uninstall.sh` change the user's Mac (LaunchAgents, `~/Applications`): run them only when asked.
+- `scripts/install.sh` and `scripts/uninstall.sh` change the user's Mac (LaunchAgents, `~/Applications`): run them only when asked; to test them use a temp `HOME` plus `YPLAYER_NO_LAUNCHD=1` (launchd labels are global).
+- Releases: one version in `crates/yplayer/Cargo.toml`, `pyproject.toml`, `yplayer/__init__.py`, `apps/macos/Packaging/Info.plist` (checked by `scripts/package-release.sh`); tag `vX.Y.Z` on main → `.github/workflows/release.yml` publishes `yplayer-macos-arm64.tar.gz` (+ `.sha256`) that `scripts/get.sh` installs (arm64 only).
+- CI runners use Xcode's Swift (older than local CLT, 6.3.3 vs 6.4): passing a MainActor method directly as a closure (e.g. `Binding(set: method)`) crashed it; wrap it in `{ method($0) }`.
 - Test with CJK titles; the real library is mostly Japanese music.

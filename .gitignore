@@ -24,3 +24,6 @@ target/
 # Swift build output and app bundle
 apps/macos/.build/
 build/
+
+# Release packages (scripts/package-release.sh)
+dist/
