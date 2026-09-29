@@ -29,17 +29,9 @@ pub struct WorkerResponse {
     #[serde(default)]
     pub error: Option<String>,
     #[serde(default)]
-    pub path: Option<String>,
-    #[serde(default)]
-    pub meta: Option<Value>,
-    #[serde(default)]
     pub results: Option<Vec<Value>>,
     #[serde(default)]
-    pub entries: Option<Vec<Value>>,
-    #[serde(default)]
     pub formats: Option<Vec<Value>>,
-    #[serde(default)]
-    pub synced: Option<String>,
 }
 
 #[derive(Debug)]
@@ -86,8 +78,7 @@ impl From<WorkerFailure> for anyhow::Error {
 
 pub struct Bridge {
     // Owned only to keep the worker process alive (kill_on_drop); never read.
-    #[allow(dead_code)]
-    child: Child,
+    _child: Child,
     stdin: tokio::process::ChildStdin,
     reader: BufReader<tokio::process::ChildStdout>,
     next_id: u64,
@@ -130,7 +121,7 @@ impl Bridge {
         let reader = BufReader::new(stdout);
 
         let mut bridge = Self {
-            child,
+            _child: child,
             stdin,
             reader,
             next_id: 1,
@@ -233,24 +224,6 @@ impl Bridge {
 
         let results = resp.results.unwrap_or_default();
         Ok(results
-            .into_iter()
-            .filter_map(|v| parse_track_from_value(&v))
-            .collect())
-    }
-
-    // Playlist import (which consumes this) is wired up in a later phase.
-    #[allow(dead_code)]
-    pub async fn playlist_entries(&mut self, url: &str) -> Result<Vec<Track>> {
-        let resp = self
-            .send(WorkerCommand {
-                cmd: "playlist_entries".to_string(),
-                url: Some(url.to_string()),
-                ..Default::default()
-            })
-            .await?;
-
-        let entries = resp.entries.unwrap_or_default();
-        Ok(entries
             .into_iter()
             .filter_map(|v| parse_track_from_value(&v))
             .collect())

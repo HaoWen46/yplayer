@@ -12,7 +12,6 @@ Commands:
     download        – download native audio; streams started/progress events
     cancel          – cancel an in-flight download (handled inline)
     search          – search YouTube, return results
-    playlist_entries – extract playlist entries (flat, no download)
     list_formats    – list available audio formats for a URL
 """
 
@@ -25,7 +24,6 @@ from concurrent.futures import ThreadPoolExecutor
 from yt_dlp.utils import DownloadCancelled
 
 from .core import download_track, list_audio_formats, search_results
-from .playlist import extract_playlist_entries
 
 # Concurrent jobs; announced in the ready line so the host never sends more.
 SLOTS = 8
@@ -60,12 +58,6 @@ def _handle_search(req: dict, emit, cancel_event) -> dict:
     return {"results": results}
 
 
-def _handle_playlist_entries(req: dict, emit, cancel_event) -> dict:
-    url = req.get("url", "")
-    entries = extract_playlist_entries(url)
-    return {"entries": entries}
-
-
 def _handle_list_formats(req: dict, emit, cancel_event) -> dict:
     url = req.get("url", "")
     formats = list_audio_formats(url)
@@ -93,7 +85,7 @@ def _run(handler, rid, req: dict, cancel_event: threading.Event):
         # A library may call sys.exit(); keep the worker alive and report it.
         failed(f"worker aborted: {e}", False, e)
     except Exception as e:
-        # Includes YplayerError from die(), which carries the real message.
+        # Includes core.YplayerError, whose message is meant for the user.
         failed(str(e), isinstance(e, DownloadCancelled), e)
     finally:
         _cancel_events.pop(rid, None)
@@ -103,7 +95,6 @@ def main():
     handlers = {
         "download": _handle_download,
         "search": _handle_search,
-        "playlist_entries": _handle_playlist_entries,
         "list_formats": _handle_list_formats,
     }
 

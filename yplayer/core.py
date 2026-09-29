@@ -1,21 +1,12 @@
-# yplayer/core.py
-"""
-Full, drop-in core module (patched for per-track folders).
+"""Downloads, search and format inspection for the yplayer worker (see worker.py).
 
-Features:
-- Metadata (search / durations / single-video info) via YouTube Data API (no descriptions).
-- Downloads via yt-dlp.
-- **New:** per-track folder layout for new downloads:
-    ~/.cache/yplayer/<SanitizedTitle> [<id8>]/audio.<ext>
-    ~/.cache/yplayer/<SanitizedTitle> [<id8>]/meta.json
-  (Legacy flat cache remains supported.)
-- Robust post-download discovery of actual filename.
-- Sidecar JSON: folder meta.json, written after the audio.
-- Cached library listing helpers for the browse UI (both layouts).
+A download lands in <cache>/<Title> [<id8>]/ as audio.<ext>, cover.jpg and
+meta.json; meta.json is written last and marks the download complete.
+Search uses the YouTube Data API; downloads and format listing use yt-dlp.
 """
+
 import json
 import os
-import re
 import stat
 import time
 import urllib.parse
@@ -24,33 +15,24 @@ import urllib.request
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadCancelled
 
-# DEFAULT_CACHE_DIR is re-exported for albums.py.
-from .config import DEFAULT_CACHE_DIR as DEFAULT_CACHE_DIR
-from .config import KNOWN_EXTS
-from .utils import die, info, normalize_ext, which
 
-# ----------- FS / deps -----------
+class YplayerError(Exception):
+    """An expected failure whose message is safe to show to the user.
 
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
+    The worker returns ``str(YplayerError)`` in the JSON ``error`` field.
+    """
 
-def require_bins():
-    """Warn if ffmpeg missing."""
-    if not which("ffmpeg") and not which("avconv"):
-        info(
-            "ffmpeg not found — native downloads will work, "
-            "but conversion/metadata embedding won't.\n"
-            "Install with: brew install ffmpeg"
-        )
 
-# ----------- YouTube Data API (no descriptions) ----------
+# ----------- YouTube Data API (search) ----------
 
 API_BASE = "https://www.googleapis.com/youtube/v3"
 
 def _require_api_key(api_key: str | None) -> str:
     key = api_key or os.environ.get("YT_API_KEY")
     if not key:
-        die("YouTube Data API key missing. Set $YT_API_KEY or pass --yt-api-key.")
+        raise YplayerError(
+            "YouTube Data API key missing. Set $YT_API_KEY or api_key in config.toml."
+        )
     return key
 
 def _http_get_json(url: str, timeout: int = 10) -> dict:
@@ -128,244 +110,34 @@ def yt_api_durations(ids: list[str], api_key: str) -> dict[str, int | None]:
             out.setdefault(vid, None)
     return out
 
-# ----------- Metadata sidecar & cache listing ----------
+def search_results(query: str, limit: int = 10, *, api_key: str | None = None) -> list[dict]:
+    """Search via the YouTube Data API. Returns id/title/uploader/webpage_url/duration."""
+    key = _require_api_key(api_key)
+    results = yt_api_search(query, limit, key)
+    if results:
+        durs = yt_api_durations([r["id"] for r in results], key)
+        for r in results:
+            r["duration"] = durs.get(r["id"])
+    return results
+
+# ----------- Track folder files ----------
 
 def _create_new(path: str) -> int:
     """Create path for writing; fails on an existing file or symlink."""
     return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
 
-def save_sidecar(cache_dir: str, info_obj: dict, *, track_dir: str | None = None):
-    """Write minimal metadata JSON next to the audio file.
-       Writes <track_dir>/meta.json if track_dir provided.
-    """
-    ensure_dir(cache_dir)
-    vid = info_obj.get("id")
-    if not vid:
-        return
-    meta = {
-        "id": vid,
-        "title": info_obj.get("title"),
-        "uploader": info_obj.get("uploader"),
-        "duration": info_obj.get("duration"),
-        "webpage_url": info_obj.get("webpage_url"),
-    }
-    # per-track. meta.json is the download's completion marker, so write it
-    # atomically and let failures propagate instead of reporting success.
-    if track_dir:
-        os.makedirs(track_dir, exist_ok=True)
-        tmp = os.path.join(track_dir, "meta.json.tmp")
-        try:
-            if stat.S_ISREG(os.lstat(tmp).st_mode):
-                os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-        with os.fdopen(_create_new(tmp), "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, os.path.join(track_dir, "meta.json"))
-
-def _sanitize_title(title: str | None) -> str:
-    """Make a filesystem-safe-ish filename from a title (keeps unicode)."""
-    if not title:
-        return ""
-    s = title.strip()
-    s = re.sub(r'[:\/\\\?\*"<>\|\n\r\t]', '', s)
-    s = re.sub(r'\s+', ' ', s)
-    return s[:200].strip()
-
-def _pick_existing_path(cache_dir: str, vid: str) -> str | None:
-    """Find an existing file by id or fuzzy matches in flat layout."""
-    # 1) id.ext exact
-    for ext in KNOWN_EXTS:
-        p = os.path.join(cache_dir, f"{vid}.{ext}")
-        if os.path.exists(p):
-            return p
-    # 2) filename contains id
+def _write_meta(track_dir: str, meta: dict):
+    """Write <track_dir>/meta.json. It is the download's completion marker, so
+    write it atomically and let failures propagate instead of reporting success."""
+    tmp = os.path.join(track_dir, "meta.json.tmp")
     try:
-        for fname in os.listdir(cache_dir):
-            if vid in fname:
-                ext = os.path.splitext(fname)[1].lstrip(".").lower()
-                if ext in KNOWN_EXTS:
-                    return os.path.join(cache_dir, fname)
-    except Exception:
+        if stat.S_ISREG(os.lstat(tmp).st_mode):
+            os.unlink(tmp)
+    except FileNotFoundError:
         pass
-    return None
-
-def _iter_track_dirs(cache_dir: str):
-    try:
-        for name in os.listdir(cache_dir):
-            d = os.path.join(cache_dir, name)
-            if os.path.isdir(d) and os.path.exists(os.path.join(d, "meta.json")):
-                yield d
-    except Exception:
-        return
-
-def _first_audio_in_dir(d: str) -> str | None:
-    try:
-        for fname in os.listdir(d):
-            p = os.path.join(d, fname)
-            if os.path.isfile(p):
-                ext = os.path.splitext(fname)[1].lstrip(".").lower()
-                if ext in KNOWN_EXTS:
-                    return p
-    except Exception:
-        return None
-    return None
-
-def find_existing(cache_dir: str, vid: str, title: str | None = None) -> str | None:
-    """
-    Search cache_dir for a file matching the video id or the title (sanitized).
-    Supports both layouts (per-track folder and legacy flat).
-    Returns full path or None.
-    """
-    if not cache_dir or not vid:
-        return None
-
-    # 0) per-track folder: look for meta.json where id matches
-    for d in _iter_track_dirs(cache_dir):
-        try:
-            with open(os.path.join(d, "meta.json"), encoding="utf-8") as f:
-                meta = json.load(f)
-            if meta.get("id") == vid:
-                p = _first_audio_in_dir(d)
-                if p:
-                    return p
-        except Exception:
-            continue
-
-    # 1) exact id-based files (legacy flat)
-    exact = _pick_existing_path(cache_dir, vid)
-    if exact:
-        return exact
-
-    # 2) title-based attempts (legacy flat)
-    if title:
-        san = _sanitize_title(title)
-        if san:
-            # exact sanitized match
-            for ext in KNOWN_EXTS:
-                cand = os.path.join(cache_dir, f"{san}.{ext}")
-                if os.path.exists(cand):
-                    return cand
-            # startswith / contains match
-            try:
-                san_l = san.lower()
-                for fname in os.listdir(cache_dir):
-                    name_noext = os.path.splitext(fname)[0].lower()
-                    if name_noext.startswith(san_l) or san_l in name_noext:
-                        ext = os.path.splitext(fname)[1].lstrip(".").lower()
-                        if ext in KNOWN_EXTS:
-                            return os.path.join(cache_dir, fname)
-            except Exception:
-                pass
-
-    return None
-
-def list_cached_tracks(cache_dir: str) -> list[dict]:
-    """Scan cache dir, return unique tracks with sidecar metadata if present. Supports both layouts."""
-    out: list[dict] = []
-    if not os.path.isdir(cache_dir):
-        return out
-
-    # per-track folders
-    for d in _iter_track_dirs(cache_dir):
-        meta = None
-        try:
-            with open(os.path.join(d, "meta.json"), encoding="utf-8") as f:
-                meta = json.load(f)
-        except Exception:
-            meta = None
-        audio = _first_audio_in_dir(d)
-        if audio:
-            out.append({
-                "id": (meta or {}).get("id"),
-                "title": (meta or {}).get("title") or os.path.basename(d),
-                "uploader": (meta or {}).get("uploader"),
-                "duration": (meta or {}).get("duration"),
-                "webpage_url": (meta or {}).get("webpage_url"),
-                "path": audio,
-            })
-
-    # legacy flat files + sidecars
-    seen_ids: dict[str, dict] = {}
-    try:
-        for name in os.listdir(cache_dir):
-            base, ext = os.path.splitext(name)
-            ext = ext.lstrip(".").lower()
-            full = os.path.join(cache_dir, name)
-            if ext in KNOWN_EXTS:
-                vid = base
-                entry = seen_ids.setdefault(vid, {})
-                entry["path"] = full
-            elif ext == "json":
-                try:
-                    with open(full, encoding="utf-8") as f:
-                        meta = json.load(f)
-                    vid = meta.get("id") or base
-                    entry = seen_ids.setdefault(vid, {})
-                    entry.update({
-                        "id": vid,
-                        "title": meta.get("title"),
-                        "uploader": meta.get("uploader"),
-                        "duration": meta.get("duration"),
-                        "webpage_url": meta.get("webpage_url"),
-                    })
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    for vid, d in seen_ids.items():
-        path = d.get("path") or _pick_existing_path(cache_dir, vid)
-        if not path:
-            continue
-        d.setdefault("id", vid)
-        d["path"] = path
-        out.append(d)
-
-    out.sort(key=lambda x: (x.get("title") or os.path.basename(x["path"])).lower())
-    return out
-
-# ----------- YTDL helpers (download only) ----------
-
-# Recognise playlist URLs
-_PLAYLIST_RE = re.compile(r"[?&]list=([a-zA-Z0-9_-]{10,})")
-def is_playlist_url(url: str) -> bool:
-    return bool(_PLAYLIST_RE.search(url))
-
-def _base_ydl_opts(cache_dir: str) -> dict:
-    return {
-        "quiet": True,
-        "no_warnings": True,
-        # Keep stdout pure JSON for the worker protocol: send all yt-dlp output
-        # (incl. the download progress bar) to stderr, and disable progress.
-        "logtostderr": True,
-        "noprogress": True,
-        "noplaylist": True,
-        "outtmpl": os.path.join(cache_dir, "%(id)s.%(ext)s"),
-        "format": "bestaudio/best",
-        "retries": 2,
-        "socket_timeout": 10,
-    }
-
-# ----------- Download (per-track folder layout) ----------
-
-def path_for(cache_dir: str, vid: str, ext: str) -> str:
-    return os.path.join(cache_dir, f"{vid}.{normalize_ext(ext)}")
-
-def _first_audio_created(before: set[str], after: set[str], directory: str) -> str | None:
-    # Find new audio file created in directory
-    try:
-        new_files = list(set(os.listdir(directory)) - (before if directory == "." else set()))
-    except Exception:
-        new_files = []
-    for fname in new_files:
-        ext = os.path.splitext(fname)[1].lstrip(".").lower()
-        if ext in KNOWN_EXTS:
-            return os.path.join(directory, fname)
-    return None
-
-# Time source for progress throttling; tests swap it for a fake clock.
-_clock = time.monotonic
+    with os.fdopen(_create_new(tmp), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, os.path.join(track_dir, "meta.json"))
 
 def _track_meta(info_obj: dict) -> dict:
     return {
@@ -390,6 +162,11 @@ def _fetch_thumbnail(video_id: str, dest: str) -> bool:
     except Exception:
         return False
     return True
+
+# ----------- Download ----------
+
+# Time source for progress throttling; tests swap it for a fake clock.
+_clock = time.monotonic
 
 def download_track(url: str, cache_dir: str, *, emit, cancel_event) -> dict:
     """
@@ -475,7 +252,7 @@ def download_track(url: str, cache_dir: str, *, emit, cancel_event) -> dict:
         except Exception:
             thumb = None
         meta = _track_meta(rd)
-        save_sidecar(cache_dir, meta, track_dir=track_dir)
+        _write_meta(track_dir, meta)
     except BaseException as e:
         if job_dir:
             e.job_dir = job_dir
@@ -489,28 +266,7 @@ def download_track(url: str, cache_dir: str, *, emit, cancel_event) -> dict:
         "file_size": os.path.getsize(path),
     }
 
-# ----------- Inspect / search (API-first) ----------
-
-def search_results(query: str, limit: int = 10, *, api_key: str | None = None,
-                   want_duration: bool = True) -> list[dict]:
-    """Fast search via YouTube Data API. Returns id/title/uploader/webpage_url/duration."""
-    key = _require_api_key(api_key) if want_duration or api_key else (api_key or os.environ.get("YT_API_KEY"))
-    if want_duration:
-        key = _require_api_key(api_key)
-    results = yt_api_search(query, limit, key) if key else yt_api_search(query, limit, os.environ.get("YT_API_KEY", ""))
-    if want_duration and results:
-        ids = [r["id"] for r in results]
-        durs = yt_api_durations(ids, key)
-        for r in results:
-            r["duration"] = durs.get(r["id"])
-    return results
-
-def video_info_from_query(query: str, *, api_key: str | None = None) -> dict:
-    """Top-1 result via API (kept for completeness)."""
-    res = search_results(query, limit=1, api_key=api_key, want_duration=True)
-    if not res:
-        die("no results")
-    return res[0]
+# ----------- Format inspection ----------
 
 def list_audio_formats(url: str) -> list[dict]:
     """Inspect CDN audio formats for a specific URL using yt-dlp (heavy)."""
