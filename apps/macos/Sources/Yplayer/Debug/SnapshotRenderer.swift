@@ -6,7 +6,7 @@ import YplayerKit
 /// display). `ImageRenderer` and `cacheDisplay` both drop Liquid Glass on macOS (`ImageRenderer`
 /// also drops buttons and scroll views), so each state is shown in a borderless window below the
 /// desktop, where the user never sees it, and captured by the window server with
-/// `screencapture -l`.
+/// `screencapture -l`. The settings states show the real settings window, title bar included.
 @MainActor
 enum SnapshotRenderer {
     struct Failure: Error, CustomStringConvertible {
@@ -63,11 +63,24 @@ enum SnapshotRenderer {
         ]
     }
 
+    /// The rendered settings window states, by file name.
+    static func settingsStates() -> [(name: String, model: AppModel)] {
+        [
+            ("settings", DebugFixtures.settingsModel(loudnessAvailable: true)),
+            ("settings-no-ffmpeg", DebugFixtures.settingsModel(loudnessAvailable: false)),
+        ]
+    }
+
     static func render(to dir: URL) async throws {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         for (name, view) in states() {
             let url = dir.appending(path: "\(name).png")
             try await capture(view, to: url)
+            print(url.path(percentEncoded: false))
+        }
+        for (name, model) in settingsStates() {
+            let url = dir.appending(path: "\(name).png")
+            try await captureSettings(model, to: url)
             print(url.path(percentEncoded: false))
         }
     }
@@ -95,6 +108,24 @@ enum SnapshotRenderer {
         window.orderFrontRegardless()
         defer { window.orderOut(nil) }
         try await Task.sleep(for: .milliseconds(500))
+        try screenshot(window, to: url)
+    }
+
+    /// The settings window at its own size, as `SettingsWindowController` makes it.
+    private static func captureSettings(_ model: AppModel, to url: URL) async throws {
+        let window = SettingsWindowController.makeWindow(
+            content: SettingsView(model: model, chooseDestination: { nil })
+                .environment(\.appearsActive, true))
+        window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) - 1)
+        window.orderFrontRegardless()
+        window.makeFirstResponder(nil)
+        defer { window.orderOut(nil) }
+        try await Task.sleep(for: .milliseconds(500))
+        try screenshot(window, to: url)
+    }
+
+    /// Captures `window` to `url` with `screencapture -l`.
+    private static func screenshot(_ window: NSWindow, to url: URL) throws {
         let path = url.path(percentEncoded: false)
         try? FileManager.default.removeItem(atPath: path)
         let screencapture = Process()

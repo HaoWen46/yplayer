@@ -195,6 +195,19 @@ enum DebugFixtures {
         return state
     }
 
+    /// The fixture library with leveling on: with ffmpeg, an API key and the default music
+    /// folder, or without ffmpeg and a key and with the folder on another disk.
+    static func settingsModel(loudnessAvailable: Bool) -> AppModel {
+        let model = model(store())
+        model.settings = ServiceSettings(
+            levelLoudness: true, loudnessAvailable: loudnessAvailable,
+            apiKey: loudnessAvailable ? "fixture-api-key" : nil,
+            musicFolder: loudnessAvailable
+                ? URL.musicDirectory.appending(path: "yt-audio").path(percentEncoded: false)
+                : "/Volumes/音楽ライブラリ/yt-audio")
+        return model
+    }
+
     /// The toast after a new song was dropped on "ずとまよ".
     static let addedToast = AddedToast(
         album: "ずとまよ",

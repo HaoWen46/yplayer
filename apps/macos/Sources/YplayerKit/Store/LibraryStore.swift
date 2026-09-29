@@ -139,6 +139,8 @@ public final class LibraryStore {
             appendToast(ToastItem(severity: toast.severity, message: toast.message))
         case .resync:
             needsResync = true
+        case .settings:
+            break
         case .unknown:
             break
         }
