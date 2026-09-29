@@ -11,6 +11,8 @@ public enum Event: Decodable, Equatable, Sendable {
     case toast(Toast)
     case resync
     case settings(ServiceSettings)
+    /// Up Next changed.
+    case queue(QueueState)
     /// An event name this client does not know; never an error (forward compatibility).
     case unknown(String)
 
@@ -35,6 +37,7 @@ public enum Event: Decodable, Equatable, Sendable {
         case "toast": self = .toast(try Toast(from: decoder))
         case "resync": self = .resync
         case "settings": self = .settings(try ServiceSettings(from: decoder))
+        case "queue": self = .queue(try QueueState(from: decoder))
         default: self = .unknown(name)
         }
     }

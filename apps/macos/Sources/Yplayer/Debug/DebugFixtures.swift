@@ -171,6 +171,35 @@ enum DebugFixtures {
         return model(store)
     }
 
+    /// More ずとまよ songs and one by Ado for Up Next; 『暗く黒く』 failed to download.
+    static let upNextTracks: [Track] = [
+        track(10, "ずっと真夜中でいいのに。『残機』MV", zutomayo, 227, size: 4_318_774),
+        track(11, "ずっと真夜中でいいのに。『猫リセット』MV", zutomayo, 241, size: 4_586_031),
+        track(12, "ずっと真夜中でいいのに。『勘ぐれい』MV", zutomayo, 251, size: 4_776_120),
+        track(13, "ずっと真夜中でいいのに。『暗く黒く』MV", zutomayo, 262, size: nil, state: .failed),
+        track(14, "ずっと真夜中でいいのに。『脳裏上のクラッカー』MV", zutomayo, 236, size: 4_490_562),
+        track(15, "Ado「唱」MV", "Ado", 190, size: 3_615_402),
+    ]
+
+    /// `artworkModel` with Up Next shown: three play-next songs, then eight more of ずとまよ (the
+    /// failed one second, so it shows).
+    static func upNextModel(_ artwork: String?) -> AppModel {
+        let model = artworkModel(artwork)
+        for track in upNextTracks {
+            model.store.apply(.event(.trackUpsert(track)))
+        }
+        var album = albums[0]
+        album.trackIDs = [1, 2, 13, 3, 4, 10, 11, 12, 14].map { String(format: "fixture-%03d", $0) }
+        model.store.apply(.event(.albumUpsert(album)))
+        model.store.loadQueue(
+            QueueState(
+                next: ["fixture-005", "fixture-015", "fixture-006"],
+                upcoming: Array(album.trackIDs.dropFirst()), more: false, context: .album(album.id)
+            ))
+        model.showsQueue = true
+        return model
+    }
+
     /// Albums for the orb: five used ones (CJK, Korean, a long Latin name) and a never-used one
     /// past the five-bubble cap.
     static let orbAlbums: [Album] =

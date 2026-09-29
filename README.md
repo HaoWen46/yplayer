@@ -31,7 +31,7 @@ A YouTube audio player for macOS that plays from a local cache. Drag a YouTube l
 | **Python 3.11+** | Yes | Runs the yt-dlp download worker (in the repo's `.venv`) |
 | **uv** | Yes | Installs the worker package; upgrades yt-dlp |
 | **deno** | Yes | JavaScript runtime yt-dlp uses for YouTube downloads |
-| **ffmpeg** | No | No longer required (audio is stored in its native format) |
+| **ffmpeg** | No | Evens out loudness (each song is measured once); without it songs play at their own volume |
 
 ```bash
 brew install mpv uv deno
@@ -71,10 +71,12 @@ Stops the service and the app and removes their LaunchAgent plists, `~/.local/bi
 `Yplayer.app` lives in the menu bar only (no Dock icon). It is a client of the service: it needs `yplay serve` running (the `com.yplayer.service` LaunchAgent) and never plays audio itself. While it cannot reach the service it shows "Can't reach the yplay service — retrying in Ns" with a Retry Now button.
 
 - Status item: `music.note` when not playing, `waveform` while playing; click to open or close the popover.
-- Now-playing card: artwork, title, uploader, scrubber with elapsed/remaining time, previous · play/pause · next, loop mode (none → all → single → shuffle), volume, lyrics toggle (synced lyrics replace the library while on), and a ⋯ menu (Remove from Album…, Delete from Library…, Show in Finder, Copy YouTube Link).
+- Now-playing card: artwork, title, uploader, scrubber with elapsed/remaining time, previous · play/pause · next, loop mode (none → all → single → shuffle), volume, Up Next and lyrics toggles (each replaces the library while on), and a ⋯ menu (Remove from Album…, Delete from Library…, Show in Finder, Copy YouTube Link).
 - Library tabs: Albums · Songs · Search. Albums: + creates an album, double-click a name to rename it, Delete Album… keeps its songs. An album's songs can be reordered by dragging. Downloading rows show progress; failed rows show a warning icon and a Retry menu item.
 - Track rows: double-click or Return plays; right-click for Play Next, Add to Album ▸, Remove from Album… (album view), Delete from Library…, Show in Finder, Copy YouTube Link, Retry (failed only), Rename…; trackpad swipe-left removes from the album (album view) or deletes from the library (Songs).
 - Deleting from the library moves the audio file to the Trash; every removal and deletion asks for confirmation first.
+- Up Next: "Playing Next" (songs added with Play Next; Clear, drag to reorder) and "Up Next from <album>" (what the album or library plays after them). Double-click or Return plays a row now; swipe left, ⌫ or the context menu removes it from Up Next only.
+- Settings (gear button in the library tabs, or ⌘,): Even out loudness, the music folder (Show in Finder; Move… to another folder on the same disk), and the YouTube API key for `yplay search`. The app shows a Dock icon while the window is open.
 - Media keys and Control Center's Now Playing show the current song and control the service.
 
 Keyboard shortcuts (popover open):
@@ -83,6 +85,7 @@ Keyboard shortcuts (popover open):
 |-----|--------|
 | Space | Play/pause (not while typing in a text field) |
 | ⌘F | Search the library |
+| ⌘, | Open Settings |
 | Return | Play the selected row |
 | ⌫ | Remove from album (album view) or delete from library (Songs), after confirmation |
 | ⌘⌫ | Delete from library, after confirmation |

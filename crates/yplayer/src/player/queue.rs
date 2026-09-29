@@ -4,8 +4,16 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 
-use crate::protocol::ContextRef;
+use crate::protocol::{ContextRef, QueueSection, QueueState};
 use crate::types::LoopMode;
+
+/// Where an upcoming entry lives.
+enum Slot {
+    /// Index in `order`: the rest of this cycle, or `All`'s following cycle.
+    Order(usize),
+    /// Index in `next_cycle` (`Shuffle`'s following cycle).
+    NextCycle(usize),
+}
 
 /// Play order for one context plus the play-next FIFO. Pure: no I/O; the
 /// engine resolves the returned ids to files.
@@ -235,6 +243,123 @@ impl Queue {
         self.next_idx = next_idx;
     }
 
+    /// Up Next without changing anything: every play-next entry, then at
+    /// most `limit` context tracks in the order they will play. `All` and
+    /// `Shuffle` continue into the following cycle; `Single` is ignored, as
+    /// manual next ignores it.
+    pub fn snapshot(&self, limit: usize) -> QueueState {
+        let mut upcoming = self.upcoming();
+        let listed: Vec<String> = upcoming.by_ref().take(limit).cloned().collect();
+        QueueState {
+            next: self.up_next.iter().cloned().collect(),
+            upcoming: listed,
+            more: upcoming.next().is_some(),
+            context: self.context.clone(),
+        }
+    }
+
+    /// Remove play-next entry `i`; the removed id, or `None` when out of range.
+    pub fn remove_next(&mut self, i: usize) -> Option<String> {
+        self.up_next.remove(i)
+    }
+
+    /// Remove upcoming entry `i` (as `snapshot` lists them) from the play
+    /// order; the removed id, or `None` when out of range. In `All` the
+    /// following cycle is this cycle's order again, so a track listed in
+    /// both leaves both.
+    pub fn remove_upcoming(&mut self, i: usize) -> Option<String> {
+        match self.locate(i)? {
+            Slot::Order(k) => Some(self.remove_order_at(k)),
+            Slot::NextCycle(j) => Some(self.next_cycle.remove(j)),
+        }
+    }
+
+    /// Move play-next entry `from` so it ends at index `to`; false (and
+    /// nothing moves) when either is out of range.
+    pub fn move_next(&mut self, from: usize, to: usize) -> bool {
+        if to >= self.up_next.len() {
+            return false;
+        }
+        let Some(id) = self.up_next.remove(from) else {
+            return false;
+        };
+        self.up_next.insert(to, id);
+        true
+    }
+
+    pub fn clear_next(&mut self) {
+        self.up_next.clear();
+    }
+
+    /// Make an Up Next entry current, as if playback had advanced to it:
+    /// `next[i]` drops `next[0..=i]`; `upcoming[i]` empties `next` and skips
+    /// `upcoming[0..i]`. The new current id, or `None` (nothing changes)
+    /// when `i` is out of range.
+    pub fn jump(&mut self, section: QueueSection, i: usize) -> Option<String> {
+        match section {
+            QueueSection::Next => {
+                if i >= self.up_next.len() {
+                    return None;
+                }
+                self.up_next.drain(..i);
+                self.advance()
+            }
+            QueueSection::Upcoming => {
+                self.locate(i)?;
+                self.up_next.clear();
+                let mut id = None;
+                for _ in 0..=i {
+                    id = self.advance();
+                }
+                id
+            }
+        }
+    }
+
+    /// The context tracks after the play-next entries: the rest of this
+    /// cycle, then the following one in `All` and `Shuffle`.
+    fn upcoming(&self) -> impl Iterator<Item = &String> {
+        let rest = self.order.get(self.next_idx..).unwrap_or_default();
+        let following: &[String] = match self.loop_mode {
+            LoopMode::All => &self.order,
+            LoopMode::Shuffle => &self.next_cycle,
+            LoopMode::None | LoopMode::Single => &[],
+        };
+        rest.iter().chain(following)
+    }
+
+    /// Where upcoming entry `i` lives; `None` when out of range.
+    fn locate(&self, i: usize) -> Option<Slot> {
+        let rest = self.order.len().saturating_sub(self.next_idx);
+        if i < rest {
+            return Some(Slot::Order(self.next_idx + i));
+        }
+        let j = i - rest;
+        match self.loop_mode {
+            LoopMode::All if j < self.order.len() => Some(Slot::Order(j)),
+            LoopMode::Shuffle if j < self.next_cycle.len() => Some(Slot::NextCycle(j)),
+            _ => None,
+        }
+    }
+
+    /// Remove `order[k]`, keeping the cursor on the same tracks. Outside
+    /// `Shuffle`, `order` is `base`, so it leaves `base` too.
+    fn remove_order_at(&mut self, k: usize) -> String {
+        let id = self.order.remove(k);
+        if k < self.next_idx {
+            self.next_idx -= 1;
+        }
+        self.cur_idx = match self.cur_idx {
+            Some(c) if c == k => None,
+            Some(c) if c > k => Some(c - 1),
+            other => other,
+        };
+        if self.loop_mode != LoopMode::Shuffle {
+            self.base.retain(|x| *x != id);
+        }
+        id
+    }
+
     fn wraps(&self) -> bool {
         matches!(self.loop_mode, LoopMode::All | LoopMode::Shuffle)
     }
@@ -456,6 +581,224 @@ mod tests {
         }
         seen.sort();
         assert_eq!(seen, sorted_order);
+    }
+
+    fn state(next: &[&str], upcoming: &[&str], more: bool) -> QueueState {
+        QueueState {
+            next: ids(next),
+            upcoming: ids(upcoming),
+            more,
+            context: Some(ContextRef::Album(1)),
+        }
+    }
+
+    /// What `advance_auto` returns `n` times; `Single` never plays past the
+    /// current track this way, so it uses manual next.
+    fn played(q: &mut Queue, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|_| {
+                if q.loop_mode() == LoopMode::Single {
+                    q.next_manual().unwrap()
+                } else {
+                    q.advance_auto().unwrap()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn snapshot_in_none_lists_the_rest_of_the_order() {
+        let mut q = queue(&["a", "b", "c", "d"], "b", LoopMode::None);
+        assert_eq!(q.snapshot(100), state(&[], &["c", "d"], false));
+        q.play_next("x");
+        q.play_next("y");
+        let snap = q.snapshot(100);
+        assert_eq!(snap, state(&["x", "y"], &["c", "d"], false));
+        // Taking a snapshot changes nothing.
+        assert_eq!(q.snapshot(100), snap);
+        assert_eq!(played(&mut q, 4), ids(&["x", "y", "c", "d"]));
+        assert_eq!(q.advance_auto(), None);
+        assert_eq!(Queue::new().snapshot(100), QueueState::default());
+    }
+
+    #[test]
+    fn snapshot_in_all_continues_into_the_following_cycle() {
+        let mut q = queue(&["a", "b", "c"], "b", LoopMode::All);
+        assert_eq!(q.snapshot(100), state(&[], &["c", "a", "b", "c"], false));
+        q.play_next("x");
+        assert_eq!(q.snapshot(100), state(&["x"], &["c", "a", "b", "c"], false));
+        assert_eq!(played(&mut q, 5), ids(&["x", "c", "a", "b", "c"]));
+    }
+
+    #[test]
+    fn snapshot_in_shuffle_is_the_real_play_order_across_the_wrap() {
+        let order: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
+        for with_next in [false, true] {
+            let mut q = Queue::with_seed(9);
+            q.set_loop(LoopMode::Shuffle);
+            q.start(ContextRef::Library, order.clone(), "t5");
+            q.advance_auto();
+            q.advance_auto();
+            if with_next {
+                q.play_next("x");
+            }
+            let snap = q.snapshot(100);
+            assert_eq!(snap, q.snapshot(100));
+            assert_eq!(snap.next, if with_next { ids(&["x"]) } else { vec![] });
+            // The 7 left in this cycle, then all 10 of the next one.
+            assert_eq!(snap.upcoming.len(), 17);
+            assert!(!snap.more);
+            let expected: Vec<String> = snap.next.iter().chain(&snap.upcoming).cloned().collect();
+            assert_eq!(played(&mut q, expected.len()), expected);
+        }
+    }
+
+    #[test]
+    fn snapshot_in_single_lists_what_manual_next_plays() {
+        let mut q = queue(&["a", "b", "c"], "a", LoopMode::Single);
+        assert_eq!(q.snapshot(100), state(&[], &["b", "c"], false));
+        q.play_next("x");
+        assert_eq!(q.snapshot(100), state(&["x"], &["b", "c"], false));
+        assert_eq!(played(&mut q, 3), ids(&["x", "b", "c"]));
+        assert_eq!(q.snapshot(100), state(&[], &[], false));
+    }
+
+    #[test]
+    fn snapshot_caps_upcoming_and_reports_more() {
+        let order = |n: usize| (0..n).map(|i| format!("t{i:03}")).collect::<Vec<_>>();
+        let mut q = Queue::with_seed(1);
+        q.start(ContextRef::Library, order(101), "t000");
+        let snap = q.snapshot(100);
+        assert_eq!(snap.upcoming, order(101)[1..].to_vec());
+        assert!(!snap.more);
+
+        q.start(ContextRef::Library, order(102), "t000");
+        let snap = q.snapshot(100);
+        assert_eq!(snap.upcoming.len(), 100);
+        assert!(snap.more);
+
+        // Play-next entries are never cut.
+        for i in 0..120 {
+            q.play_next(&format!("n{i}"));
+        }
+        assert_eq!(q.snapshot(100).next.len(), 120);
+
+        // 59 left plus a following cycle of 60.
+        let mut q = Queue::with_seed(1);
+        q.set_loop(LoopMode::All);
+        q.start(ContextRef::Library, order(60), "t000");
+        let snap = q.snapshot(100);
+        assert_eq!(snap.upcoming[58], "t059");
+        assert_eq!(snap.upcoming[59], "t000");
+        assert_eq!(snap.upcoming.len(), 100);
+        assert!(snap.more);
+        assert_eq!(q.snapshot(2).upcoming, ids(&["t001", "t002"]));
+    }
+
+    #[test]
+    fn remove_move_and_clear_next() {
+        let mut q = queue(&["a", "b"], "a", LoopMode::None);
+        for id in ["x", "y", "z"] {
+            q.play_next(id);
+        }
+        assert!(q.move_next(0, 2));
+        assert_eq!(q.snapshot(100).next, ids(&["y", "z", "x"]));
+        assert!(q.move_next(2, 1));
+        assert_eq!(q.snapshot(100).next, ids(&["y", "x", "z"]));
+        assert!(!q.move_next(3, 0));
+        assert!(!q.move_next(0, 3));
+        assert_eq!(q.snapshot(100).next, ids(&["y", "x", "z"]));
+
+        assert_eq!(q.remove_next(1).as_deref(), Some("x"));
+        assert_eq!(q.remove_next(2), None);
+        assert_eq!(q.snapshot(100), state(&["y", "z"], &["b"], false));
+        q.clear_next();
+        assert_eq!(q.snapshot(100), state(&[], &["b"], false));
+        assert_eq!(q.current(), Some("a"));
+        assert_eq!(q.advance_auto().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn remove_upcoming_in_this_cycle_keeps_the_cursor() {
+        let mut q = queue(&["a", "b", "c", "d"], "b", LoopMode::None);
+        q.play_next("x");
+        assert_eq!(q.remove_upcoming(0).as_deref(), Some("c"));
+        assert_eq!(q.remove_upcoming(1), None);
+        assert_eq!(q.snapshot(100), state(&["x"], &["d"], false));
+        assert_eq!(q.current(), Some("b"));
+        assert_eq!(q.prev_manual().as_deref(), Some("a"));
+        assert_eq!(q.next_manual().as_deref(), Some("x"));
+        assert_eq!(q.next_manual().as_deref(), Some("b"));
+        assert_eq!(q.next_manual().as_deref(), Some("d"));
+        // Gone from the context order too: a loop change does not bring it back.
+        q.set_loop(LoopMode::All);
+        assert_eq!(q.snapshot(100), state(&[], &["a", "b", "d"], false));
+    }
+
+    #[test]
+    fn remove_upcoming_in_the_following_cycle() {
+        // `All`: the following cycle is the same order.
+        let mut q = queue(&["a", "b", "c"], "b", LoopMode::All);
+        assert_eq!(q.remove_upcoming(1).as_deref(), Some("a"));
+        assert_eq!(q.snapshot(100), state(&[], &["c", "b", "c"], false));
+        assert_eq!(q.remove_upcoming(1).as_deref(), Some("b"));
+        assert_eq!(q.current(), Some("b"));
+        assert_eq!(q.snapshot(100), state(&[], &["c", "c"], false));
+        assert_eq!(q.remove_upcoming(2), None);
+        assert_eq!(played(&mut q, 2), ids(&["c", "c"]));
+
+        // `Shuffle`: only that entry of the next cycle goes.
+        let order: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
+        let mut q = Queue::with_seed(3);
+        q.set_loop(LoopMode::Shuffle);
+        q.start(ContextRef::Library, order, "t0");
+        let before = q.snapshot(100).upcoming;
+        let removed = q.remove_upcoming(6).unwrap();
+        assert_eq!(removed, before[6]);
+        let mut after = before.clone();
+        after.remove(6);
+        assert_eq!(q.snapshot(100).upcoming, after);
+        assert_eq!(played(&mut q, after.len()), after);
+    }
+
+    #[test]
+    fn jump_to_a_play_next_entry_drops_the_ones_before_it() {
+        let mut q = queue(&["a", "b", "c"], "a", LoopMode::None);
+        for id in ["x", "y", "z"] {
+            q.play_next(id);
+        }
+        assert_eq!(q.jump(QueueSection::Next, 3), None);
+        assert_eq!(q.current(), Some("a"));
+        assert_eq!(q.jump(QueueSection::Next, 1).as_deref(), Some("y"));
+        assert_eq!(q.current(), Some("y"));
+        assert_eq!(q.snapshot(100), state(&["z"], &["b", "c"], false));
+        assert_eq!(played(&mut q, 3), ids(&["z", "b", "c"]));
+    }
+
+    #[test]
+    fn jump_to_an_upcoming_entry_empties_next_and_skips_before_it() {
+        let mut q = queue(&["a", "b", "c", "d"], "a", LoopMode::None);
+        q.play_next("x");
+        assert_eq!(q.jump(QueueSection::Upcoming, 3), None);
+        assert_eq!(q.snapshot(100), state(&["x"], &["b", "c", "d"], false));
+        assert_eq!(q.jump(QueueSection::Upcoming, 1).as_deref(), Some("c"));
+        assert_eq!(q.current(), Some("c"));
+        assert_eq!(q.snapshot(100), state(&[], &["d"], false));
+        assert_eq!(q.prev_manual().as_deref(), Some("b"));
+
+        // Into `All`'s following cycle.
+        let mut q = queue(&["a", "b", "c"], "b", LoopMode::All);
+        assert_eq!(q.jump(QueueSection::Upcoming, 2).as_deref(), Some("b"));
+        assert_eq!(q.snapshot(100), state(&[], &["c", "a", "b", "c"], false));
+
+        // Into `Shuffle`'s next cycle: the entry listed there.
+        let order: Vec<String> = (0..6).map(|i| format!("t{i}")).collect();
+        let mut q = Queue::with_seed(5);
+        q.set_loop(LoopMode::Shuffle);
+        q.start(ContextRef::Library, order, "t2");
+        let upcoming = q.snapshot(100).upcoming;
+        assert_eq!(q.jump(QueueSection::Upcoming, 8), Some(upcoming[8].clone()));
+        assert_eq!(q.snapshot(100).upcoming[..2], upcoming[9..]);
     }
 
     #[test]

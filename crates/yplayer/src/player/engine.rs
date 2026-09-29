@@ -8,7 +8,9 @@ use tokio::time::Instant;
 
 use crate::player::mpv::{CommandTimeout, MpvApi, MpvEvent, MpvSpawner};
 use crate::player::queue::Queue;
-use crate::protocol::{ContextRef, PlayState, PlayerState};
+use crate::protocol::{
+    ContextRef, PlayState, PlayerState, QueueSection, QueueState, UPCOMING_LIMIT,
+};
 use crate::types::LoopMode;
 
 /// Quit mpv after this long paused or stopped.
@@ -295,6 +297,72 @@ impl<S: MpvSpawner> Engine<S> {
     ) -> Result<(), EngineError> {
         self.queue.replace_order(order);
         self.refresh_preload(r).await
+    }
+
+    /// Up Next, as `queue.get` reports it.
+    pub fn queue_state(&self) -> QueueState {
+        self.queue.snapshot(UPCOMING_LIMIT)
+    }
+
+    // Up Next edits: indices point into `queue_state` and must be in range
+    // (the service checks). Each re-preloads when the next track changed.
+
+    pub async fn remove_next(
+        &mut self,
+        i: usize,
+        r: &impl TrackResolver,
+    ) -> Result<(), EngineError> {
+        self.queue.remove_next(i);
+        self.refresh_preload(r).await
+    }
+
+    pub async fn remove_upcoming(
+        &mut self,
+        i: usize,
+        r: &impl TrackResolver,
+    ) -> Result<(), EngineError> {
+        self.queue.remove_upcoming(i);
+        self.refresh_preload(r).await
+    }
+
+    pub async fn move_next(
+        &mut self,
+        from: usize,
+        to: usize,
+        r: &impl TrackResolver,
+    ) -> Result<(), EngineError> {
+        self.queue.move_next(from, to);
+        self.refresh_preload(r).await
+    }
+
+    pub async fn clear_next(&mut self, r: &impl TrackResolver) -> Result<(), EngineError> {
+        self.queue.clear_next();
+        self.refresh_preload(r).await
+    }
+
+    /// Play Up Next entry `i` of `section` now (see `Queue::jump`). The
+    /// queue only moves when the load succeeds.
+    pub async fn jump(
+        &mut self,
+        section: QueueSection,
+        i: usize,
+        r: &impl TrackResolver,
+    ) -> Result<(), EngineError> {
+        let saved = self.queue.clone();
+        let Some(id) = self.queue.jump(section, i) else {
+            return Ok(());
+        };
+        let result = match r.playable_path(&id) {
+            Some(path) => {
+                let gain = r.gain_db(&id);
+                self.load(path, 0.0, gain).await
+            }
+            None => Err(EngineError::Unplayable(id)),
+        };
+        if result.is_err() {
+            self.queue = saved;
+        }
+        result
     }
 
     /// Returns true when the player state changed.
@@ -1139,6 +1207,82 @@ mod tests {
         assert_eq!(fake.commands(), vec![loadfile(&p("b"), "replace")]);
         assert_eq!(track(&e).as_deref(), Some("b"));
         assert_eq!(e.state().state, PlayState::Playing);
+    }
+
+    #[tokio::test]
+    async fn up_next_edits_re_preload_the_next_track() {
+        let fake = FakeSpawner::default();
+        let r = paths(&["a", "b", "c", "x", "y"]);
+        let mut e = playing(&fake, LoopMode::None, &["a", "b", "c"], "a", &r).await;
+        let preload = |id: &str| vec![cmd(&[json!("playlist-clear")]), loadfile(&p(id), "append")];
+
+        e.play_next("x", &r).await.unwrap();
+        e.play_next("y", &r).await.unwrap();
+        assert_eq!(fake.commands(), preload("x"));
+        assert_eq!(e.queue_state().next, ids(&["x", "y"]));
+
+        fake.clear_commands();
+        e.move_next(1, 0, &r).await.unwrap();
+        assert_eq!(fake.commands(), preload("y"));
+        assert_eq!(e.queue_state().next, ids(&["y", "x"]));
+
+        fake.clear_commands();
+        e.remove_next(0, &r).await.unwrap();
+        assert_eq!(fake.commands(), preload("x"));
+
+        fake.clear_commands();
+        e.clear_next(&r).await.unwrap();
+        assert_eq!(fake.commands(), preload("b"));
+
+        fake.clear_commands();
+        e.remove_upcoming(0, &r).await.unwrap();
+        assert_eq!(fake.commands(), preload("c"));
+        assert_eq!(e.queue_state().upcoming, ids(&["c"]));
+
+        // An edit that leaves the next track alone sends nothing.
+        fake.clear_commands();
+        e.play_next("a", &r).await.unwrap();
+        e.remove_next(0, &r).await.unwrap();
+        assert_eq!(fake.commands(), [preload("a"), preload("c")].concat());
+        fake.clear_commands();
+        e.clear_next(&r).await.unwrap();
+        assert!(fake.commands().is_empty());
+        assert_eq!(track(&e).as_deref(), Some("a"));
+    }
+
+    #[tokio::test]
+    async fn jump_plays_the_entry_and_keeps_the_queue_when_unplayable() {
+        let fake = FakeSpawner::default();
+        let r = paths(&["a", "c", "d", "x"]);
+        let mut e = playing(&fake, LoopMode::None, &["a", "b", "c", "d"], "a", &r).await;
+        e.play_next("x", &r).await.unwrap();
+        e.play_next("y", &r).await.unwrap();
+
+        // `b` has no file: nothing moves.
+        fake.clear_commands();
+        let before = e.queue_state();
+        assert!(matches!(
+            e.jump(QueueSection::Upcoming, 0, &r).await,
+            Err(EngineError::Unplayable(id)) if id == "b"
+        ));
+        assert_eq!(e.queue_state(), before);
+        assert_eq!(track(&e).as_deref(), Some("a"));
+        assert!(fake.commands().is_empty());
+
+        e.jump(QueueSection::Upcoming, 1, &r).await.unwrap();
+        assert_eq!(fake.commands(), vec![loadfile(&p("c"), "replace")]);
+        assert_eq!(track(&e).as_deref(), Some("c"));
+        assert_eq!(e.state().state, PlayState::Playing);
+        let st = e.queue_state();
+        assert!(st.next.is_empty());
+        assert_eq!(st.upcoming, ids(&["d"]));
+
+        e.play_next("x", &r).await.unwrap();
+        fake.clear_commands();
+        e.jump(QueueSection::Next, 0, &r).await.unwrap();
+        assert_eq!(fake.commands(), vec![loadfile(&p("x"), "replace")]);
+        assert_eq!(track(&e).as_deref(), Some("x"));
+        assert_eq!(e.queue_state().upcoming, ids(&["d"]));
     }
 
     #[tokio::test]

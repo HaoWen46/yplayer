@@ -32,6 +32,7 @@ enum SnapshotRenderer {
                 "lyrics-missing",
                 lyricsPopover(DebugFixtures.artworkModel(fixtureArtwork()), .missing)
             ),
+            ("upnext", upNextPopover(DebugFixtures.upNextModel(fixtureArtwork()))),
             (
                 "popover-albums",
                 popover(
@@ -177,6 +178,11 @@ extension SnapshotRenderer {
             popover(model)
                 .environment(\.lyricsFixture, lyrics)
                 .onAppear { restartClock(model.store) })
+    }
+
+    /// The popover with Up Next shown.
+    fileprivate static func upNextPopover(_ model: AppModel) -> AnyView {
+        AnyView(popover(model).onAppear { restartClock(model.store) })
     }
 
     /// Restarts a playing fixture's clock at 1:02 when its state is shown (models are built before

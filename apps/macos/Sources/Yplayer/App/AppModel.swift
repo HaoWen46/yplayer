@@ -32,6 +32,9 @@ final class AppModel {
     var confirm: ConfirmRequest?
     /// Whether `LyricsView` replaces the library below the now-playing card.
     var showsLyrics = false
+    /// Whether `UpNextView` replaces the library below the now-playing card (never together with
+    /// `showsLyrics`).
+    var showsQueue = false
 
     init(client: ServiceClient, store: LibraryStore) {
         self.client = client
@@ -92,6 +95,26 @@ final class AppModel {
 
     func playNext(_ trackID: String) async {
         await send(.queuePlayNext(trackID: trackID))
+    }
+
+    /// Removes Up Next entry `index` of `section`, which must be `trackID`.
+    func removeFromQueue(_ section: QueueSection, _ index: Int, _ trackID: String) async {
+        await send(.queueRemove(section: section, index: index, trackID: trackID))
+    }
+
+    /// Moves play-next entry `from` (`trackID`) so it ends at index `to`.
+    func moveInQueue(from: Int, to: Int, _ trackID: String) async {
+        await send(.queueMove(from: from, to: to, trackID: trackID))
+    }
+
+    /// Empties Playing Next.
+    func clearQueue() async {
+        await send(.queueClear)
+    }
+
+    /// Plays Up Next entry `index` of `section` (`trackID`) now.
+    func jumpInQueue(_ section: QueueSection, _ index: Int, _ trackID: String) async {
+        await send(.queueJump(section: section, index: index, trackID: trackID))
     }
 
     @discardableResult
@@ -188,10 +211,11 @@ final class AppModel {
         }
     }
 
-    /// Replaces the store's library with the service's.
+    /// Replaces the store's library and Up Next with the service's.
     private func reload() async {
         do {
             store.load(try await client.send(.libraryGet, as: LibrarySnapshot.self))
+            store.loadQueue(try await client.send(.queueGet, as: QueueState.self))
         } catch {
             report(error)
         }

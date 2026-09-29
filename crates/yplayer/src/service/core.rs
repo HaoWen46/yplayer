@@ -20,7 +20,7 @@ use crate::player::engine::{Engine, EngineError, TrackResolver};
 use crate::player::mpv::{MpvEvent, MpvSpawner};
 use crate::protocol::{
     AddResult, AlbumRef, Command, ContextRef, DownloadPhase, ErrorCode, Event, PROTOCOL, PlayState,
-    PlayerState, Response, Settings, Severity,
+    PlayerState, QueueSection, QueueState, Response, Settings, Severity,
 };
 use crate::types::{Album, LoopMode, Track, TrackState};
 use crate::updater::{UpdateOutcome, Updater};
@@ -178,6 +178,8 @@ pub struct Core<S: MpvSpawner> {
     measurements: Schedule,
     /// Set by `library.move`: `run` returns then and launchd restarts us.
     restart_at: Option<Instant>,
+    /// Up Next as last sent in a `queue` event (at start: the empty queue).
+    last_queue: QueueState,
 }
 
 impl<S: MpvSpawner> Core<S> {
@@ -223,6 +225,7 @@ impl<S: MpvSpawner> Core<S> {
             measurer: None,
             measurements: Schedule::default(),
             restart_at: None,
+            last_queue: QueueState::default(),
         };
         let inbox = Inbox {
             requests: requests_rx,
@@ -370,8 +373,22 @@ impl<S: MpvSpawner> Core<S> {
                 self.track_delete(&track_id, to_trash).await
             }
             Command::TrackRetry { track_id } => self.track_retry(&track_id),
+            Command::QueueGet => Ok(json!(self.engine.queue_state())),
+            Command::QueueRemove {
+                section,
+                index,
+                track_id,
+            } => self.queue_remove(section, index, &track_id).await,
+            Command::QueueMove { from, to, track_id } => self.queue_move(from, to, &track_id).await,
+            Command::QueueClear => ok(self.engine.clear_next(&r).await),
+            Command::QueueJump {
+                section,
+                index,
+                track_id,
+            } => self.queue_jump(section, index, &track_id).await,
         };
         self.player_changed(&prev, false);
+        self.queue_changed();
         let _ = reply.send(Reply {
             response: respond(id, result),
             events,
@@ -389,6 +406,7 @@ impl<S: MpvSpawner> Core<S> {
         if self.engine.on_mpv_event(generation, ev, &r).await {
             self.player_changed(&prev, true);
         }
+        self.queue_changed();
         self.measure_next();
     }
 
@@ -409,6 +427,7 @@ impl<S: MpvSpawner> Core<S> {
                 result,
             } => self.on_measured(track_id, path, result).await,
         }
+        self.queue_changed();
     }
 
     fn emit(&self, ev: Event) {
@@ -428,6 +447,15 @@ impl<S: MpvSpawner> Core<S> {
         let halted = state.state != prev.state && state.state != PlayState::Playing;
         if state.track_id != prev.track_id || halted {
             self.save_session(&state);
+        }
+    }
+
+    /// Emit `queue` when Up Next differs from the last one emitted.
+    fn queue_changed(&mut self) {
+        let state = self.engine.queue_state();
+        if state != self.last_queue {
+            self.emit(Event::Queue(state.clone()));
+            self.last_queue = state;
         }
     }
 
@@ -509,6 +537,80 @@ impl<S: MpvSpawner> Core<S> {
             levels: &self.levels,
         };
         ok(self.engine.play_next(track_id, &r).await)
+    }
+
+    /// `not_found` unless `section` has an entry `index`; `conflict` unless
+    /// that entry is `track_id`.
+    fn check_queue_entry(
+        &self,
+        section: QueueSection,
+        index: usize,
+        track_id: &str,
+    ) -> Result<(), CmdError> {
+        let state = self.engine.queue_state();
+        let entries = match section {
+            QueueSection::Next => &state.next,
+            QueueSection::Upcoming => &state.upcoming,
+        };
+        match entries.get(index) {
+            None => Err(not_found("Up Next entry")),
+            Some(id) if id != track_id => Err(CmdError(
+                ErrorCode::Conflict,
+                "Up Next changed; try again.".into(),
+            )),
+            Some(_) => Ok(()),
+        }
+    }
+
+    async fn queue_remove(
+        &mut self,
+        section: QueueSection,
+        index: usize,
+        track_id: &str,
+    ) -> Result<Value, CmdError> {
+        self.check_queue_entry(section, index, track_id)?;
+        let r = Resolver {
+            db: &self.db,
+            downloads: &self.downloads,
+            levels: &self.levels,
+        };
+        ok(match section {
+            QueueSection::Next => self.engine.remove_next(index, &r).await,
+            QueueSection::Upcoming => self.engine.remove_upcoming(index, &r).await,
+        })
+    }
+
+    async fn queue_move(
+        &mut self,
+        from: usize,
+        to: usize,
+        track_id: &str,
+    ) -> Result<Value, CmdError> {
+        self.check_queue_entry(QueueSection::Next, from, track_id)?;
+        if to >= self.engine.queue_state().next.len() {
+            return Err(not_found("Up Next entry"));
+        }
+        let r = Resolver {
+            db: &self.db,
+            downloads: &self.downloads,
+            levels: &self.levels,
+        };
+        ok(self.engine.move_next(from, to, &r).await)
+    }
+
+    async fn queue_jump(
+        &mut self,
+        section: QueueSection,
+        index: usize,
+        track_id: &str,
+    ) -> Result<Value, CmdError> {
+        self.check_queue_entry(section, index, track_id)?;
+        let r = Resolver {
+            db: &self.db,
+            downloads: &self.downloads,
+            levels: &self.levels,
+        };
+        ok(self.engine.jump(section, index, &r).await)
     }
 
     /// Emit `album.upsert` for `album_id` and bump the library version.
@@ -1332,4 +1434,283 @@ fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    use super::*;
+    use crate::download::worker::WorkerOptions;
+    use crate::http::CurlHttp;
+    use crate::player::engine::testing::FakeSpawner;
+
+    /// Library order: newest first.
+    const IDS: [&str; 4] = ["秒針を噛む1", "猫リセット2", "残機3", "勘ぐれい4"];
+
+    /// A core over a temp library of `IDS` (complete, with audio files).
+    fn core(dir: &Path, fake: &FakeSpawner) -> Core<FakeSpawner> {
+        let config = Config::new(Some(dir.join("cache").to_string_lossy().into_owned()), None);
+        std::fs::create_dir_all(&config.cache_dir).unwrap();
+        let db = Db::open(&config.db_path(), &config.cache_dir).unwrap();
+        for (n, id) in IDS.iter().enumerate() {
+            let audio = config.cache_dir.join(format!("{id}.opus"));
+            std::fs::write(&audio, b"").unwrap();
+            db.upsert_track(&Track {
+                id: id.to_string(),
+                title: id.to_string(),
+                uploader: None,
+                duration: Some(4),
+                webpage_url: None,
+                audio_path: Some(audio.to_string_lossy().into_owned()),
+                format: Some("opus".into()),
+                file_size: Some(0),
+                added_at: Some(10 - n as i64),
+                last_played: None,
+                state: TrackState::Complete,
+                thumb_path: None,
+            })
+            .unwrap();
+        }
+        let worker = WorkerHandle::spawn(WorkerOptions {
+            worker_python: None,
+            worker_cmd: None,
+            log_path: dir.join("worker.log"),
+            idle_timeout: Duration::from_secs(60),
+            inactivity_timeout: Duration::from_secs(180),
+        });
+        let http: Arc<dyn HttpGet> = Arc::new(CurlHttp {
+            user_agent: "test".into(),
+        });
+        let deps = CoreDeps {
+            config,
+            db,
+            spawner: fake.clone(),
+            worker,
+            http,
+            updater: None,
+        };
+        Core::new(deps).0
+    }
+
+    async fn call(core: &mut Core<FakeSpawner>, cmd: Command) -> Response {
+        let (reply, rx) = oneshot::channel();
+        core.on_request(Request { id: 1, cmd, reply }).await;
+        rx.await.unwrap().response
+    }
+
+    async fn ok_call(core: &mut Core<FakeSpawner>, cmd: Command) -> Value {
+        let resp = call(core, cmd).await;
+        assert!(resp.ok, "{resp:?}");
+        resp.result.unwrap()
+    }
+
+    fn error(resp: Response) -> (ErrorCode, String) {
+        let body = resp.error.expect("an error");
+        (body.code, body.message)
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn state(next: &[&str], upcoming: &[&str]) -> QueueState {
+        QueueState {
+            next: ids(next),
+            upcoming: ids(upcoming),
+            more: false,
+            context: Some(ContextRef::Library),
+        }
+    }
+
+    /// The `queue` events emitted since the last call.
+    fn queue_events(rx: &mut broadcast::Receiver<Event>) -> Vec<QueueState> {
+        let mut seen = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(Event::Queue(state)) => seen.push(state),
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => return seen,
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    fn play(track_id: &str) -> Command {
+        Command::Play {
+            track_id: track_id.into(),
+            context: ContextRef::Library,
+        }
+    }
+
+    fn play_next(track_id: &str) -> Command {
+        Command::QueuePlayNext {
+            track_id: track_id.into(),
+        }
+    }
+
+    fn remove(section: QueueSection, index: usize, track_id: &str) -> Command {
+        Command::QueueRemove {
+            section,
+            index,
+            track_id: track_id.into(),
+        }
+    }
+
+    fn move_next(from: usize, to: usize, track_id: &str) -> Command {
+        Command::QueueMove {
+            from,
+            to,
+            track_id: track_id.into(),
+        }
+    }
+
+    fn jump(section: QueueSection, index: usize, track_id: &str) -> Command {
+        Command::QueueJump {
+            section,
+            index,
+            track_id: track_id.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_commands_check_the_index_and_track_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeSpawner::default();
+        let mut core = core(dir.path(), &fake);
+        let [a, b, c, d] = IDS;
+        let changed = (
+            ErrorCode::Conflict,
+            "Up Next changed; try again.".to_string(),
+        );
+        assert_eq!(
+            ok_call(&mut core, Command::QueueGet).await,
+            json!({"next": [], "upcoming": [], "more": false, "context": null})
+        );
+        ok_call(&mut core, play(a)).await;
+        ok_call(&mut core, play_next(d)).await;
+        ok_call(&mut core, play_next(c)).await;
+        let got: QueueState =
+            serde_json::from_value(ok_call(&mut core, Command::QueueGet).await).unwrap();
+        assert_eq!(got, state(&[d, c], &[b, c, d]));
+
+        // remove
+        let resp = call(&mut core, remove(QueueSection::Next, 2, d)).await;
+        assert_eq!(error(resp).0, ErrorCode::NotFound);
+        let resp = call(&mut core, remove(QueueSection::Upcoming, 3, d)).await;
+        assert_eq!(error(resp).0, ErrorCode::NotFound);
+        let resp = call(&mut core, remove(QueueSection::Next, 0, c)).await;
+        assert_eq!(error(resp), changed);
+        let resp = call(&mut core, remove(QueueSection::Upcoming, 0, c)).await;
+        assert_eq!(error(resp), changed);
+        assert_eq!(core.engine.queue_state(), state(&[d, c], &[b, c, d]));
+
+        // move
+        let resp = call(&mut core, move_next(0, 1, c)).await;
+        assert_eq!(error(resp), changed);
+        let resp = call(&mut core, move_next(0, 2, d)).await;
+        assert_eq!(error(resp).0, ErrorCode::NotFound);
+        let resp = call(&mut core, move_next(2, 0, d)).await;
+        assert_eq!(error(resp).0, ErrorCode::NotFound);
+        assert_eq!(ok_call(&mut core, move_next(0, 1, d)).await, json!({}));
+        assert_eq!(core.engine.queue_state(), state(&[c, d], &[b, c, d]));
+
+        assert_eq!(
+            ok_call(&mut core, remove(QueueSection::Upcoming, 1, c)).await,
+            json!({})
+        );
+        assert_eq!(core.engine.queue_state(), state(&[c, d], &[b, d]));
+        ok_call(&mut core, remove(QueueSection::Next, 0, c)).await;
+        assert_eq!(core.engine.queue_state(), state(&[d], &[b, d]));
+
+        // jump
+        let resp = call(&mut core, jump(QueueSection::Upcoming, 1, b)).await;
+        assert_eq!(error(resp), changed);
+        let resp = call(&mut core, jump(QueueSection::Upcoming, 2, d)).await;
+        assert_eq!(error(resp).0, ErrorCode::NotFound);
+        assert_eq!(core.engine.state().track_id.as_deref(), Some(a));
+        assert_eq!(
+            ok_call(&mut core, jump(QueueSection::Upcoming, 1, d)).await,
+            json!({})
+        );
+        assert_eq!(core.engine.state().track_id.as_deref(), Some(d));
+        assert_eq!(core.engine.queue_state(), state(&[], &[]));
+
+        ok_call(&mut core, play_next(b)).await;
+        ok_call(&mut core, play_next(c)).await;
+        ok_call(&mut core, jump(QueueSection::Next, 1, c)).await;
+        assert_eq!(core.engine.state().track_id.as_deref(), Some(c));
+        let path = dir.path().join(format!("cache/{c}.opus"));
+        assert_eq!(
+            fake.commands().last().unwrap(),
+            &vec![
+                json!("loadfile"),
+                json!(path),
+                json!("replace"),
+                json!(-1),
+                json!("volume-gain=0.00")
+            ]
+        );
+
+        // clear
+        ok_call(&mut core, play_next(a)).await;
+        assert_eq!(ok_call(&mut core, Command::QueueClear).await, json!({}));
+        assert_eq!(core.engine.queue_state(), state(&[], &[]));
+    }
+
+    #[tokio::test]
+    async fn queue_event_is_emitted_only_when_up_next_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeSpawner::default();
+        let mut core = core(dir.path(), &fake);
+        let mut rx = core.events.subscribe();
+        let [a, b, c, d] = IDS;
+
+        // Requests.
+        ok_call(&mut core, Command::Now).await;
+        assert_eq!(queue_events(&mut rx), []);
+        ok_call(&mut core, play(a)).await;
+        assert_eq!(queue_events(&mut rx), [state(&[], &[b, c, d])]);
+        ok_call(&mut core, Command::Volume { value: 50.0 }).await;
+        ok_call(&mut core, Command::Pause).await;
+        ok_call(&mut core, Command::Resume).await;
+        ok_call(&mut core, Command::QueueClear).await;
+        ok_call(&mut core, Command::QueueGet).await;
+        assert_eq!(queue_events(&mut rx), []);
+        ok_call(&mut core, play_next(d)).await;
+        assert_eq!(queue_events(&mut rx), [state(&[d], &[b, c, d])]);
+        let resp = call(&mut core, play_next("nope")).await;
+        assert_eq!(error(resp).0, ErrorCode::NotFound);
+        assert_eq!(queue_events(&mut rx), []);
+
+        // mpv events: preloading changes nothing; moving on to the
+        // preloaded entry consumes it.
+        let g = fake.generation();
+        core.on_mpv_event(g, MpvEvent::FileLoaded).await;
+        core.on_mpv_event(g, MpvEvent::PlaybackRestart).await;
+        assert_eq!(queue_events(&mut rx), []);
+        let path = dir.path().join(format!("cache/{d}.opus"));
+        let ev = MpvEvent::PropertyChange {
+            name: "path".into(),
+            data: json!(path),
+        };
+        core.on_mpv_event(g, ev).await;
+        assert_eq!(core.engine.state().track_id.as_deref(), Some(d));
+        assert_eq!(queue_events(&mut rx), [state(&[], &[b, c, d])]);
+
+        // Internal messages.
+        let msg = || Internal::Updated(UpdateOutcome::UpToDate("2026.09.01".into()));
+        core.on_internal(msg()).await;
+        assert_eq!(queue_events(&mut rx), []);
+        let r = Resolver {
+            db: &core.db,
+            downloads: &core.downloads,
+            levels: &core.levels,
+        };
+        core.engine.play_next(c, &r).await.unwrap();
+        core.on_internal(msg()).await;
+        assert_eq!(queue_events(&mut rx), [state(&[c], &[b, c, d])]);
+        core.on_internal(msg()).await;
+        assert_eq!(queue_events(&mut rx), []);
+    }
 }
