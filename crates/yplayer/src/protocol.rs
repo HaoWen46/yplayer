@@ -40,6 +40,9 @@ const COMMANDS: [&str; 27] = [
     "lyrics",
 ];
 
+/// Wire names of the settings and music-folder commands.
+const SETTINGS_COMMANDS: [&str; 3] = ["settings.get", "settings.set", "library.move"];
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestEnvelope {
     pub id: u64,
@@ -51,6 +54,14 @@ fn default_true() -> bool {
     true
 }
 
+/// For `Option<Option<T>>` fields with `#[serde(default)]`: absent is
+/// `None`, `null` is `Some(None)`.
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
 pub enum Command {
@@ -60,6 +71,23 @@ pub enum Command {
     Subscribe,
     #[serde(rename = "library.get")]
     LibraryGet,
+    #[serde(rename = "settings.get")]
+    SettingsGet,
+    /// Absent fields stay unchanged; `api_key: null` removes the key.
+    #[serde(rename = "settings.set")]
+    SettingsSet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        level_loudness: Option<bool>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present"
+        )]
+        api_key: Option<Option<String>>,
+    },
+    /// Move the music folder to `to` (applied by a service restart).
+    #[serde(rename = "library.move")]
+    LibraryMove { to: String },
     #[serde(rename = "now")]
     Now,
     #[serde(rename = "add")]
@@ -232,6 +260,16 @@ pub struct AddResult {
     pub was_in_album: bool,
 }
 
+/// Result of `settings.get`/`settings.set` and payload of the `settings` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Settings {
+    pub level_loudness: bool,
+    /// ffmpeg was found: tracks can be measured.
+    pub loudness_available: bool,
+    pub api_key: Option<String>,
+    pub music_folder: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PlayState {
@@ -295,6 +333,8 @@ pub enum Event {
     },
     #[serde(rename = "toast")]
     Toast { severity: Severity, message: String },
+    #[serde(rename = "settings")]
+    Settings(Settings),
     #[serde(rename = "resync")]
     Resync,
 }
@@ -315,7 +355,7 @@ pub fn decode_request(line: &str) -> Result<RequestEnvelope, Response> {
     let Some(cmd) = value.get("cmd").and_then(Value::as_str) else {
         return Err(Response::err(id, ErrorCode::BadRequest, "missing cmd"));
     };
-    if !COMMANDS.contains(&cmd) {
+    if !COMMANDS.contains(&cmd) && !SETTINGS_COMMANDS.contains(&cmd) {
         return Err(Response::err(
             id,
             ErrorCode::UnknownCommand,
@@ -637,6 +677,74 @@ mod tests {
         assert_eq!(
             serde_json::to_value(Response::err(4, ErrorCode::NotFound, "no such track")).unwrap(),
             json!({"id": 4, "ok": false, "error": {"code": "not_found", "message": "no such track"}})
+        );
+    }
+
+    #[test]
+    fn settings_and_move_commands_round_trip() {
+        let cases: Vec<(&str, Command)> = vec![
+            (r#"{"id":1,"cmd":"settings.get"}"#, Command::SettingsGet),
+            (
+                r#"{"id":1,"cmd":"settings.set"}"#,
+                Command::SettingsSet {
+                    level_loudness: None,
+                    api_key: None,
+                },
+            ),
+            (
+                r#"{"id":1,"cmd":"settings.set","level_loudness":false}"#,
+                Command::SettingsSet {
+                    level_loudness: Some(false),
+                    api_key: None,
+                },
+            ),
+            (
+                r#"{"id":1,"cmd":"settings.set","api_key":null}"#,
+                Command::SettingsSet {
+                    level_loudness: None,
+                    api_key: Some(None),
+                },
+            ),
+            (
+                r#"{"id":1,"cmd":"settings.set","level_loudness":true,"api_key":"AIza"}"#,
+                Command::SettingsSet {
+                    level_loudness: Some(true),
+                    api_key: Some(Some("AIza".into())),
+                },
+            ),
+            (
+                r#"{"id":1,"cmd":"library.move","to":"/Volumes/音楽/yt-audio"}"#,
+                Command::LibraryMove {
+                    to: "/Volumes/音楽/yt-audio".into(),
+                },
+            ),
+        ];
+        for (wire, cmd) in cases {
+            let expected = RequestEnvelope { id: 1, cmd };
+            assert_eq!(decode_request(wire).unwrap(), expected, "{wire}");
+            let back = serde_json::to_value(&expected).unwrap();
+            assert_eq!(back, serde_json::from_str::<Value>(wire).unwrap(), "{wire}");
+        }
+        let resp = decode_request(r#"{"id":2,"cmd":"library.move"}"#).unwrap_err();
+        assert_eq!(resp.error.unwrap().code, ErrorCode::BadRequest);
+    }
+
+    #[test]
+    fn settings_event_is_flat() {
+        let settings = Settings {
+            level_loudness: true,
+            loudness_available: false,
+            api_key: None,
+            music_folder: "/Users/me/Music/yt-audio".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&Event::Settings(settings.clone())).unwrap(),
+            r#"{"event":"settings","level_loudness":true,"loudness_available":false,"api_key":null,"music_folder":"/Users/me/Music/yt-audio"}"#
+        );
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap(),
+            json!({"level_loudness": true, "loudness_available": false, "api_key": null,
+                "music_folder": "/Users/me/Music/yt-audio"})
         );
     }
 

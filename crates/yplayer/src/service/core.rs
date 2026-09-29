@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,18 +8,19 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Instant;
 
 use super::downloads::{self, Downloads, JobMsg};
-use crate::config::{Config, SessionState};
+use crate::config::{self, Config, PendingMove, SessionState, SettingEdit};
 use crate::download::worker::{JobId, WorkerHandle, WorkerMsg};
 use crate::http::HttpGet;
 use crate::library::db::{Db, DbError, LyricsRow};
 use crate::library::reconcile::{ReconcileReport, reconcile, remove_partials};
 use crate::library::safe_fs::{self, RemoveMode};
+use crate::loudness::{Levels, Measure, Measurement, Schedule};
 use crate::lyrics::{self, LyricsOutcome};
 use crate::player::engine::{Engine, EngineError, TrackResolver};
 use crate::player::mpv::{MpvEvent, MpvSpawner};
 use crate::protocol::{
     AddResult, AlbumRef, Command, ContextRef, DownloadPhase, ErrorCode, Event, PROTOCOL, PlayState,
-    PlayerState, Response, Severity,
+    PlayerState, Response, Settings, Severity,
 };
 use crate::types::{Album, LoopMode, Track, TrackState};
 use crate::updater::{UpdateOutcome, Updater};
@@ -32,6 +33,8 @@ const UPDATE_RECHECK: Duration = Duration::from_secs(24 * 3600);
 /// A reconcile importing or relinking more tracks than this emits one
 /// `resync` instead of an event per track.
 const RESYNC_ABOVE: usize = 200;
+/// `library.move` replies, then the service exits this long after.
+const RESTART_DELAY: Duration = Duration::from_millis(300);
 
 /// One socket request; the core answers on `reply`.
 pub struct Request {
@@ -71,6 +74,11 @@ enum Internal {
     },
     Updated(UpdateOutcome),
     Job(JobMsg),
+    Measured {
+        track_id: String,
+        path: String,
+        result: Result<Measurement, String>,
+    },
 }
 
 #[derive(Clone)]
@@ -109,9 +117,11 @@ fn respond(id: u64, result: Result<Value, CmdError>) -> Response {
 
 /// Complete tracks whose audio file exists play from that path; downloading
 /// tracks whose `Started` arrived stream from `appending://<absolute path>`.
+/// Gains come from `levels`.
 struct Resolver<'a> {
     db: &'a Db,
     downloads: &'a Downloads,
+    levels: &'a Levels,
 }
 
 impl TrackResolver for Resolver<'_> {
@@ -128,6 +138,10 @@ impl TrackResolver for Resolver<'_> {
             }
             TrackState::Failed => None,
         }
+    }
+
+    fn gain_db(&self, track_id: &str) -> f64 {
+        self.levels.gain(track_id)
     }
 }
 
@@ -156,7 +170,14 @@ pub struct Core<S: MpvSpawner> {
     downloads: Downloads,
     /// Track to play as soon as its download's `Started` arrives.
     pending_play: Option<String>,
-    startup_toast: Option<String>,
+    startup_toasts: Vec<(Severity, String)>,
+    /// Measured gains and the leveling switch.
+    levels: Levels,
+    /// ffmpeg, or a fake in tests; `None`: loudness can't be measured.
+    measurer: Option<Arc<dyn Measure>>,
+    measurements: Schedule,
+    /// Set by `library.move`: `run` returns then and launchd restarts us.
+    restart_at: Option<Instant>,
 }
 
 impl<S: MpvSpawner> Core<S> {
@@ -176,6 +197,10 @@ impl<S: MpvSpawner> Core<S> {
             .unwrap_or(100.0)
             .clamp(0.0, 100.0);
         let loop_mode = session.loop_mode.unwrap_or(LoopMode::None);
+        let levels = Levels::new(
+            deps.config.level_loudness,
+            deps.db.measured().unwrap_or_default(),
+        );
         let core = Core {
             engine: Engine::new(deps.spawner, mpv_tx, volume, loop_mode),
             config: deps.config,
@@ -193,7 +218,11 @@ impl<S: MpvSpawner> Core<S> {
             update_at: None,
             downloads: Downloads::default(),
             pending_play: None,
-            startup_toast: None,
+            startup_toasts: Vec::new(),
+            levels,
+            measurer: None,
+            measurements: Schedule::default(),
+            restart_at: None,
         };
         let inbox = Inbox {
             requests: requests_rx,
@@ -210,16 +239,26 @@ impl<S: MpvSpawner> Core<S> {
     /// A warn toast shown once the startup reconcile finished: to the
     /// subscribers then, or else to the first one.
     pub fn warn_after_startup(&mut self, message: &str) {
-        self.startup_toast = Some(message.to_string());
+        self.toast_after_startup(Severity::Warn, message);
+    }
+
+    /// `warn_after_startup` with any severity; toasts go out in order.
+    pub fn toast_after_startup(&mut self, severity: Severity, message: &str) {
+        self.startup_toasts.push((severity, message.to_string()));
     }
 
     fn flush_startup_toast(&mut self) {
-        if !self.reconciling
-            && self.events.receiver_count() > 0
-            && let Some(message) = self.startup_toast.take()
-        {
-            self.toast(Severity::Warn, message);
+        if self.reconciling || self.events.receiver_count() == 0 {
+            return;
         }
+        for (severity, message) in std::mem::take(&mut self.startup_toasts) {
+            self.toast(severity, message);
+        }
+    }
+
+    /// Measure loudness with `measurer` (ffmpeg was found at startup).
+    pub fn set_measurer(&mut self, measurer: Arc<dyn Measure>) {
+        self.measurer = Some(measurer);
     }
 
     /// Background reconcile and the first update check.
@@ -228,13 +267,14 @@ impl<S: MpvSpawner> Core<S> {
         self.check_update();
     }
 
-    /// Serve until `stop` resolves. No periodic timers: only channel receives
-    /// and the one-shot engine idle and update deadlines.
+    /// Serve until `stop` resolves or a `library.move` restart is due. No
+    /// periodic timers: only channel receives and one-shot deadlines.
     pub async fn run(&mut self, mut inbox: Inbox, stop: impl Future<Output = ()>) {
         tokio::pin!(stop);
         loop {
             tokio::select! {
                 () = &mut stop => return,
+                () = sleep_until_opt(self.restart_at) => return,
                 Some(req) = inbox.requests.recv() => self.on_request(req).await,
                 Some((generation, ev)) = inbox.mpv.recv() => self.on_mpv_event(generation, ev).await,
                 Some(msg) = inbox.internal.recv() => self.on_internal(msg).await,
@@ -259,6 +299,7 @@ impl<S: MpvSpawner> Core<S> {
         let r = Resolver {
             db: &self.db,
             downloads: &self.downloads,
+            levels: &self.levels,
         };
         let result = match cmd {
             Command::Hello { protocol } if protocol != PROTOCOL => Err(CmdError(
@@ -275,6 +316,12 @@ impl<S: MpvSpawner> Core<S> {
                 Ok(json!({"player": prev, "library_version": self.library_version}))
             }
             Command::LibraryGet => self.library_get(),
+            Command::SettingsGet => Ok(json!(self.settings())),
+            Command::SettingsSet {
+                level_loudness,
+                api_key,
+            } => self.settings_set(level_loudness, api_key).await,
+            Command::LibraryMove { to } => self.library_move(&to),
             Command::Now => self.now(),
             Command::Play { track_id, context } => self.play(track_id, context).await,
             Command::Pause => ok(self.engine.pause().await),
@@ -329,6 +376,7 @@ impl<S: MpvSpawner> Core<S> {
             response: respond(id, result),
             events,
         });
+        self.measure_next();
     }
 
     async fn on_mpv_event(&mut self, generation: u64, ev: MpvEvent) {
@@ -336,10 +384,12 @@ impl<S: MpvSpawner> Core<S> {
         let r = Resolver {
             db: &self.db,
             downloads: &self.downloads,
+            levels: &self.levels,
         };
         if self.engine.on_mpv_event(generation, ev, &r).await {
             self.player_changed(&prev, true);
         }
+        self.measure_next();
     }
 
     async fn on_internal(&mut self, msg: Internal) {
@@ -353,6 +403,11 @@ impl<S: MpvSpawner> Core<S> {
                 }
             }
             Internal::Job(msg) => self.on_job(msg).await,
+            Internal::Measured {
+                track_id,
+                path,
+                result,
+            } => self.on_measured(track_id, path, result).await,
         }
     }
 
@@ -428,6 +483,7 @@ impl<S: MpvSpawner> Core<S> {
         let r = Resolver {
             db: &self.db,
             downloads: &self.downloads,
+            levels: &self.levels,
         };
         self.engine
             .play(context.clone(), order, &track_id, &r)
@@ -450,6 +506,7 @@ impl<S: MpvSpawner> Core<S> {
         let r = Resolver {
             db: &self.db,
             downloads: &self.downloads,
+            levels: &self.levels,
         };
         ok(self.engine.play_next(track_id, &r).await)
     }
@@ -476,6 +533,7 @@ impl<S: MpvSpawner> Core<S> {
         let r = Resolver {
             db: &self.db,
             downloads: &self.downloads,
+            levels: &self.levels,
         };
         let _ = self.engine.replace_order(order, &r).await;
         Ok(())
@@ -644,6 +702,7 @@ impl<S: MpvSpawner> Core<S> {
         let r = Resolver {
             db: &self.db,
             downloads: &self.downloads,
+            levels: &self.levels,
         };
         self.engine
             .play(ContextRef::Album(album_id), order, track_id, &r)
@@ -691,6 +750,7 @@ impl<S: MpvSpawner> Core<S> {
         match msg {
             WorkerMsg::Started { path, dir, meta } => {
                 let _ = self.db.mark_started(&track_id, &meta, &path);
+                self.levels.forget(&track_id);
                 if let Some(d) = self.downloads.get_mut(&track_id) {
                     d.path = Some(path);
                     d.dir = Some(dir);
@@ -739,6 +799,8 @@ impl<S: MpvSpawner> Core<S> {
                     file_size,
                     thumb.as_deref(),
                 );
+                self.levels.forget(&track_id);
+                self.measurements.downloaded(&track_id);
                 let _ = self.track_changed(&track_id);
                 self.emit_download(&track_id, DownloadPhase::Done, None, None, None);
             }
@@ -762,6 +824,7 @@ impl<S: MpvSpawner> Core<S> {
                     let r = Resolver {
                         db: &self.db,
                         downloads: &self.downloads,
+                        levels: &self.levels,
                     };
                     let _ = self.engine.track_failed(&track_id, &r).await;
                     let _ = self.track_changed(&track_id);
@@ -782,6 +845,7 @@ impl<S: MpvSpawner> Core<S> {
             }
         }
         self.player_changed(&prev, false);
+        self.measure_next();
     }
 
     /// Remove a failed or cancelled job's folder (automatic cleanup: refused
@@ -845,10 +909,12 @@ impl<S: MpvSpawner> Core<S> {
         let r = Resolver {
             db: &self.db,
             downloads: &self.downloads,
+            levels: &self.levels,
         };
         let _ = self.engine.remove_track(track_id, &r).await;
         let albums = self.db.albums_containing(track_id)?;
         self.db.delete_track(track_id)?;
+        self.levels.forget(track_id);
         self.emit(Event::TrackRemoved {
             track_id: track_id.to_string(),
         });
@@ -899,6 +965,7 @@ impl<S: MpvSpawner> Core<S> {
 
     fn on_reconciled(&mut self, result: Result<ReconcileReport, String>) {
         self.reconciling = false;
+        self.start_backfill();
         let report = match result {
             Ok(report) => {
                 remove_partials(
@@ -956,6 +1023,189 @@ impl<S: MpvSpawner> Core<S> {
         tokio::task::spawn_blocking(move || {
             let _ = tx.send(Internal::Updated(updater.check_and_upgrade()));
         });
+    }
+
+    fn settings(&self) -> Settings {
+        Settings {
+            level_loudness: self.levels.enabled(),
+            loudness_available: self.measurer.is_some(),
+            api_key: self.config.api_key.clone(),
+            music_folder: self.config.cache_dir.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Validate, save to `config.toml`, then apply; switching leveling
+    /// changes the playing track's gain at once. `settings` goes out when
+    /// something changed.
+    async fn settings_set(
+        &mut self,
+        level_loudness: Option<bool>,
+        api_key: Option<Option<String>>,
+    ) -> Result<Value, CmdError> {
+        let api_key = api_key
+            .map(|key| valid_api_key(key.as_deref()))
+            .transpose()?;
+        let mut edits = Vec::new();
+        if let Some(on) = level_loudness {
+            edits.push(SettingEdit::LevelLoudness(on));
+        }
+        if let Some(key) = &api_key {
+            edits.push(SettingEdit::ApiKey(key.as_deref()));
+        }
+        if !edits.is_empty()
+            && let Some(file) = self.config.config_file()
+        {
+            config::save_settings(&file, &edits).map_err(|e| {
+                CmdError(
+                    ErrorCode::Internal,
+                    format!("Couldn't save your settings: {e}"),
+                )
+            })?;
+        }
+        let before = self.settings();
+        if let Some(key) = api_key {
+            self.config.api_key = key;
+        }
+        if let Some(on) = level_loudness
+            && on != self.levels.enabled()
+        {
+            self.config.level_loudness = on;
+            self.levels.set_enabled(on);
+            let r = Resolver {
+                db: &self.db,
+                downloads: &self.downloads,
+                levels: &self.levels,
+            };
+            if let Err(e) = self.engine.apply_leveling(&r).await {
+                eprintln!("could not apply the new gain: {e}");
+            }
+        }
+        let settings = self.settings();
+        if settings != before {
+            self.emit(Event::Settings(settings.clone()));
+        }
+        Ok(json!(settings))
+    }
+
+    /// Check the new place, record the move in `pending-move.json` and exit
+    /// shortly after the reply; the next start moves the folder.
+    fn library_move(&mut self, to: &str) -> Result<Value, CmdError> {
+        let to = super::check_move(&self.config.cache_dir, to, super::device_of)
+            .map_err(|message| CmdError(ErrorCode::BadRequest, message.into()))?;
+        if !self.downloads.in_flight().is_empty() {
+            return Err(CmdError(
+                ErrorCode::Conflict,
+                "Wait for downloads to finish before moving your music folder.".into(),
+            ));
+        }
+        let file = self.config.pending_move_file().ok_or_else(|| {
+            CmdError(
+                ErrorCode::Internal,
+                "no settings folder to record the move in".into(),
+            )
+        })?;
+        let request = PendingMove {
+            from: self.config.cache_dir.clone(),
+            to,
+        };
+        request.save(&file).map_err(|e| {
+            CmdError(
+                ErrorCode::Internal,
+                format!("Couldn't record the move: {e}"),
+            )
+        })?;
+        self.restart_at = Some(Instant::now() + RESTART_DELAY);
+        Ok(json!({"restarting": true}))
+    }
+
+    /// Start the next loudness measurement unless one runs or none is due:
+    /// fresh downloads, then the playing or preloaded track, then the
+    /// backfill. Never a track that is still downloading.
+    fn measure_next(&mut self) {
+        let Some(measurer) = self.measurer.clone() else {
+            return;
+        };
+        if self.measurements.running().is_some() {
+            return;
+        }
+        let player = self.engine.state();
+        let playing = player
+            .track_id
+            .filter(|_| player.state != PlayState::Stopped);
+        let current: Vec<&str> = playing
+            .as_deref()
+            .into_iter()
+            .chain(self.engine.preloaded_id())
+            .collect();
+        let (db, downloads) = (&self.db, &self.downloads);
+        let Some((track_id, path)) = self.measurements.start(&current, |id| {
+            if downloads.get(id).is_some() {
+                return None;
+            }
+            let path = db.measure_path(id).ok()??;
+            Path::new(&path).exists().then_some(path)
+        }) else {
+            return;
+        };
+        let tx = self.internal.clone();
+        tokio::spawn(async move {
+            let result = measurer.measure(PathBuf::from(&path)).await;
+            let _ = tx.send(Internal::Measured {
+                track_id,
+                path,
+                result,
+            });
+        });
+    }
+
+    /// Store a finished measurement (a failure as checked, with no values),
+    /// re-preload the next track if its gain changed, then start the next
+    /// one. The playing track keeps its gain until it ends.
+    async fn on_measured(
+        &mut self,
+        track_id: String,
+        path: String,
+        result: Result<Measurement, String>,
+    ) {
+        self.measurements.finish();
+        let measurement = match result {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("could not measure the loudness of {path}: {e}");
+                None
+            }
+        };
+        match self.db.set_loudness(&track_id, &path, measurement) {
+            Ok(true) => {
+                self.levels.set(&track_id, measurement);
+                let prev = self.engine.state();
+                let r = Resolver {
+                    db: &self.db,
+                    downloads: &self.downloads,
+                    levels: &self.levels,
+                };
+                let _ = self.engine.refresh_gains(&r).await;
+                self.player_changed(&prev, false);
+            }
+            // Re-downloaded, relinked or deleted meanwhile.
+            Ok(false) => {}
+            Err(e) => eprintln!("could not store the loudness of {track_id}: {e}"),
+        }
+        self.measure_next();
+    }
+
+    /// After a reconcile (it writes on its own connection): reload the
+    /// measured gains and queue every complete unmeasured track.
+    fn start_backfill(&mut self) {
+        match self.db.measured() {
+            Ok(measured) => self.levels = Levels::new(self.levels.enabled(), measured),
+            Err(e) => eprintln!("could not load loudness measurements: {e}"),
+        }
+        match self.db.unmeasured() {
+            Ok(ids) => self.measurements.set_backfill(ids),
+            Err(e) => eprintln!("could not list unmeasured tracks: {e}"),
+        }
+        self.measure_next();
     }
 
     fn lyrics_lookup(&self, track_id: &str) -> Result<LyricsLookup, CmdError> {
@@ -1033,6 +1283,23 @@ fn trimmed<'a>(text: &'a str, what: &str, max: usize) -> Result<&'a str, CmdErro
             format!("{what} must be 1 to {max} characters"),
         ))
     }
+}
+
+/// `settings.set`'s `api_key`: `None` (remove) for null or blank; trimmed,
+/// else `bad_request` when over 200 characters or holding whitespace or
+/// control characters.
+fn valid_api_key(key: Option<&str>) -> Result<Option<String>, CmdError> {
+    let Some(key) = key.map(str::trim).filter(|k| !k.is_empty()) else {
+        return Ok(None);
+    };
+    if key.chars().count() > 200 || key.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(CmdError(
+            ErrorCode::BadRequest,
+            "The API key must be at most 200 characters, with no spaces or control characters."
+                .into(),
+        ));
+    }
+    Ok(Some(key.to_string()))
 }
 
 fn ok(result: Result<(), EngineError>) -> Result<Value, CmdError> {
