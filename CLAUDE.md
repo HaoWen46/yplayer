@@ -16,3 +16,4 @@
 - A release install sets `worker_python` to `~/Library/Application Support/yplayer/venv/bin/python3`; a later checkout `scripts/install.sh` keeps it, so delete that line from `config.toml` first when testing worker changes from a checkout.
 - CI runners use Xcode's Swift (older than local CLT, 6.3.3 vs 6.4): passing a MainActor method directly as a closure (e.g. `Binding(set: method)`) crashed it; wrap it in `{ method($0) }`.
 - Test with CJK titles; the real library is mostly Japanese music.
+- `README.md` and `README.zh-TW.md` (Traditional Chinese, Taiwan terms) are kept in sync: mirror every README change in both; UI labels stay in English because the app is English.
