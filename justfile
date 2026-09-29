@@ -49,3 +49,7 @@ swift-test:
 # Build and ad-hoc sign build/Yplayer.app.
 app:
     scripts/build-app.sh
+
+# Redraw the app icon (apps/macos/Packaging/AppIcon.icns) after editing scripts/make-icon.swift.
+icon:
+    swift scripts/make-icon.swift apps/macos/Packaging/AppIcon.icns

@@ -11,8 +11,9 @@ swift build -c release --package-path "$PKG" >&2
 BIN_DIR="$(swift build -c release --package-path "$PKG" --show-bin-path)"
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/Yplayer" "$APP/Contents/MacOS/Yplayer"
+cp "$PKG/Packaging/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 cp "$PKG/Packaging/Info.plist" "$APP/Contents/Info.plist"
 codesign --force --sign - "$APP" >&2
 

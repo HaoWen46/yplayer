@@ -239,7 +239,7 @@ apps/macos/          # SwiftUI menu-bar app + drop orb (Swift package)
 yplayer/             # Python package: yt-dlp download worker (worker.py, core.py)
 tests/               # Python worker tests
 packaging/           # LaunchAgent plist templates (service, app)
-scripts/             # install, uninstall, app build, Swift tests, performance check
+scripts/             # install, uninstall, app build, app icon, Swift tests, performance check
 docs/specs/          # design spec with verification results
 docs/plans/          # implementation plans, one per sub-project
 ```
