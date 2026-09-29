@@ -229,6 +229,15 @@ Plan: `docs/plans/2026-09-29-hardening-plan.md`. Every finding below was reprodu
 - Robustness: orphan mpv quit at service start; hung mpv killed after two timeouts; resume after an mpv crash continues at the right position; a failed stream skips on; a damaged DB is moved aside and rebuilt from the folders; one bad folder no longer stops startup; renamed folders keep their album links; queued downloads never time out while waiting; a job the worker never starts times out; the newest drop never waits for a slot; volume/seek validated; per-connection request backpressure; oversized worker lines dropped. A second `serve` exits before touching the DB. Known and accepted: another process holding a SQLite write lock stalls the service ~5 s per write.
 - Performance: 20k-track libraries load in the app (was a reconnect loop); a song-list update costs 17 ms at 20k (was 5 s); first search keystroke 6 ms and typed keystrokes 2.4 ms at 20k; library load 122 ms (219 ms when many tracks share an added time); at most 3 toasts kept; artwork cache bounded. Known: at 20k tracks the idle service shows ~28 MB footprint of freed-but-counted small allocations (live heap ~0.5 MB; 3 MB with the real 9-track library); `next` costs ~4 ms at 20k (queue copy for safe rollback).
 
+## Polish results (2026-09-29, installed, real library; plan `docs/plans/2026-09-29-polish-plan.md`)
+
+- Loudness leveling: all 9 library tracks measured within 20 s of install (incl. a 3 h medley; 0.46 s per 4.5 min song, ~1 s at background priority; true peak was 4x costlier, so sample peak + 1 dB headroom); measured −6.1…−11.5 LUFS; mpv `volume-gain` read back −3.1 dB for a −10.9 LUFS track; toggling the setting changes the playing track's gain live (0.0 ↔ −3.1).
+- Up Next: `queue.get` on the real library lists the context's upcoming tracks; UI reviewed from snapshots (Playing Next + "Up Next from <album>", dimmed failed rows).
+- Settings: `settings.get/set` round-trip on the installed service; music-folder move verified end-to-end with the real binary in a temp HOME (relative path refused; move → exit 0 → restart renames the folder, rewrites track paths, updates `cache_dir` keeping config comments, removes the request file).
+- App icon: full-bleed .icns (macOS 26 masks it natively; a shaped legacy icon was shrunk onto a gray plate); `CFBundlePackageType` added (Finder had shown a blank icon).
+- Perf after install: service idle 0.00 wakeups/s, 3.7 MB (after the backfill); app popover closed 0.00 wakeups/s, 19.0 MB.
+- Gates: Rust 179 passed + ignored real-mpv/ffmpeg/e2e passing; Swift 62 passed; lint and warnings-as-errors build clean. The Trash test now also needs `YPLAY_TEST_TRASH=1`.
+
 ## Out of scope (v1)
 
 - Full library window; YouTube search/browse in the app; playlist import; browser extensions; bookmarklets; `yplay://` URL scheme and Shortcuts/share-sheet integration; Safari tab drags; lyrics editing; cross-platform; notarization/distribution beyond this machine; homebrew `yt-dlp` (it is outdated and broken — the app always uses its own venv copy).
