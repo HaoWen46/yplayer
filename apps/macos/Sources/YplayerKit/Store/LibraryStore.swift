@@ -11,6 +11,8 @@ public final class LibraryStore {
     /// Albums by name.
     public private(set) var albums: [Album] = []
     public private(set) var player: PlayerState?
+    /// Up Next, from `queue.get` (`loadQueue`) and `queue` events.
+    public private(set) var queue = QueueState.empty
     public private(set) var downloads: [String: DownloadProgress] = [:]
     public private(set) var connection: ConnectionStatus = .connecting
     public var toasts: [ToastItem] = []
@@ -72,6 +74,13 @@ public final class LibraryStore {
         downloads = downloads.filter { tracks[$0.key]?.state == .downloading }
         libraryVersion = snapshot.libraryVersion
         needsResync = false
+    }
+
+    /// Replaces Up Next (the `queue.get` result); observers see a change only when it differs.
+    public func loadQueue(_ state: QueueState) {
+        if queue != state {
+            queue = state
+        }
     }
 
     /// Appends `toast` after dropping toasts older than `toastLifetime`, unless it repeats the
@@ -139,6 +148,8 @@ public final class LibraryStore {
             appendToast(ToastItem(severity: toast.severity, message: toast.message))
         case .resync:
             needsResync = true
+        case .queue(let state):
+            loadQueue(state)
         case .unknown:
             break
         }

@@ -180,6 +180,30 @@ public struct PlayerState: Codable, Equatable, Sendable {
     }
 }
 
+/// Which list of a `QueueState` an index points into.
+public enum QueueSection: String, Codable, Equatable, Sendable {
+    case next, upcoming
+}
+
+/// Up Next: `next` is the play-next FIFO (every entry); `upcoming` the context tracks that play
+/// after it, in play order, at most 100; `more` when `upcoming` was cut there.
+public struct QueueState: Codable, Equatable, Sendable {
+    public var next: [String]
+    public var upcoming: [String]
+    public var more: Bool
+    public var context: ContextRef?
+
+    /// Nothing up next.
+    public static let empty = QueueState(next: [], upcoming: [], more: false, context: nil)
+
+    public init(next: [String], upcoming: [String], more: Bool, context: ContextRef?) {
+        self.next = next
+        self.upcoming = upcoming
+        self.more = more
+        self.context = context
+    }
+}
+
 public struct DownloadEvent: Codable, Equatable, Sendable {
     public var trackID: String
     public var phase: DownloadPhase

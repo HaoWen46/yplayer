@@ -85,6 +85,20 @@ private let commandCases: [(String, Command)] = [
     (#"{"id":1,"cmd":"track.retry","track_id":"dQw4w9WgXcQ"}"#, .trackRetry(trackID: videoID)),
     (#"{"id":1,"cmd":"rescan"}"#, .rescan),
     (#"{"id":1,"cmd":"lyrics","track_id":"dQw4w9WgXcQ"}"#, .lyrics(trackID: videoID)),
+    (#"{"id":1,"cmd":"queue.get"}"#, .queueGet),
+    (
+        #"{"id":1,"cmd":"queue.remove","section":"upcoming","index":2,"track_id":"dQw4w9WgXcQ"}"#,
+        .queueRemove(section: .upcoming, index: 2, trackID: videoID)
+    ),
+    (
+        #"{"id":1,"cmd":"queue.move","from":0,"to":2,"track_id":"dQw4w9WgXcQ"}"#,
+        .queueMove(from: 0, to: 2, trackID: videoID)
+    ),
+    (#"{"id":1,"cmd":"queue.clear"}"#, .queueClear),
+    (
+        #"{"id":1,"cmd":"queue.jump","section":"next","index":1,"track_id":"dQw4w9WgXcQ"}"#,
+        .queueJump(section: .next, index: 1, trackID: videoID)
+    ),
 ]
 
 @Test(arguments: commandCases)
@@ -93,7 +107,7 @@ func commandEncodesToGoldenJSON(_ wire: String, _ command: Command) throws {
 }
 
 @Test func everyCommandHasAGoldenCase() {
-    #expect(Set(commandCases.map { $0.1.name }).count == 27)
+    #expect(Set(commandCases.map { $0.1.name }).count == 32)
 }
 
 // Rust `add_defaults_play_true` / `track_delete_defaults_to_trash_true`: the Swift encoding
@@ -156,6 +170,14 @@ private let eventCases: [(String, Event)] = [
         .toast(Toast(severity: .warn, message: "m"))
     ),
     (#"{"event":"resync"}"#, .resync),
+    (
+        #"{"event":"queue","next":["n"],"upcoming":["a","b"],"more":true,"context":{"album_id":3}}"#,
+        .queue(QueueState(next: ["n"], upcoming: ["a", "b"], more: true, context: .album(3)))
+    ),
+    (
+        #"{"event":"queue","next":[],"upcoming":[],"more":false,"context":null}"#,
+        .queue(.empty)
+    ),
 ]
 
 @Test(arguments: eventCases)
@@ -195,6 +217,16 @@ func eventDecodesFromGoldenJSON(_ wire: String, _ event: Event) throws {
 
     let missing = try decodeResponse(#"{"id":7,"ok":true,"result":{"missing":true}}"#)
     #expect(try missing.result(as: LyricsResult.self) == .missing)
+}
+
+@Test func queueGetResultDecodes() throws {
+    let response = try decodeResponse(
+        #"{"id":8,"ok":true,"result":{"next":["秒針を噛む"],"upcoming":["残機","猫リセット"],"more":false,"context":{"library":true}}}"#
+    )
+    #expect(
+        try response.result(as: QueueState.self)
+            == QueueState(
+                next: ["秒針を噛む"], upcoming: ["残機", "猫リセット"], more: false, context: .library))
 }
 
 @Test func errorResponseDecodesCodeAndMessage() throws {

@@ -10,7 +10,7 @@ pub const MAX_LINE: usize = 1 << 20;
 pub const PROTOCOL: u32 = 1;
 
 /// Wire names of every `Command`, used to tell unknown commands from malformed ones.
-const COMMANDS: [&str; 27] = [
+const COMMANDS: [&str; 32] = [
     "hello",
     "subscribe",
     "library.get",
@@ -38,7 +38,15 @@ const COMMANDS: [&str; 27] = [
     "track.retry",
     "rescan",
     "lyrics",
+    "queue.get",
+    "queue.remove",
+    "queue.move",
+    "queue.clear",
+    "queue.jump",
 ];
+
+/// Most `upcoming` entries a `QueueState` lists.
+pub const UPCOMING_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestEnvelope {
@@ -123,6 +131,37 @@ pub enum Command {
     Rescan,
     #[serde(rename = "lyrics")]
     Lyrics { track_id: String },
+    #[serde(rename = "queue.get")]
+    QueueGet,
+    #[serde(rename = "queue.remove")]
+    QueueRemove {
+        section: QueueSection,
+        index: usize,
+        track_id: String,
+    },
+    /// `to` is the entry's final index in `next`.
+    #[serde(rename = "queue.move")]
+    QueueMove {
+        from: usize,
+        to: usize,
+        track_id: String,
+    },
+    #[serde(rename = "queue.clear")]
+    QueueClear,
+    #[serde(rename = "queue.jump")]
+    QueueJump {
+        section: QueueSection,
+        index: usize,
+        track_id: String,
+    },
+}
+
+/// Which list of a `QueueState` an index points into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueueSection {
+    Next,
+    Upcoming,
 }
 
 /// `{"id": N}` or `{"name": "..."}`.
@@ -254,6 +293,17 @@ pub struct PlayerState {
     pub loop_mode: LoopMode,
 }
 
+/// Up Next: `next` is the play-next FIFO (every entry); `upcoming` the
+/// context tracks that play after it, in play order, at most
+/// `UPCOMING_LIMIT`; `more` when `upcoming` was cut there.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueState {
+    pub next: Vec<String>,
+    pub upcoming: Vec<String>,
+    pub more: bool,
+    pub context: Option<ContextRef>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DownloadPhase {
@@ -297,6 +347,8 @@ pub enum Event {
     Toast { severity: Severity, message: String },
     #[serde(rename = "resync")]
     Resync,
+    #[serde(rename = "queue")]
+    Queue(QueueState),
 }
 
 /// Serialize `v` as one compact JSON line terminated by `\n`.
@@ -447,6 +499,32 @@ mod tests {
             (
                 r#"{"id":1,"cmd":"lyrics","track_id":"dQw4w9WgXcQ"}"#,
                 Command::Lyrics {
+                    track_id: ID.into(),
+                },
+            ),
+            (r#"{"id":1,"cmd":"queue.get"}"#, Command::QueueGet),
+            (
+                r#"{"id":1,"cmd":"queue.remove","section":"upcoming","index":2,"track_id":"dQw4w9WgXcQ"}"#,
+                Command::QueueRemove {
+                    section: QueueSection::Upcoming,
+                    index: 2,
+                    track_id: ID.into(),
+                },
+            ),
+            (
+                r#"{"id":1,"cmd":"queue.move","from":0,"to":2,"track_id":"dQw4w9WgXcQ"}"#,
+                Command::QueueMove {
+                    from: 0,
+                    to: 2,
+                    track_id: ID.into(),
+                },
+            ),
+            (r#"{"id":1,"cmd":"queue.clear"}"#, Command::QueueClear),
+            (
+                r#"{"id":1,"cmd":"queue.jump","section":"next","index":1,"track_id":"dQw4w9WgXcQ"}"#,
+                Command::QueueJump {
+                    section: QueueSection::Next,
+                    index: 1,
                     track_id: ID.into(),
                 },
             ),
@@ -604,6 +682,19 @@ mod tests {
                 r#"{"event":"toast","severity":"warn","message":"m"}"#,
             ),
             (Event::Resync, r#"{"event":"resync"}"#),
+            (
+                Event::Queue(QueueState {
+                    next: vec!["n".into()],
+                    upcoming: vec!["a".into(), "b".into()],
+                    more: true,
+                    context: Some(ContextRef::Album(3)),
+                }),
+                r#"{"event":"queue","next":["n"],"upcoming":["a","b"],"more":true,"context":{"album_id":3}}"#,
+            ),
+            (
+                Event::Queue(QueueState::default()),
+                r#"{"event":"queue","next":[],"upcoming":[],"more":false,"context":null}"#,
+            ),
         ];
         for (event, wire) in cases {
             assert_eq!(serde_json::to_string(&event).unwrap(), wire);
