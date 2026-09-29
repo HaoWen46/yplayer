@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::fmt;
 use std::path::Path;
 
+use crate::loudness::Measurement;
 use crate::types::{Album, Track, TrackMeta, TrackState};
 
 #[derive(Debug)]
@@ -135,9 +136,16 @@ impl Db {
         let version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version >= 1 {
-            return Ok(());
+        if version < 1 {
+            self.migrate_v1(cache_dir)?;
         }
+        if version < 2 {
+            self.migrate_v2()?;
+        }
+        Ok(())
+    }
+
+    fn migrate_v1(&self, cache_dir: &Path) -> Result<(), DbError> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute_batch(
             "
@@ -157,6 +165,22 @@ impl Db {
         // every launch (as the old scanner did) would undo album edits.
         self.import_album_files(cache_dir)?;
         tx.execute_batch("PRAGMA user_version = 1")?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// v2: loudness measurements. `loudness_checked` is 1 once a measurement
+    /// was tried; a failed one leaves both values NULL.
+    fn migrate_v2(&self) -> Result<(), DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "
+            ALTER TABLE tracks ADD COLUMN loudness REAL;
+            ALTER TABLE tracks ADD COLUMN sample_peak REAL;
+            ALTER TABLE tracks ADD COLUMN loudness_checked INTEGER NOT NULL DEFAULT 0;
+            PRAGMA user_version = 2;
+            ",
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -259,7 +283,8 @@ impl Db {
     ) -> Result<(), DbError> {
         self.conn
             .prepare_cached(
-                "UPDATE tracks SET title = ?2, uploader = ?3, duration = ?4, webpage_url = ?5, audio_path = ?6
+                "UPDATE tracks SET title = ?2, uploader = ?3, duration = ?4, webpage_url = ?5, audio_path = ?6,
+                    loudness = NULL, sample_peak = NULL, loudness_checked = 0
                  WHERE id = ?1",
             )?
             .execute(params![
@@ -285,7 +310,8 @@ impl Db {
         self.conn
             .prepare_cached(
                 "UPDATE tracks SET title = ?2, uploader = ?3, duration = ?4, webpage_url = ?5, audio_path = ?6,
-                    format = ?7, file_size = ?8, thumb_path = ?9, state = 'complete'
+                    format = ?7, file_size = ?8, thumb_path = ?9, state = 'complete',
+                    loudness = NULL, sample_peak = NULL, loudness_checked = 0
                  WHERE id = ?1",
             )?
             .execute(params![
@@ -323,7 +349,10 @@ impl Db {
                     format=excluded.format,
                     file_size=excluded.file_size,
                     state=excluded.state,
-                    thumb_path=excluded.thumb_path",
+                    thumb_path=excluded.thumb_path,
+                    loudness = CASE WHEN tracks.audio_path IS excluded.audio_path THEN tracks.loudness END,
+                    sample_peak = CASE WHEN tracks.audio_path IS excluded.audio_path THEN tracks.sample_peak END,
+                    loudness_checked = CASE WHEN tracks.audio_path IS excluded.audio_path THEN tracks.loudness_checked ELSE 0 END",
             )?
             .execute(params![
                 track.id,
@@ -351,9 +380,109 @@ impl Db {
     ) -> Result<(), DbError> {
         let n = self
             .conn
-            .prepare_cached("UPDATE tracks SET audio_path = ?2, thumb_path = ?3 WHERE id = ?1")?
+            .prepare_cached(
+                "UPDATE tracks SET audio_path = ?2, thumb_path = ?3,
+                    loudness = CASE WHEN audio_path IS ?2 THEN loudness END,
+                    sample_peak = CASE WHEN audio_path IS ?2 THEN sample_peak END,
+                    loudness_checked = CASE WHEN audio_path IS ?2 THEN loudness_checked ELSE 0 END
+                 WHERE id = ?1",
+            )?
             .execute(params![id, audio_path, thumb_path])?;
         found(n)
+    }
+
+    /// The music folder moved from `from` to `to`: rewrite the paths under
+    /// it in one transaction. Measurements stay (the files are the same).
+    pub fn move_paths(&self, from: &Path, to: &Path) -> Result<usize, DbError> {
+        let from = format!("{}/", from.display());
+        let to = format!("{}/", to.display());
+        let tx = self.conn.unchecked_transaction()?;
+        let mut changed = 0;
+        for column in ["audio_path", "thumb_path"] {
+            changed += tx.execute(
+                &format!(
+                    "UPDATE tracks SET {column} = ?2 || substr({column}, length(?1) + 1)
+                     WHERE substr({column}, 1, length(?1)) = ?1"
+                ),
+                params![from, to],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    // --- Loudness ---
+
+    /// Store `id`'s measurement (`None`: it failed) while its audio file is
+    /// still `audio_path`; false when the row changed meanwhile.
+    pub fn set_loudness(
+        &self,
+        id: &str,
+        audio_path: &str,
+        m: Option<Measurement>,
+    ) -> Result<bool, DbError> {
+        let n = self
+            .conn
+            .prepare_cached(
+                "UPDATE tracks SET loudness = ?3, sample_peak = ?4, loudness_checked = 1
+                 WHERE id = ?1 AND audio_path = ?2",
+            )?
+            .execute(params![
+                id,
+                audio_path,
+                m.map(|m| m.integrated),
+                m.map(|m| m.sample_peak),
+            ])?;
+        Ok(n == 1)
+    }
+
+    /// Every measured track.
+    pub fn measured(&self) -> Result<Vec<(String, Measurement)>, DbError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, loudness, sample_peak FROM tracks
+             WHERE loudness IS NOT NULL AND sample_peak IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    Measurement {
+                        integrated: row.get(1)?,
+                        sample_peak: row.get(2)?,
+                    },
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Complete tracks never measured, most recently played first, then
+    /// most recently added.
+    pub fn unmeasured(&self) -> Result<Vec<String>, DbError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id FROM tracks
+             WHERE state = 'complete' AND loudness_checked = 0 AND audio_path != ''
+             ORDER BY last_played DESC, added_at DESC",
+        )?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(ids)
+    }
+
+    /// The audio file to measure for `id`: set when it is complete and not
+    /// measured yet.
+    pub fn measure_path(&self, id: &str) -> Result<Option<String>, DbError> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT audio_path FROM tracks
+                 WHERE id = ?1 AND state = 'complete' AND loudness_checked = 0 AND audio_path != ''",
+            )?
+            .query_row(params![id], |row| row.get::<_, String>(0))
+            .optional()?)
     }
 
     /// Complete tracks never checked for a cover (`thumb_path` NULL; `''` means
@@ -793,9 +922,9 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_migrates_to_v1_schema() {
+    fn fresh_db_migrates_to_current_schema() {
         let (db, _dir) = open_temp();
-        assert_eq!(user_version(&db), 1);
+        assert_eq!(user_version(&db), 2);
         let tracks = columns(&db, "tracks");
         assert!(tracks.contains(&"state".to_string()));
         assert!(tracks.contains(&"thumb_path".to_string()));
@@ -820,7 +949,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = v0_fixture(dir.path());
         let db = Db::open(&path, dir.path()).unwrap();
-        assert_eq!(user_version(&db), 1);
+        assert_eq!(user_version(&db), 2);
         assert_eq!(
             db.get_track("aaaaaaaaaaa").unwrap().unwrap(),
             Track {
@@ -1150,6 +1279,196 @@ mod tests {
         let row = db.get_lyrics("t2").unwrap().unwrap();
         assert!(!row.synced);
         assert_eq!(row.body, None);
+    }
+
+    /// A v1 database as the first native-app release left it.
+    fn v1_fixture(dir: &Path) -> PathBuf {
+        let path = v0_fixture(dir);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE tracks ADD COLUMN state TEXT NOT NULL DEFAULT 'complete';
+             ALTER TABLE tracks ADD COLUMN thumb_path TEXT;
+             ALTER TABLE albums ADD COLUMN last_used_at INTEGER;
+             CREATE TABLE lyrics (track_id TEXT PRIMARY KEY, synced INTEGER, body TEXT, fetched_at INTEGER NOT NULL);
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        path
+    }
+
+    fn loudness_row(db: &Db, id: &str) -> (Option<f64>, Option<f64>, i64) {
+        db.conn
+            .query_row(
+                "SELECT loudness, sample_peak, loudness_checked FROM tracks WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    fn lvl(integrated: f64, sample_peak: f64) -> Measurement {
+        Measurement {
+            integrated,
+            sample_peak,
+        }
+    }
+
+    #[test]
+    fn v1_db_migrates_to_v2_with_unmeasured_tracks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = v1_fixture(dir.path());
+        let db = Db::open(&path, dir.path()).unwrap();
+        assert_eq!(user_version(&db), 2);
+        let cols = columns(&db, "tracks");
+        for col in ["loudness", "sample_peak", "loudness_checked"] {
+            assert!(cols.contains(&col.to_string()), "{col}");
+        }
+        assert_eq!(loudness_row(&db, "aaaaaaaaaaa"), (None, None, 0));
+        assert_eq!(db.get_track("aaaaaaaaaaa").unwrap().unwrap().title, "One");
+        assert_eq!(db.unmeasured().unwrap(), ["aaaaaaaaaaa", "bbbbbbbbbbb"]);
+        drop(db);
+        // Opening again leaves it at v2.
+        let db = Db::open(&path, dir.path()).unwrap();
+        assert_eq!(user_version(&db), 2);
+    }
+
+    #[test]
+    fn loudness_is_stored_only_for_the_measured_file() {
+        let (db, _dir) = open_temp();
+        db.upsert_track(&track("t1", "夜に駆ける")).unwrap();
+        assert_eq!(
+            db.measure_path("t1").unwrap().as_deref(),
+            Some("/tmp/t1.mp3")
+        );
+
+        assert!(
+            !db.set_loudness("t1", "/tmp/other.mp3", Some(lvl(-9.0, -0.5)))
+                .unwrap()
+        );
+        assert_eq!(loudness_row(&db, "t1"), (None, None, 0));
+        assert!(
+            db.set_loudness("t1", "/tmp/t1.mp3", Some(lvl(-9.0, -0.5)))
+                .unwrap()
+        );
+        assert_eq!(loudness_row(&db, "t1"), (Some(-9.0), Some(-0.5), 1));
+        assert_eq!(
+            db.measured().unwrap(),
+            [("t1".to_string(), lvl(-9.0, -0.5))]
+        );
+        assert_eq!(db.measure_path("t1").unwrap(), None);
+        assert!(db.unmeasured().unwrap().is_empty());
+
+        // A failure is checked, with no values.
+        db.upsert_track(&track("t2", "Two")).unwrap();
+        assert!(db.set_loudness("t2", "/tmp/t2.mp3", None).unwrap());
+        assert_eq!(loudness_row(&db, "t2"), (None, None, 1));
+        assert_eq!(db.measured().unwrap().len(), 1);
+        assert!(db.unmeasured().unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_audio_path_change_resets_loudness() {
+        let (db, _dir) = open_temp();
+        let measure = |db: &Db, id: &str| {
+            let path = db.get_track(id).unwrap().unwrap().audio_path.unwrap();
+            assert!(db.set_loudness(id, &path, Some(lvl(-9.0, -0.5))).unwrap());
+        };
+        db.upsert_track(&track("t1", "One")).unwrap();
+
+        // Same path again (a rescan) keeps it; a new path resets it.
+        measure(&db, "t1");
+        db.upsert_track(&track("t1", "One (renamed)")).unwrap();
+        assert_eq!(loudness_row(&db, "t1"), (Some(-9.0), Some(-0.5), 1));
+        let mut moved = track("t1", "One");
+        moved.audio_path = Some("/tmp/new/t1.mp3".into());
+        db.upsert_track(&moved).unwrap();
+        assert_eq!(loudness_row(&db, "t1"), (None, None, 0));
+
+        measure(&db, "t1");
+        db.relink_track("t1", "/tmp/new/t1.mp3", None).unwrap();
+        assert_eq!(loudness_row(&db, "t1"), (Some(-9.0), Some(-0.5), 1));
+        db.relink_track("t1", "/tmp/renamed/t1.mp3", None).unwrap();
+        assert_eq!(loudness_row(&db, "t1"), (None, None, 0));
+
+        // A download writes a new file, even at the same path.
+        measure(&db, "t1");
+        let m = meta("t1", "One");
+        db.mark_started("t1", &m, "/tmp/renamed/t1.mp3").unwrap();
+        assert_eq!(loudness_row(&db, "t1"), (None, None, 0));
+        measure(&db, "t1");
+        db.mark_complete("t1", &m, "/tmp/renamed/t1.mp3", None, None, None)
+            .unwrap();
+        assert_eq!(loudness_row(&db, "t1"), (None, None, 0));
+    }
+
+    #[test]
+    fn move_paths_rewrites_prefixes_and_keeps_loudness() {
+        let (db, _dir) = open_temp();
+        let mut t = track("t1", "秒針を噛む");
+        t.audio_path = Some("/Users/me/Music/yt-audio/秒針を噛む [t1]/audio.opus".into());
+        t.thumb_path = Some("/Users/me/Music/yt-audio/秒針を噛む [t1]/cover.jpg".into());
+        db.upsert_track(&t).unwrap();
+        let mut other = track("t2", "Two");
+        other.audio_path = Some("/Users/me/Music/yt-audio-old/Two [t2]/audio.opus".into());
+        db.upsert_track(&other).unwrap();
+        assert!(
+            db.set_loudness(
+                "t1",
+                t.audio_path.as_deref().unwrap(),
+                Some(lvl(-9.0, -0.5))
+            )
+            .unwrap()
+        );
+
+        let changed = db
+            .move_paths(
+                Path::new("/Users/me/Music/yt-audio"),
+                Path::new("/Volumes/Data/音楽/yt-audio"),
+            )
+            .unwrap();
+        assert_eq!(changed, 2);
+        let got = db.get_track("t1").unwrap().unwrap();
+        assert_eq!(
+            got.audio_path.as_deref(),
+            Some("/Volumes/Data/音楽/yt-audio/秒針を噛む [t1]/audio.opus")
+        );
+        assert_eq!(
+            got.thumb_path.as_deref(),
+            Some("/Volumes/Data/音楽/yt-audio/秒針を噛む [t1]/cover.jpg")
+        );
+        assert_eq!(loudness_row(&db, "t1"), (Some(-9.0), Some(-0.5), 1));
+        assert_eq!(
+            db.get_track("t2").unwrap().unwrap().audio_path,
+            other.audio_path
+        );
+    }
+
+    #[test]
+    fn unmeasured_orders_by_last_played_then_added_and_skips_incomplete() {
+        let (db, _dir) = open_temp();
+        for (id, added_at, last_played, state) in [
+            ("old", 100, None, TrackState::Complete),
+            ("new", 300, None, TrackState::Complete),
+            ("played", 50, Some(900), TrackState::Complete),
+            ("played2", 60, Some(500), TrackState::Complete),
+            ("dl", 400, None, TrackState::Downloading),
+            ("bad", 500, None, TrackState::Failed),
+        ] {
+            let mut t = track(id, id);
+            t.added_at = Some(added_at);
+            t.last_played = last_played;
+            t.state = state;
+            db.upsert_track(&t).unwrap();
+        }
+        assert_eq!(
+            db.unmeasured().unwrap(),
+            ["played", "played2", "new", "old"]
+        );
+        assert_eq!(db.measure_path("dl").unwrap(), None);
+        assert_eq!(db.measure_path("bad").unwrap(), None);
+        db.insert_pending("pending0000", "https://youtu.be/pending0000")
+            .unwrap();
+        assert_eq!(db.measure_path("pending0000").unwrap(), None);
     }
 
     #[test]

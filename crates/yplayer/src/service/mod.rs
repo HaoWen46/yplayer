@@ -2,7 +2,7 @@ pub mod conn;
 pub mod core;
 pub mod downloads;
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,14 +13,16 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 use self::core::{Core, CoreDeps, Inbox, Request};
-use crate::config::Config;
+use crate::config::{self, Config, FileConfig, PendingMove, SettingEdit};
 use crate::download::bridge::worker_command;
 use crate::download::worker::{WorkerHandle, WorkerOptions};
 use crate::http::{CurlHttp, HttpGet};
 use crate::library::db::Db;
 use crate::library::reconcile::recover_interrupted;
+use crate::loudness::Ffmpeg;
 use crate::lyrics::USER_AGENT;
 use crate::player::mpv::{MpvOptions, MpvSpawner, ProcessSpawner};
+use crate::protocol::Severity;
 use crate::updater::{SystemRunner, Updater};
 
 const WORKER_IDLE: Duration = Duration::from_secs(60);
@@ -35,7 +37,7 @@ pub struct ServeOptions {
 /// `yplay serve`: run until SIGTERM/SIGINT.
 pub async fn serve(opts: ServeOptions) -> Result<()> {
     let ServeOptions {
-        config,
+        mut config,
         socket_path,
         state_dir,
     } = opts;
@@ -47,7 +49,15 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     if UnixStream::connect(&socket_path).await.is_ok() {
         bail!("yplay serve is already running ({})", socket_path.display());
     }
+    config.settings_dir = Some(state_dir.clone());
+    if let Some(file) = config.config_file()
+        && let Some(on) = FileConfig::load_from(&file).level_loudness
+    {
+        config.level_loudness = on;
+    }
+    let moved = take_pending_move(&mut config);
     let (db, rebuilt) = open_db(&config)?;
+    let move_toast = moved.as_ref().map(|outcome| finish_move(&db, outcome));
     owner_only_files(&config);
     let listener = bind_socket(&socket_path).await?;
     // An mpv left playing by a killed previous instance stops now, not at the
@@ -99,6 +109,13 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     if rebuilt {
         core.warn_after_startup(DB_REBUILT);
     }
+    if let Some((severity, message)) = move_toast {
+        core.toast_after_startup(severity, &message);
+    }
+    match Ffmpeg::find() {
+        Some(ffmpeg) => core.set_measurer(Arc::new(ffmpeg)),
+        None => eprintln!("ffmpeg not found: loudness leveling is unavailable"),
+    }
     core.start();
 
     let mut term = signal(SignalKind::terminate())?;
@@ -114,6 +131,125 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
 }
 
 const DB_REBUILT: &str = "Your library database was damaged and has been rebuilt from your music folder; albums could not be recovered.";
+
+/// What became of a `library.move` request at startup.
+#[derive(Debug, PartialEq)]
+enum MoveOutcome {
+    Moved { from: PathBuf, to: PathBuf },
+    Failed(String),
+}
+
+/// Apply a pending `library.move` before the DB opens. The request file is
+/// deleted first, so a move is never retried; the folder is renamed only
+/// when `from` is still the music folder, exists, and `to` does not. On
+/// success the music folder becomes `to`, in `config` and in `config.toml`.
+fn take_pending_move(config: &mut Config) -> Option<MoveOutcome> {
+    let file = config.pending_move_file()?;
+    let text = match std::fs::read_to_string(&file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        text => text,
+    };
+    if let Err(e) = std::fs::remove_file(&file) {
+        return Some(MoveOutcome::Failed(format!(
+            "couldn't remove {}: {e}",
+            file.display()
+        )));
+    }
+    let request = match text
+        .map_err(|e| e.to_string())
+        .and_then(|t| serde_json::from_str::<PendingMove>(&t).map_err(|e| e.to_string()))
+    {
+        Ok(request) => request,
+        Err(e) => return Some(MoveOutcome::Failed(e)),
+    };
+    let PendingMove { from, to } = request;
+    let failed = |reason: String| Some(MoveOutcome::Failed(reason));
+    if from != config.cache_dir {
+        return failed(format!(
+            "your music folder is now {}",
+            config.cache_dir.display()
+        ));
+    }
+    if !from.is_dir() {
+        return failed(format!("{} is missing", from.display()));
+    }
+    if to.symlink_metadata().is_ok() {
+        return failed(format!("{} already exists", to.display()));
+    }
+    if let Err(e) = std::fs::rename(&from, &to) {
+        return failed(e.to_string());
+    }
+    if let Some(file) = config.config_file()
+        && let Err(e) = config::save_settings(&file, &[SettingEdit::CacheDir(&to)])
+    {
+        // Without the new path in config.toml the next start would use an
+        // empty `from`: put the folder back.
+        let _ = std::fs::rename(&to, &from);
+        return failed(format!("couldn't save the new location: {e}"));
+    }
+    config.cache_dir = to.clone();
+    Some(MoveOutcome::Moved { from, to })
+}
+
+/// After the DB opened: rewrite the moved folder's paths; the startup toast.
+fn finish_move(db: &Db, outcome: &MoveOutcome) -> (Severity, String) {
+    match outcome {
+        MoveOutcome::Moved { from, to } => {
+            if let Err(e) = db.move_paths(from, to) {
+                eprintln!("could not rewrite the moved paths: {e}");
+            }
+            (
+                Severity::Info,
+                format!("Moved your music folder to {}.", to.display()),
+            )
+        }
+        MoveOutcome::Failed(e) => (
+            Severity::Warn,
+            format!("Couldn't move your music folder: {e}."),
+        ),
+    }
+}
+
+/// Check a `library.move` target for the music folder `cache_dir`; `device`
+/// gives a path's device (tests inject it). Returns the new location, or the
+/// `bad_request` message.
+fn check_move(
+    cache_dir: &Path,
+    to: &str,
+    device: impl Fn(&Path) -> std::io::Result<u64>,
+) -> Result<PathBuf, &'static str> {
+    const EXISTS: &str = "Something already exists at that location.";
+    let to = Path::new(to);
+    if !to.is_absolute() {
+        return Err("The new location must be a full path.");
+    }
+    let (Some(parent), Some(name)) = (to.parent(), to.file_name()) else {
+        return Err(EXISTS);
+    };
+    let real_parent = match parent.canonicalize() {
+        Ok(p) if p.is_dir() => p,
+        _ => return Err("That folder's parent doesn't exist."),
+    };
+    let target = parent.join(name);
+    if target.symlink_metadata().is_ok() {
+        return Err(EXISTS);
+    }
+    let real_cache = cache_dir
+        .canonicalize()
+        .unwrap_or_else(|_| cache_dir.to_path_buf());
+    if real_parent.join(name).starts_with(&real_cache) {
+        return Err("The new location can't be inside your music folder.");
+    }
+    match (device(&real_parent), device(&real_cache)) {
+        (Ok(a), Ok(b)) if a == b => Ok(target),
+        _ => Err("Choose a folder on the same disk as your music folder."),
+    }
+}
+
+/// The device a path lives on.
+fn device_of(path: &Path) -> std::io::Result<u64> {
+    std::fs::metadata(path).map(|m| m.dev())
+}
 
 /// Files the service creates (DB, session file, logs, mpv socket) are
 /// owner-only.
@@ -232,7 +368,9 @@ mod tests {
     use super::core::EVENT_CAPACITY;
     use super::*;
     use crate::config::SessionState;
+    use crate::loudness::{Measure, MeasureFuture, Measurement};
     use crate::player::engine::testing::FakeSpawner;
+    use crate::player::mpv::MpvEvent;
     use crate::protocol::{Command, ContextRef, MAX_LINE};
     use crate::types::{LoopMode, Track, TrackState};
     use serde_json::{Value, json};
@@ -291,8 +429,11 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Cache `<dir>/cache`; `config.toml` and `pending-move.json` in `dir`.
     fn config(dir: &Path) -> Config {
-        Config::new(Some(dir.join("cache").to_string_lossy().into_owned()), None)
+        let mut config = Config::new(Some(dir.join("cache").to_string_lossy().into_owned()), None);
+        config.settings_dir = Some(dir.to_path_buf());
+        config
     }
 
     /// Two complete tracks with (empty) audio files: A added after B.
@@ -387,9 +528,23 @@ mod tests {
         capacity: usize,
         worker_cmd: Option<Vec<String>>,
     ) -> Svc {
+        launch_with(dir, sock, capacity, worker_cmd, None).await
+    }
+
+    /// `launch`, measuring loudness with `measurer`.
+    async fn launch_with(
+        dir: tempfile::TempDir,
+        sock: PathBuf,
+        capacity: usize,
+        worker_cmd: Option<Vec<String>>,
+        measurer: Option<Arc<dyn Measure>>,
+    ) -> Svc {
         let fake = FakeSpawner::default();
         let listener = bind_socket(&sock).await.unwrap();
         let (mut core, inbox) = new_core(dir.path(), &fake, capacity, worker_cmd);
+        if let Some(measurer) = measurer {
+            core.set_measurer(measurer);
+        }
         core.start();
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::task::spawn_local(run(core, inbox, listener, sock.clone(), async move {
@@ -637,10 +792,7 @@ mod tests {
                     .join(format!("Song {A} [aaaaaaaa]/audio.opus"))
                     .to_string_lossy()
                     .into_owned();
-                assert_eq!(
-                    svc.fake.commands(),
-                    vec![vec![json!("loadfile"), json!(path), json!("replace")]]
-                );
+                assert_eq!(svc.fake.commands(), vec![loadfile(&path)]);
                 let lib = c.call(json!({"id": 5, "cmd": "library.get"})).await;
                 let track = &lib["result"]["tracks"][0];
                 assert_eq!(track["id"], json!(A));
@@ -887,8 +1039,19 @@ while True:
         ev["event"] == "player" && ev["track_id"] == vid
     }
 
+    /// `loadfile replace` at gain 0 (nothing measured).
     fn loadfile(path: &str) -> Vec<Value> {
-        vec![json!("loadfile"), json!(path), json!("replace")]
+        loadfile_gain(path, "replace", "0.00")
+    }
+
+    fn loadfile_gain(path: &str, mode: &str, gain: &str) -> Vec<Value> {
+        vec![
+            json!("loadfile"),
+            json!(path),
+            json!(mode),
+            json!(-1),
+            json!(format!("volume-gain={gain}")),
+        ]
     }
 
     fn seeded_path(svc: &Svc, id: &str) -> String {
@@ -1384,6 +1547,535 @@ while True:
                 svc.stop().await;
             })
             .await;
+    }
+
+    /// Announces each measured path on `started`, then waits for a permit on
+    /// `release`; answers from `levels` by track id (others fail).
+    struct FakeMeasurer {
+        started: mpsc::UnboundedSender<String>,
+        release: Arc<tokio::sync::Semaphore>,
+        levels: Vec<(&'static str, Measurement)>,
+        running: Arc<AtomicUsize>,
+        most_running: Arc<AtomicUsize>,
+    }
+
+    impl Measure for FakeMeasurer {
+        fn measure(&self, path: PathBuf) -> MeasureFuture {
+            let path = path.to_string_lossy().into_owned();
+            let result = self
+                .levels
+                .iter()
+                .find(|(id, _)| path.contains(id))
+                .map(|(_, m)| *m)
+                .ok_or_else(|| "no usable loudness summary".to_string());
+            let _ = self.started.send(path);
+            let release = self.release.clone();
+            let (running, most) = (self.running.clone(), self.most_running.clone());
+            Box::pin(async move {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                release.acquire().await.unwrap().forget();
+                running.fetch_sub(1, Ordering::SeqCst);
+                result
+            })
+        }
+    }
+
+    fn lvl(integrated: f64, sample_peak: f64) -> Measurement {
+        Measurement {
+            integrated,
+            sample_peak,
+        }
+    }
+
+    /// Poll `done` until it holds (the core works in the background).
+    async fn eventually(what: &str, done: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while !done() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn loudness_is_measured_one_at_a_time_and_reaches_mpv() {
+        const V: &str = "okayddddddd";
+        LocalSet::new()
+            .run_until(async {
+                let (started_tx, mut started) = mpsc::unbounded_channel();
+                let release = Arc::new(tokio::sync::Semaphore::new(0));
+                let most_running = Arc::new(AtomicUsize::new(0));
+                let measurer = FakeMeasurer {
+                    started: started_tx,
+                    release: release.clone(),
+                    // A: +6 dB; B: −2 dB; V fails (plays at the median, +2).
+                    levels: vec![(A, lvl(-20.0, -10.0)), (B, lvl(-12.0, -3.0))],
+                    running: Arc::new(AtomicUsize::new(0)),
+                    most_running: most_running.clone(),
+                };
+                let dir = tempfile::tempdir().unwrap();
+                let script = dir.path().join("fake_worker.py");
+                std::fs::write(&script, FAKE_WORKER).unwrap();
+                let sock = PathBuf::from(format!(
+                    "/tmp/yp13-{}-{}.sock",
+                    std::process::id(),
+                    SOCK_SEQ.fetch_add(1, Ordering::SeqCst)
+                ));
+                let cmd = vec![
+                    "/usr/bin/python3".to_string(),
+                    script.to_string_lossy().into_owned(),
+                ];
+                let mut svc = launch_with(
+                    dir,
+                    sock,
+                    EVENT_CAPACITY,
+                    Some(cmd),
+                    Some(Arc::new(measurer)),
+                )
+                .await;
+                let next_started = async |started: &mut mpsc::UnboundedReceiver<String>| {
+                    tokio::time::timeout(WAIT, started.recv())
+                        .await
+                        .expect("no measurement started")
+                        .unwrap()
+                };
+
+                // The backfill after the startup reconcile: newest first.
+                assert_eq!(next_started(&mut started).await, seeded_path(&svc, A));
+                let mut sub = Client::subscribed(&svc.sock).await;
+                let mut c = Client::connect(&svc.sock).await;
+                let settings = c.call(json!({"id": 1, "cmd": "settings.get"})).await;
+                assert_eq!(settings["result"]["loudness_available"], json!(true));
+
+                // A download that finishes waits for the running measurement,
+                // then goes before the rest of the backfill.
+                c.call(
+                    json!({"id": 2, "cmd": "add", "url": format!("https://youtu.be/{V}"),
+                    "album": null, "play": false}),
+                )
+                .await;
+                sub.until(|ev| is_download(ev, V, "done")).await;
+                c.call(json!({"id": 3, "cmd": "now"})).await;
+                assert!(started.try_recv().is_err());
+                release.add_permits(1);
+                let v_path = svc.track_dir(V).join("audio.webm");
+                assert_eq!(next_started(&mut started).await, v_path.to_string_lossy());
+                release.add_permits(1);
+                assert_eq!(next_started(&mut started).await, seeded_path(&svc, B));
+                release.add_permits(1);
+                let db = Db::open(&svc.cache().join(".yplayer.db"), &svc.cache()).unwrap();
+                eventually("B stored", || matches!(db.measure_path(B), Ok(None))).await;
+                assert_eq!(db.measured().unwrap().len(), 2);
+                assert!(db.unmeasured().unwrap().is_empty());
+                assert_eq!(most_running.load(Ordering::SeqCst), 1);
+
+                // Gains reach mpv: V (failed) at the median, A at its own.
+                c.call(
+                    json!({"id": 4, "cmd": "play", "track_id": V, "context": {"library": true}}),
+                )
+                .await;
+                assert_eq!(
+                    svc.fake.commands().last().unwrap(),
+                    &loadfile_gain(&v_path.to_string_lossy(), "replace", "2.00")
+                );
+                c.call(
+                    json!({"id": 5, "cmd": "play", "track_id": A, "context": {"library": true}}),
+                )
+                .await;
+                assert_eq!(
+                    svc.fake.commands().last().unwrap(),
+                    &loadfile_gain(&seeded_path(&svc, A), "replace", "6.00")
+                );
+                svc.fake.emit(MpvEvent::FileLoaded);
+                let preload_b = loadfile_gain(&seeded_path(&svc, B), "append", "-2.00");
+                eventually("B preloaded", || svc.fake.commands().contains(&preload_b)).await;
+
+                // Switching leveling off sets the gain live and re-preloads.
+                svc.fake.clear_commands();
+                let resp = c
+                    .call(json!({"id": 6, "cmd": "settings.set", "level_loudness": false}))
+                    .await;
+                assert_eq!(resp["result"]["level_loudness"], json!(false));
+                assert_eq!(
+                    svc.fake.commands(),
+                    vec![
+                        vec![json!("set_property"), json!("volume-gain"), json!(0.0)],
+                        vec![json!("playlist-clear")],
+                        loadfile_gain(&seeded_path(&svc, B), "append", "0.00"),
+                    ]
+                );
+                let evs = sub.until(|ev| ev["event"] == "settings").await;
+                assert_eq!(evs.last().unwrap()["level_loudness"], json!(false));
+                svc.fake.clear_commands();
+                c.call(json!({"id": 7, "cmd": "settings.set", "level_loudness": true}))
+                    .await;
+                assert_eq!(
+                    svc.fake.commands()[0],
+                    vec![json!("set_property"), json!("volume-gain"), json!(6.0)]
+                );
+                // Everything is measured: nothing else runs.
+                c.call(json!({"id": 8, "cmd": "now"})).await;
+                assert!(started.try_recv().is_err());
+                svc.stop().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn settings_are_validated_saved_and_announced() {
+        LocalSet::new()
+            .run_until(async {
+                let mut svc = start(EVENT_CAPACITY).await;
+                let mut sub = Client::subscribed(&svc.sock).await;
+                let mut c = Client::connect(&svc.sock).await;
+                let file = svc.dir.path().join("config.toml");
+                let music = svc.cache().to_string_lossy().into_owned();
+                let resp = c.call(json!({"id": 1, "cmd": "settings.get"})).await;
+                assert_eq!(
+                    resp["result"],
+                    json!({"level_loudness": true, "loudness_available": false,
+                        "api_key": std::env::var("YT_API_KEY").ok(), "music_folder": music})
+                );
+
+                // A bad key changes nothing, not even the other field.
+                for (id, key) in [
+                    (2, "abc def".to_string()),
+                    (3, "x".repeat(201)),
+                    (4, "tab\tkey".to_string()),
+                    (5, "bell\u{7}".to_string()),
+                ] {
+                    let resp = c
+                        .call(
+                            json!({"id": id, "cmd": "settings.set", "level_loudness": false,
+                            "api_key": key}),
+                        )
+                        .await;
+                    assert_eq!(resp["error"]["code"], json!("bad_request"), "{key:?}");
+                }
+                assert!(!file.exists());
+                let resp = c.call(json!({"id": 6, "cmd": "settings.get"})).await;
+                assert_eq!(resp["result"]["level_loudness"], json!(true));
+
+                let resp = c
+                    .call(
+                        json!({"id": 7, "cmd": "settings.set", "level_loudness": false,
+                        "api_key": "  AIza-鍵_123  "}),
+                    )
+                    .await;
+                let expected = json!({"level_loudness": false, "loudness_available": false,
+                    "api_key": "AIza-鍵_123", "music_folder": music});
+                assert_eq!(resp["result"], expected);
+                let mut event = expected.clone();
+                event["event"] = json!("settings");
+                assert_eq!(sub.recv().await, event);
+                let saved = FileConfig::load_from(&file);
+                assert_eq!(saved.level_loudness, Some(false));
+                assert_eq!(saved.api_key.as_deref(), Some("AIza-鍵_123"));
+
+                // No change: no event. A blank key removes it (the next event
+                // proves the no-op sent none).
+                c.call(json!({"id": 8, "cmd": "settings.set", "level_loudness": false}))
+                    .await;
+                let resp = c
+                    .call(json!({"id": 9, "cmd": "settings.set", "api_key": "   "}))
+                    .await;
+                assert_eq!(resp["result"]["api_key"], Value::Null);
+                let ev = sub.recv().await;
+                assert_eq!(ev["event"], json!("settings"));
+                assert_eq!(ev["api_key"], Value::Null);
+                assert!(FileConfig::load_from(&file).api_key.is_none());
+
+                let key = "k".repeat(200);
+                let resp = c
+                    .call(json!({"id": 10, "cmd": "settings.set", "api_key": key}))
+                    .await;
+                assert_eq!(resp["result"]["api_key"], json!(key));
+                assert_eq!(sub.recv().await["api_key"], json!(key));
+                let resp = c
+                    .call(json!({"id": 11, "cmd": "settings.set", "api_key": null}))
+                    .await;
+                assert_eq!(resp["result"]["api_key"], Value::Null);
+                assert_eq!(sub.recv().await["api_key"], Value::Null);
+                assert_eq!(FileConfig::load_from(&file).level_loudness, Some(false));
+                svc.stop().await;
+            })
+            .await;
+    }
+
+    #[test]
+    fn check_move_validates_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("yt-audio");
+        std::fs::create_dir(&cache).unwrap();
+        let other = dir.path().join("外付け");
+        std::fs::create_dir(&other).unwrap();
+        let a_file = dir.path().join("file");
+        std::fs::write(&a_file, b"").unwrap();
+        let real_other = other.canonicalize().unwrap();
+        // Everything under `other` is on another disk.
+        let device = |p: &Path| -> std::io::Result<u64> {
+            Ok(if p.starts_with(&real_other) { 2 } else { 1 })
+        };
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        const SAME_DISK: &str = "Choose a folder on the same disk as your music folder.";
+
+        let target = dir.path().join("音楽");
+        assert_eq!(check_move(&cache, &s(&target), device), Ok(target.clone()));
+        assert_eq!(
+            check_move(&cache, &format!("{}/", target.display()), device),
+            Ok(target.clone())
+        );
+        assert_eq!(
+            check_move(&cache, &s(&other.join("yt-audio")), device),
+            Err(SAME_DISK)
+        );
+        for (to, message) in [
+            (
+                "yt-audio".to_string(),
+                "The new location must be a full path.",
+            ),
+            (
+                "~/Music/yt-audio".to_string(),
+                "The new location must be a full path.",
+            ),
+            (
+                s(&dir.path().join("missing/yt-audio")),
+                "That folder's parent doesn't exist.",
+            ),
+            (
+                s(&a_file.join("yt-audio")),
+                "That folder's parent doesn't exist.",
+            ),
+            (s(&other), "Something already exists at that location."),
+            (s(&a_file), "Something already exists at that location."),
+            (
+                "/".to_string(),
+                "Something already exists at that location.",
+            ),
+            (s(&cache), "Something already exists at that location."),
+            (
+                s(&cache.join("inner")),
+                "The new location can't be inside your music folder.",
+            ),
+        ] {
+            assert_eq!(check_move(&cache, &to, device), Err(message), "{to}");
+        }
+        let unreadable = |_: &Path| -> std::io::Result<u64> { Err(std::io::Error::other("no")) };
+        assert_eq!(check_move(&cache, &s(&target), unreadable), Err(SAME_DISK));
+        // The real device check: a sibling folder is on the same disk.
+        assert_eq!(check_move(&cache, &s(&target), device_of), Ok(target));
+    }
+
+    #[tokio::test]
+    async fn library_move_records_the_request_and_restarts() {
+        LocalSet::new()
+            .run_until(async {
+                let mut svc = start(EVENT_CAPACITY).await;
+                let mut c = Client::connect(&svc.sock).await;
+                let root = svc.dir.path().to_path_buf();
+                let cache = svc.cache();
+                for (id, to, message) in [
+                    (
+                        1,
+                        "music".to_string(),
+                        "The new location must be a full path.",
+                    ),
+                    (
+                        2,
+                        root.join("missing/yt-audio").to_string_lossy().into_owned(),
+                        "That folder's parent doesn't exist.",
+                    ),
+                    (
+                        3,
+                        cache.to_string_lossy().into_owned(),
+                        "Something already exists at that location.",
+                    ),
+                    (
+                        4,
+                        cache.join("inner").to_string_lossy().into_owned(),
+                        "The new location can't be inside your music folder.",
+                    ),
+                ] {
+                    let resp = c
+                        .call(json!({"id": id, "cmd": "library.move", "to": to}))
+                        .await;
+                    assert_eq!(
+                        resp["error"],
+                        json!({"code": "bad_request", "message": message}),
+                        "{to}"
+                    );
+                }
+                let pending = root.join("pending-move.json");
+                assert!(!pending.exists());
+
+                let to = root.join("新しい場所");
+                let resp = c
+                    .call(json!({"id": 5, "cmd": "library.move", "to": to}))
+                    .await;
+                let replied = tokio::time::Instant::now();
+                assert_eq!(resp["result"], json!({"restarting": true}));
+                let request: PendingMove =
+                    serde_json::from_str(&std::fs::read_to_string(&pending).unwrap()).unwrap();
+                assert_eq!(
+                    request,
+                    PendingMove {
+                        from: cache.clone(),
+                        to
+                    }
+                );
+
+                // The service shuts down by itself; launchd restarts it.
+                let task = svc.task.take().unwrap();
+                tokio::time::timeout(WAIT, task).await.unwrap().unwrap();
+                assert!(replied.elapsed() >= Duration::from_millis(250));
+                assert!(!svc.sock.exists());
+                assert!(cache.is_dir());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn library_move_waits_for_downloads() {
+        const V: &str = "holdeeeeeee";
+        LocalSet::new()
+            .run_until(async {
+                let mut svc = start_with_worker().await;
+                let mut sub = Client::subscribed(&svc.sock).await;
+                let mut c = Client::connect(&svc.sock).await;
+                c.call(
+                    json!({"id": 1, "cmd": "add", "url": format!("https://youtu.be/{V}"),
+                    "album": null, "play": false}),
+                )
+                .await;
+                sub.until(|ev| is_download(ev, V, "downloading")).await;
+
+                let to = svc.dir.path().join("moved");
+                let resp = c
+                    .call(json!({"id": 2, "cmd": "library.move", "to": to}))
+                    .await;
+                assert_eq!(
+                    resp["error"],
+                    json!({"code": "conflict",
+                        "message": "Wait for downloads to finish before moving your music folder."})
+                );
+                assert!(!svc.dir.path().join("pending-move.json").exists());
+                svc.release(V);
+                sub.until(|ev| is_download(ev, V, "done")).await;
+                svc.stop().await;
+            })
+            .await;
+    }
+
+    #[test]
+    fn startup_move_renames_the_folder_and_rewrites_the_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config(dir.path());
+        let db = seed(&config);
+        let a_path = db.get_track(A).unwrap().unwrap().audio_path.unwrap();
+        assert!(db.set_loudness(A, &a_path, Some(lvl(-9.0, -0.5))).unwrap());
+        drop(db);
+        let file = config.config_file().unwrap();
+        std::fs::write(&file, "# mine\nworker_python = \"/py\"\n").unwrap();
+        let from = config.cache_dir.clone();
+        let to = dir.path().join("ミュージック");
+        let pending = config.pending_move_file().unwrap();
+        PendingMove {
+            from: from.clone(),
+            to: to.clone(),
+        }
+        .save(&pending)
+        .unwrap();
+
+        let outcome = take_pending_move(&mut config).unwrap();
+        assert_eq!(
+            outcome,
+            MoveOutcome::Moved {
+                from: from.clone(),
+                to: to.clone()
+            }
+        );
+        assert!(!pending.exists());
+        assert!(!from.exists());
+        let a_folder = to.join(format!("Song {A} [aaaaaaaa]"));
+        assert!(a_folder.join("audio.opus").is_file());
+        assert_eq!(config.cache_dir, to);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.starts_with("# mine\nworker_python = \"/py\"\n"),
+            "{text}"
+        );
+        assert_eq!(
+            FileConfig::load_from(&file).cache_dir,
+            Some(to.to_string_lossy().into_owned())
+        );
+
+        let (db, rebuilt) = open_db(&config).unwrap();
+        assert!(!rebuilt);
+        assert_eq!(
+            finish_move(&db, &outcome),
+            (
+                Severity::Info,
+                format!("Moved your music folder to {}.", to.display())
+            )
+        );
+        assert_eq!(
+            db.get_track(A).unwrap().unwrap().audio_path,
+            Some(a_folder.join("audio.opus").to_string_lossy().into_owned())
+        );
+        assert_eq!(db.measured().unwrap(), [(A.to_string(), lvl(-9.0, -0.5))]);
+        assert_eq!(take_pending_move(&mut config), None);
+    }
+
+    #[test]
+    fn startup_move_that_cannot_happen_is_dropped_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config(dir.path());
+        std::fs::create_dir_all(&config.cache_dir).unwrap();
+        let from = config.cache_dir.clone();
+        let to = dir.path().join("taken");
+        std::fs::create_dir(&to).unwrap();
+        let pending = config.pending_move_file().unwrap();
+        PendingMove {
+            from: from.clone(),
+            to: to.clone(),
+        }
+        .save(&pending)
+        .unwrap();
+
+        let outcome = take_pending_move(&mut config).unwrap();
+        let reason = format!("{} already exists", to.display());
+        assert_eq!(outcome, MoveOutcome::Failed(reason.clone()));
+        assert!(!pending.exists());
+        assert!(from.is_dir());
+        assert_eq!(config.cache_dir, from);
+        assert!(!dir.path().join("config.toml").exists());
+        let db = Db::open(&config.db_path(), &config.cache_dir).unwrap();
+        assert_eq!(
+            finish_move(&db, &outcome),
+            (
+                Severity::Warn,
+                format!("Couldn't move your music folder: {reason}.")
+            )
+        );
+
+        // A request for another folder and an unreadable file are dropped too.
+        let elsewhere = PendingMove {
+            from: dir.path().join("elsewhere"),
+            to: dir.path().join("new"),
+        };
+        elsewhere.save(&pending).unwrap();
+        assert!(matches!(
+            take_pending_move(&mut config),
+            Some(MoveOutcome::Failed(_))
+        ));
+        std::fs::write(&pending, "{not json").unwrap();
+        assert!(matches!(
+            take_pending_move(&mut config),
+            Some(MoveOutcome::Failed(_))
+        ));
+        assert!(!pending.exists());
+        assert!(!dir.path().join("new").exists());
+        assert_eq!(config.cache_dir, from);
     }
 
     // Moves a real folder into the user's Trash, so it only runs on request

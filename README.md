@@ -167,6 +167,7 @@ Exit codes: `0` success; `1` the service returned an error (its message is print
 | `volume` | Initial volume, 0.0–1.0 (the last volume in session state wins) |
 | `api_key` | YouTube Data API key for `yplay search` (else `YT_API_KEY`) |
 | `worker_python` | Absolute path of the worker's Python (written by `install.sh`) |
+| `level_loudness` | Play every song at a similar loudness (default `true`; the app's Settings window writes it) |
 
 Environment variables:
 
@@ -185,6 +186,10 @@ Files:
 | `~/Library/Logs/yplayer/service.log` | Service stdout/stderr under launchd |
 | `~/Library/Logs/yplayer/app.log` | Menu-bar app stdout/stderr under launchd |
 | `~/Music/yt-audio/` | Cache and library DB (see below) |
+
+## Loudness
+
+With `level_loudness` on, the service measures each song once with ffmpeg's EBU R128 filter (integrated loudness and sample peak, at background priority, one song at a time: new downloads first, then the playing song, then the rest of the library) and plays it with an mpv `volume-gain` that brings it to −14 LUFS without lifting its peak above −1 dBFS, clamped to −20…+10 dB; songs not measured yet play at the median gain. Leveling needs `ffmpeg` on the service's `PATH` (`brew install ffmpeg`); without it nothing is measured and every song plays unchanged.
 
 ## Cache layout
 
