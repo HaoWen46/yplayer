@@ -137,6 +137,39 @@ private func sampleStore() -> LibraryStore {
     #expect(store.currentTrack?.id == "b")
 }
 
+/// Runs `change` and reports whether observers of `store.queue` saw a change.
+@MainActor
+private func queueChanged(_ store: LibraryStore, by change: () -> Void) -> Bool {
+    let counter = ChangeCounter()
+    withObservationTracking {
+        _ = store.queue
+    } onChange: {
+        MainActor.assumeIsolated { counter.count += 1 }
+    }
+    change()
+    return counter.count > 0
+}
+
+@MainActor
+@Test func queueLoadsAndFollowsEventsOnlyOnChange() {
+    let store = sampleStore()
+    #expect(store.queue == .empty)
+
+    let loaded = QueueState(next: ["d"], upcoming: ["b", "c"], more: false, context: .album(1))
+    #expect(queueChanged(store) { store.loadQueue(loaded) })
+    #expect(store.queue == loaded)
+
+    let same = loaded
+    #expect(!queueChanged(store) { store.apply(.event(.queue(same))) })
+
+    let advanced = QueueState(next: [], upcoming: ["c"], more: true, context: .album(1))
+    #expect(queueChanged(store) { store.apply(.event(.queue(advanced))) })
+    #expect(store.queue == advanced)
+
+    #expect(queueChanged(store) { store.apply(.event(.queue(.empty))) })
+    #expect(store.queue == .empty)
+}
+
 @MainActor
 @Test func downloadProgressFraction() {
     let store = sampleStore()

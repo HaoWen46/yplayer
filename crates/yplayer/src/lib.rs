@@ -3,6 +3,7 @@ pub mod config;
 pub mod download;
 pub mod http;
 pub mod library;
+pub mod loudness;
 pub mod lyrics;
 pub mod player;
 pub mod protocol;

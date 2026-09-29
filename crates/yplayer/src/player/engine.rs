@@ -8,7 +8,9 @@ use tokio::time::Instant;
 
 use crate::player::mpv::{CommandTimeout, MpvApi, MpvEvent, MpvSpawner};
 use crate::player::queue::Queue;
-use crate::protocol::{ContextRef, PlayState, PlayerState};
+use crate::protocol::{
+    ContextRef, PlayState, PlayerState, QueueSection, QueueState, UPCOMING_LIMIT,
+};
 use crate::types::LoopMode;
 
 /// Quit mpv after this long paused or stopped.
@@ -20,6 +22,11 @@ const MAX_TIMEOUTS: u32 = 2;
 
 pub trait TrackResolver {
     fn playable_path(&self, track_id: &str) -> Option<String>;
+
+    /// Gain to play `track_id` with, in dB (mpv's per-file `volume-gain`).
+    fn gain_db(&self, _track_id: &str) -> f64 {
+        0.0
+    }
 }
 
 #[derive(Debug)]
@@ -68,8 +75,10 @@ pub struct Engine<S: MpvSpawner> {
     duration: Option<f64>,
     /// Path loaded for the current track; `resume` reloads it after an idle quit.
     current_path: Option<String>,
-    /// `(track_id, path)` appended after the current entry.
-    preloaded: Option<(String, String)>,
+    /// `volume-gain` the current track plays with; `resume` reloads with it.
+    current_gain: f64,
+    /// `(track_id, path, gain)` appended after the current entry.
+    preloaded: Option<(String, String, f64)>,
     /// A `loadfile replace` has not reached `FileLoaded` yet: the preload
     /// waits for it, and a stale `idle-active=true` is not an end of playback.
     awaiting_load: bool,
@@ -105,6 +114,7 @@ impl<S: MpvSpawner> Engine<S> {
             at_ms: now_ms(),
             duration: None,
             current_path: None,
+            current_gain: 0.0,
             preloaded: None,
             awaiting_load: false,
             mpv_paused: false,
@@ -126,9 +136,10 @@ impl<S: MpvSpawner> Engine<S> {
         let path = r
             .playable_path(start_id)
             .ok_or_else(|| EngineError::Unplayable(start_id.to_string()))?;
+        let gain = r.gain_db(start_id);
         let saved = self.queue.clone();
         self.queue.start(context, order, start_id);
-        let result = self.load(path, 0.0).await;
+        let result = self.load(path, 0.0, gain).await;
         if result.is_err() {
             self.queue = saved;
         }
@@ -167,7 +178,7 @@ impl<S: MpvSpawner> Engine<S> {
                     _ if state == PlayState::Paused => self.position,
                     _ => 0.0,
                 };
-                self.load(path, start).await
+                self.load(path, start, self.current_gain).await
             }
         }
     }
@@ -288,6 +299,72 @@ impl<S: MpvSpawner> Engine<S> {
         self.refresh_preload(r).await
     }
 
+    /// Up Next, as `queue.get` reports it.
+    pub fn queue_state(&self) -> QueueState {
+        self.queue.snapshot(UPCOMING_LIMIT)
+    }
+
+    // Up Next edits: indices point into `queue_state` and must be in range
+    // (the service checks). Each re-preloads when the next track changed.
+
+    pub async fn remove_next(
+        &mut self,
+        i: usize,
+        r: &impl TrackResolver,
+    ) -> Result<(), EngineError> {
+        self.queue.remove_next(i);
+        self.refresh_preload(r).await
+    }
+
+    pub async fn remove_upcoming(
+        &mut self,
+        i: usize,
+        r: &impl TrackResolver,
+    ) -> Result<(), EngineError> {
+        self.queue.remove_upcoming(i);
+        self.refresh_preload(r).await
+    }
+
+    pub async fn move_next(
+        &mut self,
+        from: usize,
+        to: usize,
+        r: &impl TrackResolver,
+    ) -> Result<(), EngineError> {
+        self.queue.move_next(from, to);
+        self.refresh_preload(r).await
+    }
+
+    pub async fn clear_next(&mut self, r: &impl TrackResolver) -> Result<(), EngineError> {
+        self.queue.clear_next();
+        self.refresh_preload(r).await
+    }
+
+    /// Play Up Next entry `i` of `section` now (see `Queue::jump`). The
+    /// queue only moves when the load succeeds.
+    pub async fn jump(
+        &mut self,
+        section: QueueSection,
+        i: usize,
+        r: &impl TrackResolver,
+    ) -> Result<(), EngineError> {
+        let saved = self.queue.clone();
+        let Some(id) = self.queue.jump(section, i) else {
+            return Ok(());
+        };
+        let result = match r.playable_path(&id) {
+            Some(path) => {
+                let gain = r.gain_db(&id);
+                self.load(path, 0.0, gain).await
+            }
+            None => Err(EngineError::Unplayable(id)),
+        };
+        if result.is_err() {
+            self.queue = saved;
+        }
+        result
+    }
+
     /// Returns true when the player state changed.
     pub async fn on_mpv_event(
         &mut self,
@@ -331,10 +408,11 @@ impl<S: MpvSpawner> Engine<S> {
                     true
                 }
                 "path" => match self.preloaded.take() {
-                    Some((_, path)) if data.as_str() == Some(path.as_str()) => {
+                    Some((_, path, gain)) if data.as_str() == Some(path.as_str()) => {
                         // mpv moved on to the preloaded entry.
                         self.queue.advance_auto();
                         self.current_path = Some(path);
+                        self.current_gain = gain;
                         self.position = 0.0;
                         self.duration = None;
                         self.at_ms = now_ms();
@@ -377,6 +455,36 @@ impl<S: MpvSpawner> Engine<S> {
                 true
             }
         }
+    }
+
+    /// A track's gain changed (a new measurement): re-preload the next track
+    /// if its gain differs. The playing track keeps its gain.
+    pub async fn refresh_gains(&mut self, r: &impl TrackResolver) -> Result<(), EngineError> {
+        self.refresh_preload(r).await
+    }
+
+    /// Loudness leveling was switched: set the playing track's `volume-gain`
+    /// live and re-preload the next track with its new gain.
+    pub async fn apply_leveling(&mut self, r: &impl TrackResolver) -> Result<(), EngineError> {
+        let Some(id) = self.queue.current() else {
+            return Ok(());
+        };
+        let gain = r.gain_db(id);
+        self.current_gain = gain;
+        if self.mpv_alive() && self.state != PlayState::Stopped {
+            self.cmd(vec![
+                json!("set_property"),
+                json!("volume-gain"),
+                json!(round_gain(gain)),
+            ])
+            .await?;
+        }
+        self.refresh_preload(r).await
+    }
+
+    /// The track appended after the current entry.
+    pub fn preloaded_id(&self) -> Option<&str> {
+        self.preloaded.as_ref().map(|(id, _, _)| id.as_str())
     }
 
     pub fn idle_deadline(&self) -> Option<Instant> {
@@ -484,20 +592,28 @@ impl<S: MpvSpawner> Engine<S> {
         Ok(())
     }
 
-    /// `loadfile <path> replace` (with `start=<pos>` when resuming) and play.
-    async fn load(&mut self, path: String, start: f64) -> Result<(), EngineError> {
+    /// `loadfile <path> replace -1 volume-gain=<gain>` (plus `start=<pos>`
+    /// when resuming) and play.
+    async fn load(&mut self, path: String, start: f64, gain: f64) -> Result<(), EngineError> {
         self.ensure_mpv().await?;
-        let mut args = vec![json!("loadfile"), json!(path.as_str()), json!("replace")];
+        let mut options = gain_option(gain);
         if start > 0.0 {
-            args.push(json!(-1));
-            args.push(json!(format!("start={start}")));
+            options.push_str(&format!(",start={start}"));
         }
-        self.cmd(args).await?;
+        self.cmd(vec![
+            json!("loadfile"),
+            json!(path.as_str()),
+            json!("replace"),
+            json!(-1),
+            json!(options),
+        ])
+        .await?;
         if self.mpv_paused {
             self.set_pause(false).await?;
         }
         self.state = PlayState::Playing;
         self.current_path = Some(path);
+        self.current_gain = gain;
         self.duration = None;
         self.preloaded = None;
         self.awaiting_load = true;
@@ -517,7 +633,7 @@ impl<S: MpvSpawner> Engine<S> {
     ) -> Result<bool, EngineError> {
         let saved = self.queue.clone();
         let result = match self.step(step, r) {
-            Some(path) => self.load(path, 0.0).await.map(|()| true),
+            Some((path, gain)) => self.load(path, 0.0, gain).await.map(|()| true),
             None => Ok(false),
         };
         if !matches!(result, Ok(true)) {
@@ -539,9 +655,9 @@ impl<S: MpvSpawner> Engine<S> {
         Ok(())
     }
 
-    /// Move the queue, skipping ids with no playable file; the path of the
-    /// track reached, or `None` when there is none.
-    fn step(&mut self, step: Step, r: &impl TrackResolver) -> Option<String> {
+    /// Move the queue, skipping ids with no playable file; the path and gain
+    /// of the track reached, or `None` when there is none.
+    fn step(&mut self, step: Step, r: &impl TrackResolver) -> Option<(String, f64)> {
         let mut seen = HashSet::new();
         loop {
             let id = match step {
@@ -550,7 +666,7 @@ impl<S: MpvSpawner> Engine<S> {
                 Step::Prev => self.queue.prev_manual(),
             }?;
             if let Some(path) = r.playable_path(&id) {
-                return Some(path);
+                return Some((path, r.gain_db(&id)));
             }
             if !seen.insert(id) {
                 return None;
@@ -558,29 +674,38 @@ impl<S: MpvSpawner> Engine<S> {
         }
     }
 
-    fn preload_target(&self, r: &impl TrackResolver) -> Option<(String, String)> {
+    fn preload_target(&self, r: &impl TrackResolver) -> Option<(String, String, f64)> {
         // `Single` repeats through mpv's `loop-file`.
         if self.queue.loop_mode() == LoopMode::Single {
             return None;
         }
         let id = self.queue.peek_next_auto()?;
         let path = r.playable_path(&id)?;
-        Some((id, path))
+        let gain = r.gain_db(&id);
+        Some((id, path, gain))
     }
 
-    /// Make mpv's playlist `[current, next]`.
+    /// Make mpv's playlist `[current, next]`; the next entry carries its
+    /// `volume-gain`.
     async fn preload(&mut self, r: &impl TrackResolver) -> Result<(), EngineError> {
         let target = self.preload_target(r);
         self.cmd(vec![json!("playlist-clear")]).await?;
-        if let Some((_, path)) = &target {
-            self.cmd(vec![json!("loadfile"), json!(path), json!("append")])
-                .await?;
+        if let Some((_, path, gain)) = &target {
+            self.cmd(vec![
+                json!("loadfile"),
+                json!(path),
+                json!("append"),
+                json!(-1),
+                json!(gain_option(*gain)),
+            ])
+            .await?;
         }
         self.preloaded = target;
         Ok(())
     }
 
-    /// Re-preload after the queue changed, if the next track differs.
+    /// Re-preload after the queue or a gain changed, if the next track (id,
+    /// path or gain) differs.
     async fn refresh_preload(&mut self, r: &impl TrackResolver) -> Result<(), EngineError> {
         if !self.mpv_alive() || self.state == PlayState::Stopped || self.awaiting_load {
             return Ok(());
@@ -637,6 +762,17 @@ fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// `gain` to two decimals, never `-0`.
+fn round_gain(gain: f64) -> f64 {
+    let gain = (gain * 100.0).round() / 100.0;
+    if gain == 0.0 { 0.0 } else { gain }
+}
+
+/// Per-file loadfile option: `volume-gain=<gain, 2 decimals>`.
+fn gain_option(gain: f64) -> String {
+    format!("volume-gain={:.2}", round_gain(gain))
 }
 
 /// Fake mpv for engine and service tests.
@@ -825,8 +961,32 @@ mod tests {
         args.to_vec()
     }
 
+    /// `loadfile` at gain 0 (resolvers without gains).
     fn loadfile(path: &str, mode: &str) -> Vec<Value> {
-        cmd(&[json!("loadfile"), json!(path), json!(mode)])
+        loadfile_opts(path, mode, "volume-gain=0.00")
+    }
+
+    fn loadfile_opts(path: &str, mode: &str, options: &str) -> Vec<Value> {
+        cmd(&[
+            json!("loadfile"),
+            json!(path),
+            json!(mode),
+            json!(-1),
+            json!(options),
+        ])
+    }
+
+    /// `Paths` plus per-track gains (0 when absent).
+    struct Gained<'a>(&'a Paths, HashMap<&'static str, f64>);
+
+    impl TrackResolver for Gained<'_> {
+        fn playable_path(&self, track_id: &str) -> Option<String> {
+            self.0.playable_path(track_id)
+        }
+
+        fn gain_db(&self, track_id: &str) -> f64 {
+            self.1.get(track_id).copied().unwrap_or(0.0)
+        }
     }
 
     fn prop(name: &str, data: Value) -> MpvEvent {
@@ -1050,6 +1210,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn up_next_edits_re_preload_the_next_track() {
+        let fake = FakeSpawner::default();
+        let r = paths(&["a", "b", "c", "x", "y"]);
+        let mut e = playing(&fake, LoopMode::None, &["a", "b", "c"], "a", &r).await;
+        let preload = |id: &str| vec![cmd(&[json!("playlist-clear")]), loadfile(&p(id), "append")];
+
+        e.play_next("x", &r).await.unwrap();
+        e.play_next("y", &r).await.unwrap();
+        assert_eq!(fake.commands(), preload("x"));
+        assert_eq!(e.queue_state().next, ids(&["x", "y"]));
+
+        fake.clear_commands();
+        e.move_next(1, 0, &r).await.unwrap();
+        assert_eq!(fake.commands(), preload("y"));
+        assert_eq!(e.queue_state().next, ids(&["y", "x"]));
+
+        fake.clear_commands();
+        e.remove_next(0, &r).await.unwrap();
+        assert_eq!(fake.commands(), preload("x"));
+
+        fake.clear_commands();
+        e.clear_next(&r).await.unwrap();
+        assert_eq!(fake.commands(), preload("b"));
+
+        fake.clear_commands();
+        e.remove_upcoming(0, &r).await.unwrap();
+        assert_eq!(fake.commands(), preload("c"));
+        assert_eq!(e.queue_state().upcoming, ids(&["c"]));
+
+        // An edit that leaves the next track alone sends nothing.
+        fake.clear_commands();
+        e.play_next("a", &r).await.unwrap();
+        e.remove_next(0, &r).await.unwrap();
+        assert_eq!(fake.commands(), [preload("a"), preload("c")].concat());
+        fake.clear_commands();
+        e.clear_next(&r).await.unwrap();
+        assert!(fake.commands().is_empty());
+        assert_eq!(track(&e).as_deref(), Some("a"));
+    }
+
+    #[tokio::test]
+    async fn jump_plays_the_entry_and_keeps_the_queue_when_unplayable() {
+        let fake = FakeSpawner::default();
+        let r = paths(&["a", "c", "d", "x"]);
+        let mut e = playing(&fake, LoopMode::None, &["a", "b", "c", "d"], "a", &r).await;
+        e.play_next("x", &r).await.unwrap();
+        e.play_next("y", &r).await.unwrap();
+
+        // `b` has no file: nothing moves.
+        fake.clear_commands();
+        let before = e.queue_state();
+        assert!(matches!(
+            e.jump(QueueSection::Upcoming, 0, &r).await,
+            Err(EngineError::Unplayable(id)) if id == "b"
+        ));
+        assert_eq!(e.queue_state(), before);
+        assert_eq!(track(&e).as_deref(), Some("a"));
+        assert!(fake.commands().is_empty());
+
+        e.jump(QueueSection::Upcoming, 1, &r).await.unwrap();
+        assert_eq!(fake.commands(), vec![loadfile(&p("c"), "replace")]);
+        assert_eq!(track(&e).as_deref(), Some("c"));
+        assert_eq!(e.state().state, PlayState::Playing);
+        let st = e.queue_state();
+        assert!(st.next.is_empty());
+        assert_eq!(st.upcoming, ids(&["d"]));
+
+        e.play_next("x", &r).await.unwrap();
+        fake.clear_commands();
+        e.jump(QueueSection::Next, 0, &r).await.unwrap();
+        assert_eq!(fake.commands(), vec![loadfile(&p("x"), "replace")]);
+        assert_eq!(track(&e).as_deref(), Some("x"));
+        assert_eq!(e.queue_state().upcoming, ids(&["d"]));
+    }
+
+    #[tokio::test]
     async fn end_file_error_skips_to_next() {
         let fake = FakeSpawner::default();
         let r = paths(&["a", "b", "c"]);
@@ -1186,15 +1422,144 @@ mod tests {
         assert_eq!(fake.spawns(), 2);
         assert_eq!(
             fake.commands(),
-            vec![cmd(&[
-                json!("loadfile"),
-                json!(p("a")),
-                json!("replace"),
-                json!(-1),
-                json!("start=42.5"),
-            ])]
+            vec![loadfile_opts(
+                &p("a"),
+                "replace",
+                "volume-gain=0.00,start=42.5"
+            )]
         );
         assert_eq!(e.state().state, PlayState::Playing);
+    }
+
+    #[tokio::test]
+    async fn load_resume_and_preload_pass_per_file_gain() {
+        let fake = FakeSpawner::default();
+        let paths = paths(&["a", "b", "c"]);
+        let r = Gained(
+            &paths,
+            HashMap::from([("a", -6.5), ("b", 3.254), ("c", -0.001)]),
+        );
+        let (mut e, _rx) = engine(&fake, LoopMode::None);
+        e.play(ContextRef::Album(1), ids(&["a", "b", "c"]), "a", &r)
+            .await
+            .unwrap();
+        let g = fake.generation();
+        e.on_mpv_event(g, MpvEvent::FileLoaded, &r).await;
+        assert_eq!(
+            fake.commands(),
+            vec![
+                loadfile_opts(&p("a"), "replace", "volume-gain=-6.50"),
+                cmd(&[json!("playlist-clear")]),
+                loadfile_opts(&p("b"), "append", "volume-gain=3.25"),
+            ]
+        );
+
+        // The preloaded entry's gain becomes the current one: an idle quit
+        // and resume reload `b` with it, at the position.
+        fake.clear_commands();
+        assert!(e.on_mpv_event(g, prop("path", json!(p("b"))), &r).await);
+        assert_eq!(
+            fake.commands(),
+            vec![
+                cmd(&[json!("playlist-clear")]),
+                loadfile_opts(&p("c"), "append", "volume-gain=0.00"),
+            ]
+        );
+        fake.set_time_pos(12.3);
+        e.pause().await.unwrap();
+        e.on_mpv_event(g, prop("pause", json!(true)), &r).await;
+        e.on_idle_deadline().await;
+        fake.clear_commands();
+        e.resume().await.unwrap();
+        assert_eq!(
+            fake.commands(),
+            vec![loadfile_opts(
+                &p("b"),
+                "replace",
+                "volume-gain=3.25,start=12.3"
+            )]
+        );
+
+        // Manual steps load with the target's gain.
+        fake.set_time_pos(1.0);
+        e.on_mpv_event(fake.generation(), MpvEvent::PlaybackRestart, &r)
+            .await;
+        fake.clear_commands();
+        e.prev(&r).await.unwrap();
+        assert_eq!(
+            fake.commands().last().unwrap(),
+            &loadfile_opts(&p("a"), "replace", "volume-gain=-6.50")
+        );
+    }
+
+    #[tokio::test]
+    async fn new_gain_re_preloads_next_but_leaves_the_playing_track() {
+        let fake = FakeSpawner::default();
+        let paths = paths(&["a", "b"]);
+        let before = Gained(&paths, HashMap::from([("a", 1.0), ("b", 2.0)]));
+        let mut e = playing(&fake, LoopMode::None, &["a", "b"], "a", &paths).await;
+        e.refresh_gains(&before).await.unwrap();
+        fake.clear_commands();
+
+        // Same gains: nothing to do.
+        e.refresh_gains(&before).await.unwrap();
+        assert!(fake.commands().is_empty());
+
+        // `a` (playing) and `b` (next) were measured: only `b` is reloaded.
+        let after = Gained(&paths, HashMap::from([("a", -4.0), ("b", -2.5)]));
+        e.refresh_gains(&after).await.unwrap();
+        assert_eq!(
+            fake.commands(),
+            vec![
+                cmd(&[json!("playlist-clear")]),
+                loadfile_opts(&p("b"), "append", "volume-gain=-2.50"),
+            ]
+        );
+        assert_eq!(e.preloaded_id(), Some("b"));
+    }
+
+    #[tokio::test]
+    async fn toggling_leveling_sets_gain_live_and_re_preloads() {
+        let fake = FakeSpawner::default();
+        let paths = paths(&["a", "b"]);
+        let on = Gained(&paths, HashMap::from([("a", -6.0), ("b", 4.5)]));
+        let (mut e, _rx) = engine(&fake, LoopMode::None);
+        e.play(ContextRef::Album(1), ids(&["a", "b"]), "a", &on)
+            .await
+            .unwrap();
+        e.on_mpv_event(fake.generation(), MpvEvent::FileLoaded, &on)
+            .await;
+        fake.clear_commands();
+
+        let off = Gained(&paths, HashMap::new());
+        e.apply_leveling(&off).await.unwrap();
+        assert_eq!(
+            fake.commands(),
+            vec![
+                cmd(&[json!("set_property"), json!("volume-gain"), json!(0.0)]),
+                cmd(&[json!("playlist-clear")]),
+                loadfile_opts(&p("b"), "append", "volume-gain=0.00"),
+            ]
+        );
+
+        fake.clear_commands();
+        e.pause().await.unwrap();
+        fake.clear_commands();
+        e.apply_leveling(&on).await.unwrap();
+        assert_eq!(
+            fake.commands(),
+            vec![
+                cmd(&[json!("set_property"), json!("volume-gain"), json!(-6.0)]),
+                cmd(&[json!("playlist-clear")]),
+                loadfile_opts(&p("b"), "append", "volume-gain=4.50"),
+            ]
+        );
+
+        // Stopped: nothing is sent; the next play uses the new gain.
+        e.stop().await.unwrap();
+        fake.clear_commands();
+        e.apply_leveling(&off).await.unwrap();
+        assert!(fake.commands().is_empty());
     }
 
     #[tokio::test]

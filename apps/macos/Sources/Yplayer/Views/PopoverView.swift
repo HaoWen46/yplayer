@@ -1,8 +1,9 @@
 import SwiftUI
 import YplayerKit
 
-/// The popover's content: connection banner, now playing and library, with the confirm and
-/// toast overlays. Space toggles play/pause; Esc closes the confirm overlay or else the popover.
+/// The popover's content: connection banner, now playing and library (or lyrics, or Up Next),
+/// with the confirm and toast overlays. Space toggles play/pause; Esc closes the confirm overlay
+/// or else the popover; ⌘, closes the popover and opens the settings window.
 struct PopoverView: View {
     let model: AppModel
     @Environment(\.closePopover) private var closePopover
@@ -17,6 +18,10 @@ struct PopoverView: View {
             NowPlayingCard(model: model)
             if model.showsLyrics && model.store.currentTrack != nil {
                 LyricsView(model: model)
+                    .frame(maxHeight: .infinity)
+                    .transition(.opacity)
+            } else if model.showsQueue {
+                UpNextView(model: model)
                     .frame(maxHeight: .infinity)
                     .transition(.opacity)
             } else {
@@ -46,6 +51,14 @@ struct PopoverView: View {
                 closePopover()
             }
             return .handled
+        }
+        .background {
+            Button("Settings") {
+                closePopover()
+                model.openSettings()
+            }
+            .keyboardShortcut(",", modifiers: .command)
+            .hidden()
         }
     }
 }

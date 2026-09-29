@@ -1137,6 +1137,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "toml_edit",
  "trash",
  "which",
 ]

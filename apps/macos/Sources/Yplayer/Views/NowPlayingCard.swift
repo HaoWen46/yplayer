@@ -2,8 +2,9 @@ import SwiftUI
 import YplayerKit
 
 /// The current track on a glass card: artwork, title, uploader, scrubber, transport, loop,
-/// volume, lyrics toggle and the ⋯ menu; "Not playing" with disabled controls when idle. The
-/// lyrics toggle sets `model.showsLyrics`; `PopoverView` then shows `LyricsView` below the card.
+/// volume, Up Next and lyrics toggles and the ⋯ menu; "Not playing" with disabled controls when
+/// idle. The toggles set `model.showsQueue` / `model.showsLyrics` (at most one); `PopoverView`
+/// then shows `UpNextView` / `LyricsView` below the card.
 struct NowPlayingCard: View {
     let model: AppModel
     @Environment(\.lyricsFixture) private var lyricsFixture
@@ -42,14 +43,21 @@ struct NowPlayingCard: View {
                 await model.seek(to: position)
             }
             HStack {
+                // Both sides as wide, so the transport stays centered.
                 loopButton(player?.loopMode ?? .none)
                     .disabled(player == nil)
+                    .frame(width: 64, alignment: .leading)
                 Spacer()
                 TransportControls(model: model, isPlaying: player?.state == .playing)
                     .disabled(track == nil)
                 Spacer()
-                lyricsButton
-                    .disabled(track == nil)
+                HStack(spacing: 4) {
+                    upNextButton
+                        .disabled(player == nil)
+                    lyricsButton
+                        .disabled(track == nil)
+                }
+                .frame(width: 64, alignment: .trailing)
             }
             volumeRow(player)
         }
@@ -77,9 +85,31 @@ struct NowPlayingCard: View {
         .buttonStyle(.plain)
     }
 
+    private var upNextButton: some View {
+        Button {
+            withAnimation(.snappy(duration: 0.25)) {
+                model.showsQueue.toggle()
+                if model.showsQueue { model.showsLyrics = false }
+            }
+        } label: {
+            Label("Up Next", systemImage: "list.bullet")
+                .labelStyle(.iconOnly)
+                .font(.body.weight(.semibold))
+                .frame(width: 30, height: 30)
+                .foregroundStyle(
+                    model.showsQueue ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary)
+                )
+                .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+    }
+
     private var lyricsButton: some View {
         Button {
-            withAnimation(.snappy(duration: 0.25)) { model.showsLyrics.toggle() }
+            withAnimation(.snappy(duration: 0.25)) {
+                model.showsLyrics.toggle()
+                if model.showsLyrics { model.showsQueue = false }
+            }
         } label: {
             Label("Lyrics", systemImage: "quote.bubble")
                 .labelStyle(.iconOnly)

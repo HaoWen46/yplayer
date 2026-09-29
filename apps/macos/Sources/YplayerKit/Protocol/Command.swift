@@ -29,6 +29,16 @@ public enum Command: Equatable, Sendable {
     case trackRetry(trackID: String)
     case rescan
     case lyrics(trackID: String)
+    case settingsGet
+    /// `settings.set` with the fields given; `apiKey: .some(nil)` sends null (removes the key).
+    case settingsSet(levelLoudness: Bool? = nil, apiKey: String?? = nil)
+    case libraryMove(to: String)
+    case queueGet
+    case queueRemove(section: QueueSection, index: Int, trackID: String)
+    /// `to` is the entry's final index in `next`.
+    case queueMove(from: Int, to: Int, trackID: String)
+    case queueClear
+    case queueJump(section: QueueSection, index: Int, trackID: String)
 
     /// The wire `cmd` value.
     var name: String {
@@ -60,6 +70,14 @@ public enum Command: Equatable, Sendable {
         case .trackRetry: "track.retry"
         case .rescan: "rescan"
         case .lyrics: "lyrics"
+        case .settingsGet: "settings.get"
+        case .settingsSet: "settings.set"
+        case .libraryMove: "library.move"
+        case .queueGet: "queue.get"
+        case .queueRemove: "queue.remove"
+        case .queueMove: "queue.move"
+        case .queueClear: "queue.clear"
+        case .queueJump: "queue.jump"
         }
     }
 
@@ -80,10 +98,13 @@ private struct Envelope: Encodable {
 
     enum CodingKeys: String, CodingKey {
         case id, cmd, `protocol`, url, album, play, context, position, value, mode, name, title
+        case section, index, from, to
         case trackID = "track_id"
         case albumID = "album_id"
         case trackIDs = "track_ids"
         case toTrash = "to_trash"
+        case levelLoudness = "level_loudness"
+        case apiKey = "api_key"
     }
 
     func encode(to encoder: any Encoder) throws {
@@ -91,7 +112,8 @@ private struct Envelope: Encodable {
         try container.encode(id, forKey: .id)
         try container.encode(command.name, forKey: .cmd)
         switch command {
-        case .subscribe, .libraryGet, .now, .pause, .resume, .toggle, .stop, .next, .prev, .rescan:
+        case .subscribe, .libraryGet, .now, .pause, .resume, .toggle, .stop, .next, .prev, .rescan,
+            .queueGet, .queueClear:
             break
         case .hello(let version):
             try container.encode(version, forKey: .protocol)
@@ -132,6 +154,26 @@ private struct Envelope: Encodable {
             try container.encode(trackID, forKey: .trackID)
             try container.encode(title, forKey: .title)
         case .queuePlayNext(let trackID), .trackRetry(let trackID), .lyrics(let trackID):
+            try container.encode(trackID, forKey: .trackID)
+        case .settingsGet:
+            break
+        case .settingsSet(let levelLoudness, let apiKey):
+            try container.encodeIfPresent(levelLoudness, forKey: .levelLoudness)
+            switch apiKey {
+            case .none: break
+            case .some(.none): try container.encodeNil(forKey: .apiKey)
+            case .some(.some(let key)): try container.encode(key, forKey: .apiKey)
+            }
+        case .libraryMove(let to):
+            try container.encode(to, forKey: .to)
+        case .queueRemove(let section, let index, let trackID),
+            .queueJump(let section, let index, let trackID):
+            try container.encode(section, forKey: .section)
+            try container.encode(index, forKey: .index)
+            try container.encode(trackID, forKey: .trackID)
+        case .queueMove(let from, let to, let trackID):
+            try container.encode(from, forKey: .from)
+            try container.encode(to, forKey: .to)
             try container.encode(trackID, forKey: .trackID)
         }
     }

@@ -10,7 +10,7 @@ pub const MAX_LINE: usize = 1 << 20;
 pub const PROTOCOL: u32 = 1;
 
 /// Wire names of every `Command`, used to tell unknown commands from malformed ones.
-const COMMANDS: [&str; 27] = [
+const COMMANDS: [&str; 32] = [
     "hello",
     "subscribe",
     "library.get",
@@ -38,7 +38,17 @@ const COMMANDS: [&str; 27] = [
     "track.retry",
     "rescan",
     "lyrics",
+    "queue.get",
+    "queue.remove",
+    "queue.move",
+    "queue.clear",
+    "queue.jump",
 ];
+
+/// Wire names of the settings and music-folder commands.
+const SETTINGS_COMMANDS: [&str; 3] = ["settings.get", "settings.set", "library.move"];
+/// Most `upcoming` entries a `QueueState` lists.
+pub const UPCOMING_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestEnvelope {
@@ -51,6 +61,14 @@ fn default_true() -> bool {
     true
 }
 
+/// For `Option<Option<T>>` fields with `#[serde(default)]`: absent is
+/// `None`, `null` is `Some(None)`.
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
 pub enum Command {
@@ -60,6 +78,23 @@ pub enum Command {
     Subscribe,
     #[serde(rename = "library.get")]
     LibraryGet,
+    #[serde(rename = "settings.get")]
+    SettingsGet,
+    /// Absent fields stay unchanged; `api_key: null` removes the key.
+    #[serde(rename = "settings.set")]
+    SettingsSet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        level_loudness: Option<bool>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present"
+        )]
+        api_key: Option<Option<String>>,
+    },
+    /// Move the music folder to `to` (applied by a service restart).
+    #[serde(rename = "library.move")]
+    LibraryMove { to: String },
     #[serde(rename = "now")]
     Now,
     #[serde(rename = "add")]
@@ -123,6 +158,37 @@ pub enum Command {
     Rescan,
     #[serde(rename = "lyrics")]
     Lyrics { track_id: String },
+    #[serde(rename = "queue.get")]
+    QueueGet,
+    #[serde(rename = "queue.remove")]
+    QueueRemove {
+        section: QueueSection,
+        index: usize,
+        track_id: String,
+    },
+    /// `to` is the entry's final index in `next`.
+    #[serde(rename = "queue.move")]
+    QueueMove {
+        from: usize,
+        to: usize,
+        track_id: String,
+    },
+    #[serde(rename = "queue.clear")]
+    QueueClear,
+    #[serde(rename = "queue.jump")]
+    QueueJump {
+        section: QueueSection,
+        index: usize,
+        track_id: String,
+    },
+}
+
+/// Which list of a `QueueState` an index points into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueueSection {
+    Next,
+    Upcoming,
 }
 
 /// `{"id": N}` or `{"name": "..."}`.
@@ -232,6 +298,16 @@ pub struct AddResult {
     pub was_in_album: bool,
 }
 
+/// Result of `settings.get`/`settings.set` and payload of the `settings` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Settings {
+    pub level_loudness: bool,
+    /// ffmpeg was found: tracks can be measured.
+    pub loudness_available: bool,
+    pub api_key: Option<String>,
+    pub music_folder: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PlayState {
@@ -252,6 +328,17 @@ pub struct PlayerState {
     pub volume: f64,
     #[serde(rename = "loop")]
     pub loop_mode: LoopMode,
+}
+
+/// Up Next: `next` is the play-next FIFO (every entry); `upcoming` the
+/// context tracks that play after it, in play order, at most
+/// `UPCOMING_LIMIT`; `more` when `upcoming` was cut there.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueState {
+    pub next: Vec<String>,
+    pub upcoming: Vec<String>,
+    pub more: bool,
+    pub context: Option<ContextRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,8 +382,12 @@ pub enum Event {
     },
     #[serde(rename = "toast")]
     Toast { severity: Severity, message: String },
+    #[serde(rename = "settings")]
+    Settings(Settings),
     #[serde(rename = "resync")]
     Resync,
+    #[serde(rename = "queue")]
+    Queue(QueueState),
 }
 
 /// Serialize `v` as one compact JSON line terminated by `\n`.
@@ -315,7 +406,7 @@ pub fn decode_request(line: &str) -> Result<RequestEnvelope, Response> {
     let Some(cmd) = value.get("cmd").and_then(Value::as_str) else {
         return Err(Response::err(id, ErrorCode::BadRequest, "missing cmd"));
     };
-    if !COMMANDS.contains(&cmd) {
+    if !COMMANDS.contains(&cmd) && !SETTINGS_COMMANDS.contains(&cmd) {
         return Err(Response::err(
             id,
             ErrorCode::UnknownCommand,
@@ -447,6 +538,32 @@ mod tests {
             (
                 r#"{"id":1,"cmd":"lyrics","track_id":"dQw4w9WgXcQ"}"#,
                 Command::Lyrics {
+                    track_id: ID.into(),
+                },
+            ),
+            (r#"{"id":1,"cmd":"queue.get"}"#, Command::QueueGet),
+            (
+                r#"{"id":1,"cmd":"queue.remove","section":"upcoming","index":2,"track_id":"dQw4w9WgXcQ"}"#,
+                Command::QueueRemove {
+                    section: QueueSection::Upcoming,
+                    index: 2,
+                    track_id: ID.into(),
+                },
+            ),
+            (
+                r#"{"id":1,"cmd":"queue.move","from":0,"to":2,"track_id":"dQw4w9WgXcQ"}"#,
+                Command::QueueMove {
+                    from: 0,
+                    to: 2,
+                    track_id: ID.into(),
+                },
+            ),
+            (r#"{"id":1,"cmd":"queue.clear"}"#, Command::QueueClear),
+            (
+                r#"{"id":1,"cmd":"queue.jump","section":"next","index":1,"track_id":"dQw4w9WgXcQ"}"#,
+                Command::QueueJump {
+                    section: QueueSection::Next,
+                    index: 1,
                     track_id: ID.into(),
                 },
             ),
@@ -604,6 +721,19 @@ mod tests {
                 r#"{"event":"toast","severity":"warn","message":"m"}"#,
             ),
             (Event::Resync, r#"{"event":"resync"}"#),
+            (
+                Event::Queue(QueueState {
+                    next: vec!["n".into()],
+                    upcoming: vec!["a".into(), "b".into()],
+                    more: true,
+                    context: Some(ContextRef::Album(3)),
+                }),
+                r#"{"event":"queue","next":["n"],"upcoming":["a","b"],"more":true,"context":{"album_id":3}}"#,
+            ),
+            (
+                Event::Queue(QueueState::default()),
+                r#"{"event":"queue","next":[],"upcoming":[],"more":false,"context":null}"#,
+            ),
         ];
         for (event, wire) in cases {
             assert_eq!(serde_json::to_string(&event).unwrap(), wire);
@@ -637,6 +767,74 @@ mod tests {
         assert_eq!(
             serde_json::to_value(Response::err(4, ErrorCode::NotFound, "no such track")).unwrap(),
             json!({"id": 4, "ok": false, "error": {"code": "not_found", "message": "no such track"}})
+        );
+    }
+
+    #[test]
+    fn settings_and_move_commands_round_trip() {
+        let cases: Vec<(&str, Command)> = vec![
+            (r#"{"id":1,"cmd":"settings.get"}"#, Command::SettingsGet),
+            (
+                r#"{"id":1,"cmd":"settings.set"}"#,
+                Command::SettingsSet {
+                    level_loudness: None,
+                    api_key: None,
+                },
+            ),
+            (
+                r#"{"id":1,"cmd":"settings.set","level_loudness":false}"#,
+                Command::SettingsSet {
+                    level_loudness: Some(false),
+                    api_key: None,
+                },
+            ),
+            (
+                r#"{"id":1,"cmd":"settings.set","api_key":null}"#,
+                Command::SettingsSet {
+                    level_loudness: None,
+                    api_key: Some(None),
+                },
+            ),
+            (
+                r#"{"id":1,"cmd":"settings.set","level_loudness":true,"api_key":"AIza"}"#,
+                Command::SettingsSet {
+                    level_loudness: Some(true),
+                    api_key: Some(Some("AIza".into())),
+                },
+            ),
+            (
+                r#"{"id":1,"cmd":"library.move","to":"/Volumes/音楽/yt-audio"}"#,
+                Command::LibraryMove {
+                    to: "/Volumes/音楽/yt-audio".into(),
+                },
+            ),
+        ];
+        for (wire, cmd) in cases {
+            let expected = RequestEnvelope { id: 1, cmd };
+            assert_eq!(decode_request(wire).unwrap(), expected, "{wire}");
+            let back = serde_json::to_value(&expected).unwrap();
+            assert_eq!(back, serde_json::from_str::<Value>(wire).unwrap(), "{wire}");
+        }
+        let resp = decode_request(r#"{"id":2,"cmd":"library.move"}"#).unwrap_err();
+        assert_eq!(resp.error.unwrap().code, ErrorCode::BadRequest);
+    }
+
+    #[test]
+    fn settings_event_is_flat() {
+        let settings = Settings {
+            level_loudness: true,
+            loudness_available: false,
+            api_key: None,
+            music_folder: "/Users/me/Music/yt-audio".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&Event::Settings(settings.clone())).unwrap(),
+            r#"{"event":"settings","level_loudness":true,"loudness_available":false,"api_key":null,"music_folder":"/Users/me/Music/yt-audio"}"#
+        );
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap(),
+            json!({"level_loudness": true, "loudness_available": false, "api_key": null,
+                "music_folder": "/Users/me/Music/yt-audio"})
         );
     }
 

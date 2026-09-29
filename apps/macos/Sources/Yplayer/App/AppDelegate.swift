@@ -36,6 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: StatusItemController?
     private var nowPlaying: NowPlayingController?
     private var orb: OrbController?
+    private var settings: SettingsWindowController?
 
     init(options: LaunchOptions) {
         self.options = options
@@ -58,6 +59,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             client: ServiceClient(socketPath: ServiceClient.defaultSocketPath()),
             store: LibraryStore())
         model.start()
+        let settings = SettingsWindowController(model: model)
+        self.settings = settings
+        model.openSettings = { [weak settings] in settings?.show() }
         nowPlaying = NowPlayingController(model: model)
         let statusItem = StatusItemController(model: model)
         self.statusItem = statusItem

@@ -93,8 +93,8 @@ final class LibraryUI {
     }
 }
 
-/// Segmented Albums | Songs | Search over the selected list; ⌘F selects Search and focuses its
-/// field.
+/// Segmented Albums | Songs | Search and a Settings button over the selected list; ⌘F selects
+/// Search and focuses its field.
 struct LibraryTabs: View {
     let model: AppModel
     @Environment(\.initialLibraryRoute) private var route
@@ -107,6 +107,7 @@ struct LibraryTabs: View {
 private struct LibraryContent: View {
     let model: AppModel
     @ViewState private var ui: LibraryUI
+    @Environment(\.closePopover) private var closePopover
 
     init(model: AppModel, route: LibraryRoute) {
         self.model = model
@@ -122,6 +123,21 @@ private struct LibraryContent: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
+            .frame(maxWidth: .infinity)
+            .overlay(alignment: .trailing) {
+                Button {
+                    closePopover()
+                    model.openSettings()
+                } label: {
+                    Image(systemName: "gearshape")
+                        .font(.body.weight(.semibold))
+                        .frame(width: 16, height: 16)
+                }
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+                .help("Settings")
+                .padding(.trailing, 14)
+            }
             Group {
                 switch ui.tab {
                 case .albums:

@@ -31,7 +31,7 @@ A YouTube audio player for macOS that plays from a local cache. Drag a YouTube l
 | **Python 3.11+** | Yes | Runs the yt-dlp download worker (in the repo's `.venv`) |
 | **uv** | Yes | Installs the worker package; upgrades yt-dlp |
 | **deno** | Yes | JavaScript runtime yt-dlp uses for YouTube downloads |
-| **ffmpeg** | No | No longer required (audio is stored in its native format) |
+| **ffmpeg** | No | Evens out loudness (each song is measured once); without it songs play at their own volume |
 
 ```bash
 brew install mpv uv deno
@@ -71,10 +71,12 @@ Stops the service and the app and removes their LaunchAgent plists, `~/.local/bi
 `Yplayer.app` lives in the menu bar only (no Dock icon). It is a client of the service: it needs `yplay serve` running (the `com.yplayer.service` LaunchAgent) and never plays audio itself. While it cannot reach the service it shows "Can't reach the yplay service — retrying in Ns" with a Retry Now button.
 
 - Status item: `music.note` when not playing, `waveform` while playing; click to open or close the popover.
-- Now-playing card: artwork, title, uploader, scrubber with elapsed/remaining time, previous · play/pause · next, loop mode (none → all → single → shuffle), volume, lyrics toggle (synced lyrics replace the library while on), and a ⋯ menu (Remove from Album…, Delete from Library…, Show in Finder, Copy YouTube Link).
+- Now-playing card: artwork, title, uploader, scrubber with elapsed/remaining time, previous · play/pause · next, loop mode (none → all → single → shuffle), volume, Up Next and lyrics toggles (each replaces the library while on), and a ⋯ menu (Remove from Album…, Delete from Library…, Show in Finder, Copy YouTube Link).
 - Library tabs: Albums · Songs · Search. Albums: + creates an album, double-click a name to rename it, Delete Album… keeps its songs. An album's songs can be reordered by dragging. Downloading rows show progress; failed rows show a warning icon and a Retry menu item.
 - Track rows: double-click or Return plays; right-click for Play Next, Add to Album ▸, Remove from Album… (album view), Delete from Library…, Show in Finder, Copy YouTube Link, Retry (failed only), Rename…; trackpad swipe-left removes from the album (album view) or deletes from the library (Songs).
 - Deleting from the library moves the audio file to the Trash; every removal and deletion asks for confirmation first.
+- Up Next: "Playing Next" (songs added with Play Next; Clear, drag to reorder) and "Up Next from <album>" (what the album or library plays after them). Double-click or Return plays a row now; swipe left, ⌫ or the context menu removes it from Up Next only.
+- Settings (gear button in the library tabs, or ⌘,): Even out loudness, the music folder (Show in Finder; Move… to another folder on the same disk), and the YouTube API key for `yplay search`. The app shows a Dock icon while the window is open.
 - Media keys and Control Center's Now Playing show the current song and control the service.
 
 Keyboard shortcuts (popover open):
@@ -83,6 +85,7 @@ Keyboard shortcuts (popover open):
 |-----|--------|
 | Space | Play/pause (not while typing in a text field) |
 | ⌘F | Search the library |
+| ⌘, | Open Settings |
 | Return | Play the selected row |
 | ⌫ | Remove from album (album view) or delete from library (Songs), after confirmation |
 | ⌘⌫ | Delete from library, after confirmation |
@@ -167,6 +170,7 @@ Exit codes: `0` success; `1` the service returned an error (its message is print
 | `volume` | Initial volume, 0.0–1.0 (the last volume in session state wins) |
 | `api_key` | YouTube Data API key for `yplay search` (else `YT_API_KEY`) |
 | `worker_python` | Absolute path of the worker's Python (written by `install.sh`) |
+| `level_loudness` | Play every song at a similar loudness (default `true`; the app's Settings window writes it) |
 
 Environment variables:
 
@@ -185,6 +189,10 @@ Files:
 | `~/Library/Logs/yplayer/service.log` | Service stdout/stderr under launchd |
 | `~/Library/Logs/yplayer/app.log` | Menu-bar app stdout/stderr under launchd |
 | `~/Music/yt-audio/` | Cache and library DB (see below) |
+
+## Loudness
+
+With `level_loudness` on, the service measures each song once with ffmpeg's EBU R128 filter (integrated loudness and sample peak, at background priority, one song at a time: new downloads first, then the playing song, then the rest of the library) and plays it with an mpv `volume-gain` that brings it to −14 LUFS without lifting its peak above −1 dBFS, clamped to −20…+10 dB; songs not measured yet play at the median gain. Leveling needs `ffmpeg` on the service's `PATH` (`brew install ffmpeg`); without it nothing is measured and every song plays unchanged.
 
 ## Cache layout
 
@@ -239,7 +247,7 @@ apps/macos/          # SwiftUI menu-bar app + drop orb (Swift package)
 yplayer/             # Python package: yt-dlp download worker (worker.py, core.py)
 tests/               # Python worker tests
 packaging/           # LaunchAgent plist templates (service, app)
-scripts/             # install, uninstall, app build, Swift tests, performance check
+scripts/             # install, uninstall, app build, app icon, Swift tests, performance check
 docs/specs/          # design spec with verification results
 docs/plans/          # implementation plans, one per sub-project
 ```
