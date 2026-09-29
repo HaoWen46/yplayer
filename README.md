@@ -1,5 +1,7 @@
 # Yplayer
 
+**English** | [繁體中文](README.zh-TW.md)
+
 A YouTube audio player for macOS that plays from a local cache. Drag a YouTube link from Safari or Chrome onto the floating orb: the song goes into an album and starts playing within a few seconds, and every later play is offline. A menu-bar app shows the library and controls playback; the `yplay` command controls the same background service from a terminal.
 
 <p align="center">
@@ -38,6 +40,36 @@ Songs go to `~/Music/yt-audio` (change it in Settings). No accounts, no permissi
 <p align="center">
   <img src="docs/images/settings.png" width="360" alt="Settings">
 </p>
+
+## Performance
+
+Measured on a MacBook Air (Apple silicon, macOS 27) with `top` over 20-second windows ([how](#performance-check)).
+
+| | Memory | CPU while idle |
+|---|---|---|
+| Background service, nothing playing | 3–4 MB | 0 wake-ups/s: no timers, no polling |
+| Menu-bar app, popover closed | 19 MB after launch, ~43 MB after use | 0 wake-ups/s |
+| Player (mpv) while a song plays | ~46 MB, ~3 % CPU | — |
+| Player and downloader when not needed | not running: mpv quits 10 min after playback stops, the downloader 60 s after its last download | — |
+
+| Speed | |
+|---|---|
+| New link → first sound | ~3.7 s (plays while it downloads) |
+| Saved song → playing | 0.009 s, no network |
+| Search, 20,000 songs | 6 ms for the first keystroke, 2.4 ms after |
+| Song list update, 20,000 songs | 17 ms |
+| Loudness measurement | ~0.5 s per song, once, in the background |
+
+Network, for one 4.5-minute song ([秒針を噛む](https://www.youtube.com/watch?v=GJI4Gv7NbmE)):
+
+| | Data |
+|---|---|
+| Yplayer | 4.0 MB once (audio only, Opus as YouTube serves it), then nothing |
+| YouTube at 480p | 9–14 MB every play |
+| YouTube at 720p | 14–23 MB every play |
+| YouTube at 1080p | 26–43 MB every play |
+
+Other traffic: the cover art and lyrics once per song, and one yt-dlp version check a day.
 
 ## Menu-bar app
 
