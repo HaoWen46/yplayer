@@ -80,7 +80,7 @@ struct SettingsView: View {
         Section("Playback") {
             Toggle(
                 isOn: Binding(
-                    get: { settings?.levelLoudness ?? false }, set: setLevelLoudness)
+                    get: { settings?.levelLoudness ?? false }, set: { setLevelLoudness($0) })
             ) {
                 Text("Even out loudness")
                 Text(
