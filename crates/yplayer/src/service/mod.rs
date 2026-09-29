@@ -2078,11 +2078,16 @@ while True:
         assert_eq!(config.cache_dir, from);
     }
 
-    // Moves a real folder into the user's Trash, so it only runs on request
-    // (`cargo test -- --ignored delete_to_trash`), never in the default suite.
+    // Moves a real folder into the user's Trash, so it only runs on explicit
+    // request: `YPLAY_TEST_TRASH=1 cargo test -- --ignored delete_to_trash`
+    // (a plain `--ignored` run, e.g. `just e2e`, skips it).
     #[tokio::test]
     #[ignore]
     async fn delete_to_trash_moves_folder_to_trash() {
+        if std::env::var_os("YPLAY_TEST_TRASH").is_none() {
+            eprintln!("skipped: set YPLAY_TEST_TRASH=1 to move a test folder to the Trash");
+            return;
+        }
         LocalSet::new()
             .run_until(async {
                 let mut svc = start_with_worker().await;
