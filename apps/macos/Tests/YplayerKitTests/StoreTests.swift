@@ -263,10 +263,17 @@ private func queueChanged(_ store: LibraryStore, by change: () -> Void) -> Bool 
     }
     print("search over 5,000 tracks: \(elapsed)")
     #expect(results.count == 5_000)
-    #expect(elapsed < .milliseconds(20))
+    #expect(elapsed < budget(.milliseconds(40)))
 }
 
 /// `count` tracks with distinct `addedAt`, mixed CJK and Latin titles, one in six by ZUTOMAYO.
+/// A timing budget: as given on a developer Mac (debug build, tests running in parallel), 5× on
+/// CI (GitHub sets `CI`), whose shared runners stall for tens of milliseconds. Both stay far
+/// below what an O(n²) regression costs (seconds).
+private func budget(_ local: Duration) -> Duration {
+    ProcessInfo.processInfo.environment["CI"] == nil ? local : local * 5
+}
+
 private func largeLibrary(_ count: Int) -> [Track] {
     let words = ["秒針を噛む", "お勉強しといてよ", "正しくなれない", "Night", "Blue", "Remix", "Live", "はむ"]
     let uploaders = ["ずっと真夜中でいいのに。 ZUTOMAYO", "YOASOBI", "Ado", "Vaundy", "King Gnu", "米津玄師"]
@@ -300,7 +307,7 @@ private func largeLibrary(_ count: Int) -> [Track] {
         fresh.load(LibrarySnapshot(tracks: largeLibrary(20_000), albums: [], libraryVersion: 1))
         #expect(results.map(\.id) == fresh.search(query).map(\.id))
         #expect(results.count == 3_334)
-        #expect(slowest < .milliseconds(20))
+        #expect(slowest < budget(.milliseconds(40)))
     }
 }
 
@@ -335,6 +342,6 @@ private func largeLibrary(_ count: Int) -> [Track] {
         LibrarySnapshot(tracks: Array(store.tracks.values), albums: [], libraryVersion: 1))
     #expect(store.libraryOrder == fresh.libraryOrder)
     #expect(store.search("renamed 1").map(\.id) == fresh.search("renamed 1").map(\.id))
-    #expect(load < .milliseconds(450))
-    #expect(upsert < .microseconds(1_500))
+    #expect(load < budget(.milliseconds(450)))
+    #expect(upsert < budget(.microseconds(1_500)))
 }
