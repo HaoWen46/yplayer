@@ -19,6 +19,15 @@ struct ConfirmRequest: Identifiable {
 final class AppModel {
     let store: LibraryStore
     let client: ServiceClient
+    /// The service's settings: fetched when the settings window opens and after each reconnect
+    /// while it is open, and kept current by `settings` events; nil until the first fetch.
+    var settings: ServiceSettings?
+    /// The music folder move started from the settings window, while it runs or after it failed.
+    var folderMove: FolderMove?
+    /// Whether the settings window is open (set by `SettingsWindowController`).
+    @ObservationIgnored var settingsShown = false
+    /// Opens the settings window (set by `AppDelegate`).
+    @ObservationIgnored var openSettings: @MainActor () -> Void = {}
     /// The pending destructive action, shown by `ConfirmOverlay`.
     var confirm: ConfirmRequest?
     /// Whether `LyricsView` replaces the library below the now-playing card.
@@ -40,6 +49,7 @@ final class AppModel {
                 } else if store.needsResync {
                     await reload()
                 }
+                await applySettings(update)
             }
         }
     }
@@ -198,5 +208,71 @@ final class AppModel {
     private func report(_ error: any Error) {
         let message = (error as? ServiceError)?.message ?? error.localizedDescription
         store.appendToast(ToastItem(severity: .error, message: message))
+    }
+}
+
+/// A music folder move started from the settings window.
+enum FolderMove: Equatable {
+    /// The service accepted `library.move` and restarts to move the folder to `target`.
+    case moving(target: String)
+    /// The move was refused or did not happen; the message is shown under the folder.
+    case failed(String)
+}
+
+extension AppModel {
+    /// Fetches `settings`; returns false (and keeps them) when the service can't be reached.
+    @discardableResult
+    func loadSettings() async -> Bool {
+        do {
+            settings = try await client.send(.settingsGet, as: ServiceSettings.self)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Sends `settings.set` with the fields given and applies the reply; returns the error
+    /// message, or nil on success.
+    func changeSettings(levelLoudness: Bool? = nil, apiKey: String?? = nil) async -> String? {
+        do {
+            settings = try await client.send(
+                .settingsSet(levelLoudness: levelLoudness, apiKey: apiKey),
+                as: ServiceSettings.self)
+            return nil
+        } catch {
+            return Self.message(error)
+        }
+    }
+
+    /// Asks the service to move the music folder to `target`; `folderMove` follows the move
+    /// until the restarted service reports its folder.
+    func moveMusicFolder(to target: String) async {
+        folderMove = .moving(target: target)
+        do {
+            _ = try await client.send(.libraryMove(to: target), as: LibraryMoveResult.self)
+        } catch {
+            folderMove = .failed(Self.message(error))
+        }
+    }
+
+    /// Applies a `settings` event. After a reconnect, fetches the settings again while the window
+    /// is open or a move runs, and ends the move: done when the service reports `target`.
+    fileprivate func applySettings(_ update: ClientUpdate) async {
+        switch update {
+        case .event(.settings(let new)):
+            settings = new
+        case .connected:
+            let moving: String? =
+                if case .moving(let target) = folderMove { target } else { nil }
+            guard settingsShown || moving != nil, await loadSettings(), let moving else { return }
+            folderMove =
+                settings?.musicFolder == moving ? nil : .failed("Couldn't move your music folder.")
+        default:
+            break
+        }
+    }
+
+    private static func message(_ error: any Error) -> String {
+        (error as? ServiceError)?.message ?? error.localizedDescription
     }
 }

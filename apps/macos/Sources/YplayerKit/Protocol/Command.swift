@@ -29,6 +29,10 @@ public enum Command: Equatable, Sendable {
     case trackRetry(trackID: String)
     case rescan
     case lyrics(trackID: String)
+    case settingsGet
+    /// `settings.set` with the fields given; `apiKey: .some(nil)` sends null (removes the key).
+    case settingsSet(levelLoudness: Bool? = nil, apiKey: String?? = nil)
+    case libraryMove(to: String)
 
     /// The wire `cmd` value.
     var name: String {
@@ -60,6 +64,9 @@ public enum Command: Equatable, Sendable {
         case .trackRetry: "track.retry"
         case .rescan: "rescan"
         case .lyrics: "lyrics"
+        case .settingsGet: "settings.get"
+        case .settingsSet: "settings.set"
+        case .libraryMove: "library.move"
         }
     }
 
@@ -84,6 +91,9 @@ private struct Envelope: Encodable {
         case albumID = "album_id"
         case trackIDs = "track_ids"
         case toTrash = "to_trash"
+        case to
+        case levelLoudness = "level_loudness"
+        case apiKey = "api_key"
     }
 
     func encode(to encoder: any Encoder) throws {
@@ -133,6 +143,17 @@ private struct Envelope: Encodable {
             try container.encode(title, forKey: .title)
         case .queuePlayNext(let trackID), .trackRetry(let trackID), .lyrics(let trackID):
             try container.encode(trackID, forKey: .trackID)
+        case .settingsGet:
+            break
+        case .settingsSet(let levelLoudness, let apiKey):
+            try container.encodeIfPresent(levelLoudness, forKey: .levelLoudness)
+            switch apiKey {
+            case .none: break
+            case .some(.none): try container.encodeNil(forKey: .apiKey)
+            case .some(.some(let key)): try container.encode(key, forKey: .apiKey)
+            }
+        case .libraryMove(let to):
+            try container.encode(to, forKey: .to)
         }
     }
 
