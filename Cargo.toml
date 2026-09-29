@@ -2,8 +2,8 @@
 members = ["crates/yplayer"]
 resolver = "2"
 
-# Smaller, faster release binary. LTO + a single codegen unit shrink the
-# ratatui + bundled-SQLite binary substantially; strip drops debug symbols.
+# Smaller, faster release binary: thin LTO + a single codegen unit shrink the
+# bundled-SQLite binary; strip drops debug symbols.
 [profile.release]
 lto = "thin"
 codegen-units = 1

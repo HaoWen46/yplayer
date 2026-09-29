@@ -4,7 +4,7 @@ default:
     @just --list
 
 # The same gates CI runs, offline.
-check: check-rust check-python
+check: check-rust check-python check-swift
 
 check-rust:
     cargo fmt --all --check
@@ -12,23 +12,29 @@ check-rust:
     cargo test --workspace
 
 check-python:
-    .venv/bin/ruff check yplayer/
+    .venv/bin/ruff check yplayer/ tests/
     .venv/bin/python -m pytest -q
+
+check-swift:
+    swift format lint --strict --recursive apps/macos/Sources apps/macos/Tests
+    swift build -c release --package-path apps/macos -Xswiftc -warnings-as-errors
+    scripts/swift-test.sh
 
 # Auto-fix what can be fixed.
 fix:
     cargo fmt --all
-    ruff check yplayer/ --fix
+    .venv/bin/ruff check yplayer/ tests/ --fix
+    swift format --in-place --recursive apps/macos/Sources apps/macos/Tests
 
-# Build, install ~/.local/bin/yplay, and (re)start the com.yplayer.service LaunchAgent.
+# Build and install the service and the menu-bar app, then (re)start both LaunchAgents.
 install:
     scripts/install.sh
 
-# Remove the LaunchAgent and ~/.local/bin/yplay (keeps cache, DB, config).
+# Stop both LaunchAgents; remove ~/.local/bin/yplay, the app and the plists (keeps cache, DB, config).
 uninstall:
     scripts/uninstall.sh
 
-# Check the running service against the performance budget (STATE: idle | playing).
+# Check the running service/app against the performance budget (STATE: idle | playing | app-closed | app-open).
 perf STATE:
     scripts/perf-budget.sh {{STATE}}
 

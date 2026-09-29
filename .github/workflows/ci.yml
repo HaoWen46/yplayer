@@ -7,20 +7,20 @@ on:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    # The service is macOS-only (launchd, coreaudio mpv); test where it runs.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      # Hard gates: the code must build, pass its tests, and stay formatted.
       - name: Format check
         run: cargo fmt --all --check
-      - name: Test
-        run: cargo test --workspace --verbose
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
 
   python:
     runs-on: ubuntu-latest
@@ -29,11 +29,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      # Install from pyproject.toml in a clean environment so an undeclared
-      # dependency (the python-dotenv gap that broke HEAD) fails loudly.
+      # A clean install from pyproject.toml, so an undeclared dependency fails here.
       - name: Install
         run: pip install .[dev]
       - name: Ruff
-        run: ruff check yplayer/
+        run: ruff check yplayer/ tests/
       - name: Smoke + protocol tests
         run: pytest -q
+
+  swift:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Format check
+        run: swift format lint --strict --recursive apps/macos/Sources apps/macos/Tests
+      - name: Build
+        run: swift build -c release --package-path apps/macos -Xswiftc -warnings-as-errors
+      - name: Test
+        run: swift test --package-path apps/macos

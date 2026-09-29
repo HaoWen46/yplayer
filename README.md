@@ -1,13 +1,12 @@
 # Yplayer
 
-A YouTube audio player for macOS with a local cache. `yplay serve` runs in the background as a LaunchAgent and owns the library, playback, and downloads; the `yplay` CLI talks to it over a Unix socket. New URLs start playing while they download (first audio in a few seconds), and cached tracks play with no network access.
-
-The terminal UI (Ratatui) has been removed. The UI is a SwiftUI menu-bar app (see [Menu-bar app](#menu-bar-app)); the `yplay` CLI controls the same service.
+A YouTube audio player for macOS that plays from a local cache. Drag a YouTube link from Safari or Chrome onto the floating orb: the song goes into an album and starts playing within a few seconds, and every later play is offline. A menu-bar app shows the library and controls playback; the `yplay` CLI controls the same background service from a terminal.
 
 ## Architecture
 
 ```
- yplay CLI (add/play/pause/…) ──┐ Unix socket, newline-delimited JSON
+ Yplayer.app (menu bar + orb) ──┐
+ yplay CLI (add/play/pause/…) ──┤ Unix socket, newline-delimited JSON
                                 │ ~/Library/Application Support/yplayer/yplay.sock
                                 ▼
                         yplay serve (Rust, LaunchAgent, KeepAlive)
@@ -25,6 +24,8 @@ The terminal UI (Ratatui) has been removed. The UI is a SwiftUI menu-bar app (se
 
 | Tool | Required | Purpose |
 |------|----------|---------|
+| **macOS 26** | Yes | The menu-bar app's Liquid Glass UI |
+| **Xcode Command Line Tools** | Yes | Swift 6.2, builds the menu-bar app (`xcode-select --install`) |
 | **mpv** | Yes | Audio playback |
 | **Rust (cargo)** | Yes | Builds the `yplay` binary |
 | **Python 3.11+** | Yes | Runs the yt-dlp download worker (in the repo's `.venv`) |
@@ -51,8 +52,9 @@ scripts/install.sh        # or: just install
 2. Installs the worker package with `uv pip install --python .venv/bin/python -e .`.
 3. Adds `worker_python = "<repo>/.venv/bin/python3"` to `config.toml` only if that key is absent (creating the file if needed); existing values are never changed.
 4. Writes `~/Library/LaunchAgents/com.yplayer.service.plist` (runs `~/.local/bin/yplay serve`, `KeepAlive`, `RunAtLoad`, logs to `~/Library/Logs/yplayer/service.log`).
-5. Stops the service if it is loaded, then backs up the library DB once: copies `<cache_dir>/.yplayer.db` to `<cache_dir>/.yplayer.db.pre-service.bak` if the DB exists and no backup exists yet (an existing backup is never overwritten).
+5. Stops the service if it is loaded, then backs up the library DB once: `<cache_dir>/.yplayer.db` to `<cache_dir>/.yplayer.db.pre-service.bak` (owner-only) if the DB exists and no backup exists yet (an existing backup is never overwritten).
 6. Starts the service with `launchctl bootstrap gui/$UID` and prints its status.
+7. Builds the menu-bar app and installs it with its own LaunchAgent (see [Menu-bar app](#menu-bar-app)).
 
 Check the service with `launchctl print gui/$UID/com.yplayer.service`.
 
@@ -62,7 +64,7 @@ Check the service with `launchctl print gui/$UID/com.yplayer.service`.
 scripts/uninstall.sh      # or: just uninstall
 ```
 
-Stops the service and removes the LaunchAgent plist and `~/.local/bin/yplay`. The cache, library DB, `config.toml`, and logs are kept.
+Stops the service and the app and removes their LaunchAgent plists, `~/.local/bin/yplay`, and `~/Applications/Yplayer.app`. The cache, library DB, `config.toml`, and logs are kept.
 
 ## Menu-bar app
 
@@ -87,6 +89,17 @@ Keyboard shortcuts (popover open):
 | Esc | Close the confirmation, else the popover |
 
 Install and uninstall: `scripts/install.sh` also builds the app with `scripts/build-app.sh`, installs it to `~/Applications/Yplayer.app` (replacing any previous copy), writes `~/Library/LaunchAgents/com.yplayer.app.plist` (`RunAtLoad`; relaunched only after an abnormal exit; GUI login sessions only; logs to `~/Library/Logs/yplayer/app.log`), and restarts it with `launchctl bootstrap gui/$UID`. `scripts/uninstall.sh` also stops the app and removes its LaunchAgent plist and `~/Applications/Yplayer.app`. `just app` only builds `build/Yplayer.app`.
+
+## Drop orb
+
+Start dragging a YouTube link and a glass orb appears at the right edge of the screen under the cursor; it hides again when the drag ends. It needs no permissions.
+
+- Drag over the orb and it fans out: the center is the album you used last (Inbox when there are none), around it up to 5 recent albums and **+ New…**.
+- Drop on an album and the song is added there and starts playing right away, even while it is still downloading.
+- Drop on **+ New…** to type a name for a new album (Return creates it, Esc cancels).
+- An **Undo** toast stays beside the orb for 6 s: Undo takes the song back out of the album and, if it was a new download, moves it to the Trash.
+- A link that is not a single YouTube video (a playlist, another site) makes the orb shake with a short message; nothing is added.
+- Drag sources: Safari's address bar and page links; Chrome's site icon (left of the address) and page links. Chrome tabs cannot be dragged out of Chrome, so they do not work.
 
 ## Usage
 
@@ -170,6 +183,7 @@ Files:
 |------|----------|
 | `~/Library/Application Support/yplayer/` | `config.toml`, `yplay.sock`, `yplay.mpv.sock`, `worker.log`, yt-dlp update stamp (dir mode 0700, socket 0600) |
 | `~/Library/Logs/yplayer/service.log` | Service stdout/stderr under launchd |
+| `~/Library/Logs/yplayer/app.log` | Menu-bar app stdout/stderr under launchd |
 | `~/Music/yt-audio/` | Cache and library DB (see below) |
 
 ## Cache layout
@@ -178,6 +192,7 @@ Files:
 ~/Music/yt-audio/
   <Title> [<id8>]/          # per-track folder
     audio.<ext>             # native best-audio stream
+    cover.jpg               # artwork (absent when YouTube has none)
     meta.json               # metadata sidecar, written last (completion marker)
   .yplayer.db               # SQLite library: tracks, albums, lyrics
   .yplayer_state.json       # session state (volume, last track)
@@ -194,14 +209,17 @@ scripts/perf-budget.sh app-closed   # menu-bar app running, popover closed
 scripts/perf-budget.sh app-open     # popover open while a track plays
 ```
 
-Samples the running `yplay serve` and its mpv/Python children (or, for the `app-*` states, the `Yplayer` process) with `top` for 20 s and prints average CPU, idle wakeups/s, and max memory per process. Budget: `idle` — service ≤ 0.2 idle wakeups/s, < 10 MB, no mpv or Python worker running; `playing` — service ≤ 0.2 idle wakeups/s, mpv ≤ 60 MB; `app-closed` — Yplayer ≤ 0.2 idle wakeups/s, < 40 MB; `app-open` — Yplayer ≤ 1.5 idle wakeups/s. Exits 0 on PASS, 1 on FAIL, 2 when the process is not running or more than one is.
+Samples the running `yplay serve` and its mpv/Python children (or, for the `app-*` states, the `Yplayer` process) with `top` for 20 s and prints average CPU, idle wakeups/s, and max memory per process. Budget: `idle` — service ≤ 0.2 idle wakeups/s, < 10 MB, no mpv or Python worker running; `playing` — service ≤ 0.2 idle wakeups/s, mpv ≤ 60 MB; `app-closed` — Yplayer ≤ 0.2 idle wakeups/s, < 45 MB; `app-open` — Yplayer ≤ 1.5 idle wakeups/s. Exits 0 on PASS, 1 on FAIL, 2 when the process is not running or more than one is.
 
 ## Development
 
 ```bash
-just check    # cargo fmt --check, clippy -D warnings, cargo test, ruff, pytest
+just check    # what CI runs: Rust (fmt, clippy -D warnings, tests), Python (ruff, pytest), Swift (format lint, build, tests)
+just fix      # auto-format Rust, Python and Swift
 just e2e      # ignored tests: real mpv, network, CLI end-to-end
 ```
+
+With only the Command Line Tools (no Xcode), run the Swift tests through `scripts/swift-test.sh`: it passes the Swift Testing plugin path that the tools do not find on their own. Tests never touch the real cache, the installed service or the running app.
 
 ## Project structure
 
@@ -215,10 +233,15 @@ crates/yplayer/src/
   player/            # mpv IPC, playback engine, queue
   download/          # Python worker bridge and job manager
   lyrics.rs, http.rs, updater.rs, config.rs, types.rs, ytid.rs
+apps/macos/          # SwiftUI menu-bar app + drop orb (Swift package)
+  Sources/YplayerKit/  # UI-free: socket client, protocol, library store, orb logic (tested)
+  Sources/Yplayer/     # the app: popover views, orb panels, Now Playing, artwork
 yplayer/             # Python package: yt-dlp download worker (worker.py, core.py)
-packaging/           # LaunchAgent plist template
-scripts/             # install.sh, uninstall.sh, perf-budget.sh
-docs/                # design spec and implementation plans
+tests/               # Python worker tests
+packaging/           # LaunchAgent plist templates (service, app)
+scripts/             # install, uninstall, app build, Swift tests, performance check
+docs/specs/          # design spec with verification results
+docs/plans/          # implementation plans, one per sub-project
 ```
 
 ## License
