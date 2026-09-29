@@ -13,5 +13,6 @@
 - yt-dlp updates belong to the service (daily check, exact release tag, binary-only, at least a day old); never update on the request path.
 - `scripts/install.sh` and `scripts/uninstall.sh` change the user's Mac (LaunchAgents, `~/Applications`): run them only when asked; to test them use a temp `HOME` plus `YPLAYER_NO_LAUNCHD=1` (launchd labels are global).
 - Releases: one version in `crates/yplayer/Cargo.toml`, `pyproject.toml`, `yplayer/__init__.py`, `apps/macos/Packaging/Info.plist` (checked by `scripts/package-release.sh`); tag `vX.Y.Z` on main → `.github/workflows/release.yml` publishes `yplayer-macos-arm64.tar.gz` (+ `.sha256`) that `scripts/get.sh` installs (arm64 only).
+- A release install sets `worker_python` to `~/Library/Application Support/yplayer/venv/bin/python3`; a later checkout `scripts/install.sh` keeps it, so delete that line from `config.toml` first when testing worker changes from a checkout.
 - CI runners use Xcode's Swift (older than local CLT, 6.3.3 vs 6.4): passing a MainActor method directly as a closure (e.g. `Binding(set: method)`) crashed it; wrap it in `{ method($0) }`.
 - Test with CJK titles; the real library is mostly Japanese music.
