@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    # The service is macOS-only (launchd, coreaudio mpv); test where it runs.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # A clean install from pyproject.toml, so an undeclared dependency fails here.
+      - name: Install
+        run: pip install .[dev]
+      - name: Ruff
+        run: ruff check yplayer/ tests/
+      - name: Smoke + protocol tests
+        run: pytest -q
+
+  swift:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Format check
+        run: swift format lint --strict --recursive apps/macos/Sources apps/macos/Tests
+      - name: Build
+        run: swift build -c release --package-path apps/macos -Xswiftc -warnings-as-errors
+      - name: Test
+        run: swift test --package-path apps/macos

@@ -1,0 +1,39 @@
+[package]
+name = "yplayer"
+version = "0.2.0"
+edition = "2024"
+description = "yplayer background service and CLI: cached YouTube audio playback via mpv"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "yplay"
+path = "src/main.rs"
+
+[dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
+tokio = { version = "1", features = [
+    "rt",
+    "macros",
+    "process",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+anyhow = "1"
+which = "8"
+rand = "0.10"
+regex-lite = "0.1"
+trash = "5.2.9"
+id3 = { version = "1.17.2", default-features = false, features = ["decode_picture"] }
+
+[dev-dependencies]
+tempfile = "3"
